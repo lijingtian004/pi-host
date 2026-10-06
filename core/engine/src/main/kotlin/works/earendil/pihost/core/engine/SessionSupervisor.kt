@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import works.earendil.pihost.core.process.ProcessStarter
+import works.earendil.pihost.core.rpc.ExtensionUiResponse
 import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.PiSession
 import works.earendil.pihost.core.rpc.RpcCommand
@@ -72,11 +73,13 @@ sealed interface SessionState {
  * 每会话恢复用 host 生成的 UUID 作 `--session-id`（见 [PiSpawn]），
  * 因此崩溃重启后 argv 里的 session id 不变，会话文件续用。
  *
- * **为什么是 `open`**：本工程不引 Mockito（规格书 §2：不新增第三方依赖），
- * 而 [PiEngineService] / MainActivity 的测试需要注入「记录调用的 stub 监督者」，
- * 唯一通路是继承——故对外 API 全部 `open`，内部实现细节仍是 private。
+ * **P2D 起实现 [ChatEngine]**（规格书 §4.4 / §13 偏差 4）：语义一条没改，
+ * 只是把对外面收成接口；同时**移除类与全部方法的 `open` 修饰**——
+ * P2C 标 `open` 的唯一理由是这个工程不引 Mockito、`PiEngineService`/MainActivity 的测试
+ * 只能靠继承塞 stub 监督者（规格书 §6.1 的原话）。现在测试改绑 [ChatEngine] 的假体
+ * （`FakeChatEngine`），`open` 就成了纯粹的暴露面，按 P2C 报告预告清掉。
  */
-open class SessionSupervisor(
+class SessionSupervisor(
     private val scope: CoroutineScope,
     private val starter: ProcessStarter,
     private val commandFor: (sessionId: String) -> List<String>,
@@ -85,7 +88,7 @@ open class SessionSupervisor(
     private val backoffMs: List<Long> = DEFAULT_BACKOFF_MS,
     private val handshakeTimeoutMs: Long = DEFAULT_HANDSHAKE_TIMEOUT_MS,
     private val gracefulCloseTimeoutMs: Long = PiSession.DEFAULT_GRACEFUL_TIMEOUT_MS,
-) {
+) : ChatEngine {
 
     init {
         require(backoffMs.isNotEmpty()) { "backoffMs 不能为空：重启上限 = backoffMs.size + 1 次 spawn" }
@@ -94,7 +97,7 @@ open class SessionSupervisor(
     private val _sessionStates = MutableStateFlow<Map<String, SessionState>>(emptyMap())
 
     /** key = sessionId（host 生成的 UUID）。每次转移替换整张 map 快照，保证引用透明。 */
-    open val sessionStates: StateFlow<Map<String, SessionState>> = _sessionStates.asStateFlow()
+    override val sessionStates: StateFlow<Map<String, SessionState>> = _sessionStates.asStateFlow()
 
     private val entries = ConcurrentHashMap<String, Entry>()
 
@@ -104,7 +107,7 @@ open class SessionSupervisor(
      * 挂起直到首个 [SessionState.Ready] 或终态（[SessionState.Failed]/[SessionState.Stopped]），
      * 返回 sessionId（= argv 里的 `--session-id`，重启后不变）。
      */
-    open suspend fun start(): String {
+    override suspend fun start(): String {
         val sessionId = UUID.randomUUID().toString()
         val entry = Entry(sessionId)
         entries[sessionId] = entry
@@ -119,7 +122,7 @@ open class SessionSupervisor(
      * 用户主动停：置停止标志 → 会话活着则优雅 close → [SessionState.Stopped]。
      * 未知 id / 已终态的 id 直接返回（幂等，无副作用）。
      */
-    open suspend fun stop(sessionId: String) {
+    override suspend fun stop(sessionId: String) {
         val entry = entries[sessionId] ?: return
         entry.stopRequested.set(true)
         entry.stopSignal.complete(Unit)
@@ -130,7 +133,7 @@ open class SessionSupervisor(
     }
 
     /** 全部 [stop]，并发推进，等全部进终态。 */
-    open suspend fun shutdownAll() {
+    override suspend fun shutdownAll() {
         val ids = entries.keys.toList()
         coroutineScope { ids.map { id -> launch { stop(id) } } }
         ids.forEach { entries[it]?.watcher?.cancel() }
@@ -140,31 +143,54 @@ open class SessionSupervisor(
      * 代理该会话的 [PiSession.events]（转发后的稳定 flow：进程重启后订阅者不用重订阅）。
      * 无 replay ⇒ 与 PiSession 同一条纪律：**先订阅再发命令**。会话未知 → null。
      */
-    open fun events(sessionId: String): SharedFlow<PiEvent>? = entries[sessionId]?.bus
+    override fun events(sessionId: String): SharedFlow<PiEvent>? = entries[sessionId]?.bus
 
     /**
      * 该会话事件总线的**订阅计数**代理。
      *
-     * 存在的理由：`subscriptionCount` 声明在 `MutableSharedFlow` 上，而 [events] 对外只给
-     * `SharedFlow`（不给 emit 口）——调用方要「先订阅再发命令」就只能从这里取证据。
-     * 与 [PiSession.eventsSubscriptionCount] 同一用途。会话未知 → null。
+     * 存在的理由：`subscriptionCount` 只声明在 `MutableSharedFlow` 上（1.10.2 的
+     * `SharedFlow` 接口里**没有**这个成员，编译机 javap 实测只有 `getReplayCache` + `collect`），
+     * 而 [events] 对外只给 `SharedFlow`（不给 emit 口）——调用方要「先订阅再发命令」
+     * 就只能从这里取证据。与 [PiSession.eventsSubscriptionCount] 同一用途。会话未知 → null。
+     *
+     * **不在 [ChatEngine] 接口里**（规格书 §4.4 的接口就是那 8 个成员）：
+     * UI 侧的订阅时序改用「在 Unconfined 上起收集协程」保证（见 ChatViewModel）。
      */
-    open fun eventSubscriptions(sessionId: String): StateFlow<Int>? =
+    fun eventSubscriptions(sessionId: String): StateFlow<Int>? =
         entries[sessionId]?.bus?.subscriptionCount
 
     /** 代理 [PiSession.stderrRing] 快照（8KB 环）。会话未知或还没有进程 → null。 */
-    open fun stderrTail(sessionId: String): String? = entries[sessionId]?.session?.stderrRing?.snapshot()
+    override fun stderrTail(sessionId: String): String? = entries[sessionId]?.session?.stderrRing?.snapshot()
 
     /**
      * 向该会话的活动进程发命令（`测试 RPC` 按钮的发送通路，规格书 §7）。
      * 返回用于关联 response 的 id；无活动进程 → [IllegalStateException]。
      */
-    open suspend fun send(sessionId: String, command: RpcCommand, id: String? = null): String {
+    override suspend fun send(sessionId: String, command: RpcCommand, id: String?): String {
         val session = entries[sessionId]?.session
             ?: throw IllegalStateException("会话 $sessionId 没有活动 pi 进程")
         val requestId = id ?: session.nextId()
         session.send(command, requestId)
         return requestId
+    }
+
+    /**
+     * 权限应答写回（`extension_ui_response`，protocol.md §3.7：**无回执**）。
+     *
+     * [PiSession.sendUiResponse] 是 suspend（进单 writer 的 outbox），而 [ChatEngine] 这条
+     * 签名按规格书原文是非 suspend —— 故在这里 `scope.launch` 投递。
+     * 会话已无进程（崩溃窗口 / 已 stop）时 `send` 会抛 [IllegalStateException]，
+     * 这里吞掉并记日志：那条请求在 pi 侧已经按超时（confirm=false）结算了，
+     * 补发一条应答没有意义，抛给 UI 只会把「拒绝按钮」变成崩溃。
+     */
+    override fun sendUiResponse(sessionId: String, response: ExtensionUiResponse) {
+        val session = entries[sessionId]?.session ?: return
+        scope.launch {
+            runCatching { session.sendUiResponse(response) }
+                .onFailure { throwable ->
+                    android.util.Log.w(TAG, "extension_ui_response 投递失败 id=${response.id}", throwable)
+                }
+        }
     }
 
     // ── 核心循环（规格书 §5.3） ────────────────────────────────────────────────
@@ -373,6 +399,9 @@ open class SessionSupervisor(
         val DEFAULT_BACKOFF_MS: List<Long> = listOf(1_000L, 4_000L, 16_000L)
 
         const val DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000L
+
+        /** 权限应答投递失败的留痕 tag（不是崩溃路径，只进 logcat）。 */
+        const val TAG = "PiHostSupervisor"
     }
 }
 

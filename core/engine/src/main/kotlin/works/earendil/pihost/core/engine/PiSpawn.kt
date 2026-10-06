@@ -19,7 +19,8 @@ package works.earendil.pihost.core.engine
  * - `--no-extensions` 关掉 MCP/扩展加载，避免再起一层子进程（§12.1）。
  *
  * 纯 Kotlin、无 Android API：`libDir` 由调用方取 `ctx.applicationInfo.nativeLibraryDir!!`、
- * `runtimeDir` 取 `PathLayout.runtimeDir(ctx).absolutePath` 注入（见 `EngineRuntime`）。
+ * `runtimeDir` 取 `PathLayout.runtimeDir(ctx).absolutePath` 注入（P2C 由 `EngineRuntime` 组装，
+ * P2D 起由 `di/EngineModule` 的 `@Provides` 组装）。
  */
 class PiSpawn(private val libDir: String, private val runtimeDir: String) {
 

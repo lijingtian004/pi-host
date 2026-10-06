@@ -12,6 +12,9 @@ import android.os.IBinder
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
+import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -23,20 +26,31 @@ import kotlinx.coroutines.launch
  * pi 引擎的前台服务（P2C 规格书 §6.2；方案 §3.5）。
  *
  * 职责只有一件事：**让引擎在屏灭/切后台时不被系统杀掉**，并把会话数摆进通知。
- * 状态机、argv、握手都不在这里——那是 [SessionSupervisor]（经 [EngineRuntime] 取单例）。
+ * 状态机、argv、握手都不在这里——那是 [SessionSupervisor]，P2D 起经 Hilt 注入
+ * （P2C 的 `EngineRuntime` 静态桥已随 §4.2.4 删除）。
+ *
+ * 注入的是 [ChatEngine] 而不是 `SessionSupervisor`（规格书 §4.4 末「qoder 自定，报告记录」）：
+ * 本服务只用 `sessionStates / start / shutdownAll` 三件事，接口够用；
+ * 更重要的是测试侧可以 `@UninstallModules(EngineModule::class)` + 绑一个 [ChatEngine] 假体，
+ * 不用在 Robolectric 里凑出 `nativeLibraryDir` 才能构造真监督者。
  *
  * FGS 类型走 `specialUse`（方案 §3.5 定案：本地 AI coding agent 引擎不属于
  * dataSync/mediaPlayback/location 等既有类型），API 34+ 必须配
  * `android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE` `<property>`（见 app 的 Manifest）。
  * 三档 API 分流见 [startForegroundCompat]：minSdk 26 拿不到 34 的
- * `ForegroundServiceParams` 重载（RECON §1 实测 android-35 jar 只有两个重载），
+ * `ForegroundServiceParams` 重载（RECON-P2C §1 实测 android-35 jar 只有两个重载），
  * 故 26..28 用两参、29..33 用 `FOREGROUND_SERVICE_TYPE_MANIFEST`、34+ 用 `SPECIAL_USE`。
  */
+@AndroidEntryPoint
 class PiEngineService : Service() {
+
+    /** 引擎面（Hilt 注入，`@Singleton`，与 Activity/ViewModel 拿到的是同一个对象）。 */
+    @Inject
+    lateinit var engine: ChatEngine
 
     /**
      * 服务自建 scope：与 Service 同寿（[onDestroy] cancel）。
-     * 注意与 [EngineRuntime.scope] 区分——会话协程挂在进程级 scope 上，
+     * 注意与 [EngineScope] 那条进程级 scope 区分——会话协程挂在进程级 scope 上，
      * 服务被停掉不等于子进程被杀；这里只管「通知刷新 + 启停命令派发」。
      */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -54,26 +68,27 @@ class PiEngineService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val supervisor = EngineRuntime.supervisor
-        if (supervisor == null) {
-            // 没 initialize 就没有引擎可跑：直接收摊，不抛（规格书 §6.4 用例 4）
-            stopSelf()
-            return START_NOT_STICKY
-        }
-        observeSessions(supervisor)
+        observeSessions(engine)
         when (intent?.action) {
             ACTION_START -> scope.launch {
-                runCatching { supervisor.start() }
+                // 引擎起不来（退避用完/spawn 失败）不崩服务：状态经 sessionStates 进通知，
+                // 详细 cause 由 ChatViewModel 的 ChatUiState.Failed 呈现。
+                runCatching { engine.start() }
+                    .onFailure { throwable -> Log.w(TAG, "engine.start() 失败", throwable) }
             }
 
             ACTION_STOP -> scope.launch {
-                runCatching { supervisor.shutdownAll() }
+                runCatching { engine.shutdownAll() }
+                    .onFailure { throwable -> Log.w(TAG, "engine.shutdownAll() 失败", throwable) }
                 mainHandler.post {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
             }
 
+            // 既不是 START 也不是 STOP：没有可派的命令，直接收摊（P2C「没有 supervisor」用例
+            // 在 Hilt 化后的等价面——注入恒成功，「无引擎可跑」不再是可达状态，
+            // 可达状态只剩「意图不带已知 action」，见 PiEngineServiceTest 等价重写）。
             else -> stopSelf()
         }
         return START_NOT_STICKY
@@ -88,10 +103,10 @@ class PiEngineService : Service() {
     }
 
     /** 收集会话表 → 通知文案。只观察一条会话表，重复 start command 不重订阅。 */
-    private fun observeSessions(supervisor: SessionSupervisor) {
+    private fun observeSessions(engine: ChatEngine) {
         if (observeJob != null) return
         observeJob = scope.launch {
-            supervisor.sessionStates.collect { states ->
+            engine.sessionStates.collect { states ->
                 mainHandler.post { updateNotification(states.size) }
             }
         }
@@ -172,6 +187,9 @@ class PiEngineService : Service() {
         /** 动作常量：调用方一律经 [engineStartIntent]/[engineStopIntent] 构造，避免散落字符串。 */
         const val ACTION_START: String = "works.earendil.pihost.action.START_ENGINE"
         const val ACTION_STOP: String = "works.earendil.pihost.action.STOP_ENGINE"
+
+        /** 日志 tag：启停失败必须在 logcat 留痕（不崩服务，但不能静默）。 */
+        const val TAG: String = "PiEngineService"
 
         const val CHANNEL_ID: String = "pi_engine"
         const val NOTIFICATION_ID: Int = 0x51E0

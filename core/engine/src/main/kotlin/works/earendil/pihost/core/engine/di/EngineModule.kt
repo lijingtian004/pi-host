@@ -1,6 +1,7 @@
 package works.earendil.pihost.core.engine.di
 
 import android.content.Context
+import android.os.Build
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -13,29 +14,35 @@ import works.earendil.pihost.core.engine.AssetInstaller
 import works.earendil.pihost.core.engine.BundledAssets
 import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.EngineScope
+import works.earendil.pihost.core.engine.ExecFallbackStarter
 import works.earendil.pihost.core.engine.PiSpawn
 import works.earendil.pihost.core.engine.RuntimeInstall
 import works.earendil.pihost.core.engine.RuntimeInstallImpl
 import works.earendil.pihost.core.engine.SessionSupervisor
+import works.earendil.pihost.core.engine.SpawnDiagnosticsSink
 import works.earendil.pihost.core.engine.settings.DataStoreSettingsRepository
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.EnvFactory
 import works.earendil.pihost.core.environment.PathLayout
 import works.earendil.pihost.core.process.JvmProcessFactory
 import works.earendil.pihost.core.process.ProcessStarter
+import java.io.File
 import javax.inject.Singleton
 
 /**
  * 引擎装配（规格书 §4.2.2）：P2C 那段 `EngineRuntime.initialize()` 的手工组装，
  * 原样搬进 Hilt 的 `@Singleton` 组件，静态可变桥随之删除（§4.2.4）。
  *
- * 组装件全部来自冻结区的公开工厂：
+ * 组装件来自冻结区的公开工厂（P2F 起 starter 外面多一层 core/engine 自己的包装，冻结区未动）：
  * - argv = [PiSpawn]（libDir = `applicationInfo.nativeLibraryDir`、runtimeDir = [PathLayout.runtimeDir]）；
  * - env = `EnvFactory.build(ctx, settings.memTier)`（P2E §3.4 起改动态取；P2C/P2D 写死
  *   `MemTier.MID`，与 `MemTier.DEFAULT` 同值 192MB，**默认行为一字未变**，
  *   只是磁盘上真写了 LOW/HIGH 时下次 spawn 跟着变，§13 偏差 4）；
- * - 工作目录 = [PathLayout.projectDir]`("default")`（P3 才有项目切换）；
- * - starter = [JvmProcessFactory]。
+ * - 工作目录 = [PathLayout.projectDir]`("default")`（P3 才有项目切换）。**P2F 修正**：`PathLayout` 只构造路径
+ *   不建目录，全仓此前无一处 mkdir `projects/`（RECON-P2F §2.1）→ 该目录在真机上不存在，
+ *   而子进程 chdir 先于 execve，于是 spawn 直接 `error=2`；现由 [SessionSupervisor] spawn 前 mkdirs 兜底；
+ * - starter = [ExecFallbackStarter]([JvmProcessFactory], [SpawnDiagnosticsSink])（P2F §4.1(b)(c)：
+ *   诊断上屏 + 落盘，`error=13` 时走 linker64 装载降级）。
  *
  * **为什么是 `object` + 全 `@Provides`，而不是 `abstract class` + `@Binds`**：
  * 规格书 §4.4 本来就给了两种写法并让实现方自选（「`@Binds` 或直接
@@ -54,9 +61,32 @@ object EngineModule {
     @EngineScope
     fun engineScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    /**
+     * spawn 通路（P2F §4.1(c)）：`ExecFallbackStarter(JvmProcessFactory, sink)`。
+     *
+     * - **为什么这里要 ctx**：诊断落盘路径 = `File(PathLayout.homeDir(ctx), spawn-diagnostics.log)`。
+     *   选 homeDir 不选 runtimeDir（P2F §9）：runtimeDir 会被安装器原子切换清掉，homeDir 稳定。
+     *   参数只在本模块内部动过（红线只锁 `SessionSupervisor`/`ChatEngine`/`RuntimeInstall` 的公共 API）；
+     *   `:app`/`:core:engine` 的 Hilt 测试一律 `@UninstallModules(EngineModule::class)` 整体换假体，
+     *   没有任何用例直接绑这个提供者（RECON-P2F §3 实测），所以改签名零破坏。
+     * - **sink 的 runCatching 全包 + >256KB 截断重写**都在 [SpawnDiagnosticsSink] 里，
+     *   这里只负责喂 Android 侧的头部（`Build.SUPPORTED_ABIS` 等），使两个核心类保持纯 JVM 可测。
+     */
     @Provides
     @Singleton
-    fun processStarter(): ProcessStarter = JvmProcessFactory
+    fun processStarter(@ApplicationContext ctx: Context): ProcessStarter {
+        val sink = SpawnDiagnosticsSink(
+            file = File(PathLayout.homeDir(ctx), SpawnDiagnosticsSink.FILE_NAME),
+            banner = {
+                listOf(
+                    "abis=${Build.SUPPORTED_ABIS.joinToString(",")}",
+                    "nativeLibraryDir=${ctx.applicationInfo.nativeLibraryDir}",
+                    "filesDir=${ctx.filesDir}",
+                )
+            },
+        )
+        return ExecFallbackStarter(delegate = JvmProcessFactory, diagnostics = sink)
+    }
 
     /**
      * 设置仓库（P2E §4.2）。**必须 @Singleton**：DataStore 按文件路径持锁，

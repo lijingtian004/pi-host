@@ -214,6 +214,13 @@ class SessionSupervisor(
             val helpers = ArrayList<Job>(2)
 
             val handshake = try {
+                // P2F §4.1(a)：ProcessBuilder 的子进程 **chdir 先于 execve**，cwd 不存在时抛的
+                // IOException 与「exe 不存在」共用同一条 errno 管道（都是 `error=2`，消息里只写 exe 路径），
+                // 现场根本无法区分（P2F §3.2 首要嫌疑：全仓没有任何代码建 `filesDir/projects/`，
+                // 见 RECON-P2F §2.1）。spawn 前 mkdirs 把这条歧义从根上消掉。
+                // runCatching = **失败不抛**：权限问题让后续 exec 的真实 errno 说话；
+                // mkdirs 幂等，所以重启循环（每次 setState(Spawning) 之后）天然重复覆盖，无需额外状态。
+                workingDir?.let { w -> runCatching { java.io.File(w).mkdirs() } }
                 val process = starter.start(commandFor(id), envFor(), workingDir)
                 val s = PiSession(process, scope)
                 session = s

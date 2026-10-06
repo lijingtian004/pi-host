@@ -13,7 +13,10 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -29,9 +32,20 @@ import java.util.concurrent.CopyOnWriteArrayList
  * 另一个已知现象：连续两次 setState 若发生在同一个任务里，StateFlow 会合并（conflation），
  * 中间的 `Spawning` 可能进不了 history——所以断言只针对**必然分开**的状态
  * （`Restarting` 序列、终态、starter 调用次数），不对 `Spawning` 的重复次数下断言。
+ *
+ * **P2F 追加 case12–14**（§4.1(a) spawn 前 mkdirs）：这三条要碰真实文件系统，
+ * 因此借用 `TemporaryFolder` 造「不存在 / 已存在 / 中途被删」三种 cwd，
+ * 断言取 `FakeStarter.workingDirExistedAtStart` 的**调用瞬间采样**。
+ * 注意本文件的 `WORKING_DIR` 是设备路径常量（`/data/user/0/...`），在构建机上不存在也建不出来
+ * （非 root 时 `mkdirs()` 失败被 runCatching 吞掉，root 时会真建）——这正是 `runCatching` 的分工：
+ * **cwd 建不成不是 spawn 的失败理由，真实 errno 由 delegate 上抛**。
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class SessionSupervisorTest {
+
+    /** P2F case12–14 的沙箱根（每条用例 `newFolder` 独立，互不干扰）。 */
+    @get:Rule
+    val tmp = TemporaryFolder()
 
     private val starters = CopyOnWriteArrayList<FakeStarter>()
 
@@ -46,6 +60,7 @@ class SessionSupervisorTest {
         scope: CoroutineScope,
         modes: List<PiMode>,
         stderrSeed: String? = null,
+        workingDir: String = WORKING_DIR,
     ): Pair<SessionSupervisor, FakeStarter> {
         val starter = FakeStarter(modes, stderrSeed)
         starters.add(starter)
@@ -55,7 +70,7 @@ class SessionSupervisorTest {
             starter = starter,
             commandFor = spawn::command,
             envFor = { ENV },
-            workingDir = WORKING_DIR,
+            workingDir = workingDir,
         )
         return supervisor to starter
     }
@@ -463,6 +478,96 @@ class SessionSupervisorTest {
         assertEquals(started.await(), sessionId)
         assertEquals(SessionState.Ready, supervisor.stateOf(sessionId))
         assertEquals(2, starter.invocationCount())
+    }
+
+    // ── 用例 12（P2F §4.1(a) / §4.4）：workingDir 不存在 → start() 被调时它必须已是目录 ──
+
+    @Test
+    fun `case12 missing workingDir is created before starter is invoked`() = runTest {
+        val root = tmp.newFolder("sandbox")
+        val workingDir = File(root, "projects/default")
+        assertFalse("前置条件：两层目录都不存在（正是真机上的 filesDir/projects 形状）", workingDir.exists())
+
+        val (supervisor, starter) = supervisorIn(
+            backgroundScope,
+            listOf(PiMode.HandshakeThenHang),
+            workingDir = workingDir.absolutePath,
+        )
+        val started = launchStart(supervisor)
+        pump("第一次 spawn 已发生") { starter.invocationCount() == 1 }
+
+        // 断言点在 start() **被调的那一瞬间**（FakeStarter 现场采样），不是事后 isDirectory：
+        // 事后检查分不清「supervisor 建的」与「进程起来后别人建的」，也证明不了 chdir 之前已就位。
+        assertTrue(
+            "chdir 先于 execve：start() 被调时 cwd 必须已经是目录，否则 error=2 与 exe 缺失无法区分",
+            starter.workingDirExistedAtStart[0],
+        )
+        assertTrue("cwd 确实落成了真实目录", workingDir.isDirectory)
+        assertEquals(workingDir.absolutePath, starter.workingDirs[0])
+
+        pump("握手完成") { started.isCompleted }
+        assertEquals(SessionState.Ready, supervisor.stateOf(started.await()))
+    }
+
+    // ── 用例 13（P2F §4.1(a) 边界）：workingDir 已存在 → mkdirs 幂等、不改内容、原样透传 ──
+
+    @Test
+    fun `case13 existing workingDir survives the idempotent mkdirs and is passed through`() = runTest {
+        val root = tmp.newFolder("existing-sandbox")
+        val keeper = File(root, "keep.txt").apply { writeText("重要内容") }
+        assertFalse("前置条件：没有名为 projects/default 的子目录（mkdirs 只会补这一层）",
+            File(root, "projects/default").exists())
+
+        val (supervisor, starter) = supervisorIn(
+            backgroundScope,
+            listOf(PiMode.HandshakeThenHang),
+            workingDir = root.absolutePath,
+        )
+        val started = launchStart(supervisor)
+        pump("第一次 spawn 已发生") { starter.invocationCount() == 1 }
+
+        assertTrue(starter.workingDirExistedAtStart[0])
+        assertEquals(root.absolutePath, starter.workingDirs[0])
+        assertEquals("重要内容", keeper.readText())
+        assertFalse(File(root, "projects/default").exists())
+
+        pump("握手完成") { started.isCompleted }
+        val sessionId = started.await()
+        assertEquals(SessionState.Ready, supervisor.stateOf(sessionId))
+        supervisor.stop(sessionId)
+        pump("Stopped") { supervisor.stateOf(sessionId) == SessionState.Stopped }
+    }
+
+    // ── 用例 14（P2F §4.1(a) 重启循环覆盖）：退避期间目录被外部删除 → 下次 spawn 前重建 ──
+
+    @Test
+    fun `case14 workingDir deleted between attempts is recreated on the next spawn`() = runTest {
+        val root = tmp.newFolder("reroll-sandbox")
+        val workingDir = File(root, "projects/default")
+        val (supervisor, starter) = supervisorIn(
+            backgroundScope,
+            listOf(PiMode.SilentDie, PiMode.HandshakeThenHang),
+            workingDir = workingDir.absolutePath,
+        )
+        val started = launchStart(supervisor)
+        pump("第一次 spawn 已发生且 cwd 已建") {
+            starter.invocationCount() == 1 && workingDir.isDirectory
+        }
+        assertEquals(true, starter.workingDirExistedAtStart[0])
+
+        val sessionId = sessionIdArg(starter.commands[0])!!
+        // 模拟「安装器/清理逻辑在两次尝试之间把 projects 目录抹掉」——P2F §9 诊断文件同理的坑
+        assertTrue(workingDir.delete())
+        assertFalse(workingDir.exists())
+
+        pump("第一次静默退出 → Restarting") { supervisor.stateOf(sessionId) is SessionState.Restarting }
+        skipBackoff(supervisor.stateOf(sessionId) as SessionState.Restarting)
+        pump("第二次 spawn") { starter.invocationCount() == 2 }
+
+        assertTrue("重启循环天然覆盖：第二次 start() 时 cwd 必须又被建出来", starter.workingDirExistedAtStart[1])
+        assertTrue(workingDir.isDirectory)
+        pump("第二次握手完成") { started.isCompleted }
+        assertEquals(SessionState.Ready, supervisor.stateOf(sessionId))
     }
 
     private companion object {

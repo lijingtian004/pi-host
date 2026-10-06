@@ -3,6 +3,7 @@ package works.earendil.pihost.core.engine
 import works.earendil.pihost.core.process.ProcessHandle
 import works.earendil.pihost.core.process.ProcessStarter
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.PipedInputStream
@@ -221,6 +222,13 @@ internal class FakeStarter(
     val workingDirs = CopyOnWriteArrayList<String?>()
     val spawned = CopyOnWriteArrayList<FakePiProcess>()
 
+    /**
+     * P2F §4.4：每次 `start()` **被调用的那一瞬间** workingDir 是否已是目录
+     * （null → false）。`SessionSupervisor` 的 spawn 前 mkdirs 只能这样证明——
+     * 事后 `isDirectory` 会在「starter 没建但别人建了」上假绿，且看不到调用次序。
+     */
+    val workingDirExistedAtStart = CopyOnWriteArrayList<Boolean>()
+
     fun invocationCount(): Int = invocationCounter.get()
 
     override fun start(
@@ -232,6 +240,7 @@ internal class FakeStarter(
         commands.add(command)
         envs.add(env)
         workingDirs.add(workingDir)
+        workingDirExistedAtStart.add(workingDir?.let { File(it).isDirectory } ?: false)
         val fake = FakePiProcess(modes[minOf(index, modes.lastIndex)], stderrSeed)
         spawned.add(fake)
         return fake

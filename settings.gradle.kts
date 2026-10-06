@@ -15,6 +15,9 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "pi-android"
-// P1 POC：Android-free JVM 库（P2 拆分见方案 §2）
+// P2 模块拆分进行中（方案 §2）；core/rpc、core/process 保持 Android-free JVM
+include(":app")
 include(":core:process")
 include(":core:rpc")
+include(":core:environment")
+include(":core:engine")

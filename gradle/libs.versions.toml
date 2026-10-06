@@ -4,7 +4,10 @@ coroutines = "1.10.2"
 serialization = "1.9.0"
 junit5 = "5.13.4"
 turbine = "1.2.1"
-# P2+ 引入（方案 §1/§10，P1 骨架先占位不引用）
+# Android 模块统一 Robolectric + JUnit4（方案 §11）
+junit4 = "4.13.2"
+robolectric = "4.16"
+# P2 起启用（方案 §1/§10）；hilt/compose 随后续条目引入
 agp = "8.13.0"
 hilt = "2.57.1"
 compose-bom = "2025.09.01"
@@ -16,7 +19,12 @@ kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-t
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit5" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher", version = "1.13.4" }
 turbine = { module = "app.cash.turbine:turbine", version.ref = "turbine" }
+junit4 = { module = "junit:junit", version.ref = "junit4" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

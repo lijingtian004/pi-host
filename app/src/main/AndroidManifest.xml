@@ -6,6 +6,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- P2F §4.3(a) 必修：normal 权限，安装期自动授予、无需运行时申请。
+         没有它，pi 子进程调模型 API 的 socket 会被系统直接拒——spawn 修好了也过不了 P1 的「真实对话轮」判据。
+         方向层 RECON-P2F §3.5 实测本清单此前只有上面 3 条，core/feature 各模块 Manifest 也无 uses-permission。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:name=".PiHostApp"
         android:allowBackup="false"

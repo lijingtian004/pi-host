@@ -343,8 +343,8 @@ fixture 门控：产物不入 git，测试用 `org.junit.Assume` 在找不到
 规格书红线要求汇报 `du -sh`：
 
 ```
-$ df -h /            # 构建后
-/dev/vda1  49G   46G  2.6G  95% /
+$ df -h /            # 首次 assembleDebug 后 2.6G；复跑测试+构建后 2.2G（见下）
+/dev/vda1  49G   47G  2.2G  96% /
 
 $ du -sh /root/runtime-pkg     # 中间产物（.deb 缓存 + 解包树 + 探测输出）
 319M
@@ -356,7 +356,9 @@ $ du -sh /root/android-host/tools/runtime-packaging/out
 141M   （jniLibs 107M + assets 8M + stage 25M）
 ```
 
-磁盘余量从任务开始的 3.4 G 降到 2.6 G（APK 构建的 intermediates 是主要消耗）。
+磁盘余量从任务开始的 3.4 G 降到 2.2 G：一次 `:app:assembleDebug` 的 intermediates
+（`mergeDebugNativeLibs` 会把 107 MB 原样再抄一遍）+ Robolectric 跑真实 8.2 MB zip 的
+临时沙盒是主要消耗，且 `app/build` 不会被自动回收。
 `dl/` 的 52 M `.deb` 按红线"多余的 .deb 缓存可清"列为可回收项，本次**未删除**——
 保留它是为了让 `build-jniLibs.sh` 的幂等复跑不必重新联网下载；下一个里程碑如果磁盘
-吃紧，先删它，再删 `app/build/intermediates`。
+吃紧，回收顺序：`app/build/intermediates` → `runtime-pkg/dl`（52 M）→ `out/stage`（25 M）。

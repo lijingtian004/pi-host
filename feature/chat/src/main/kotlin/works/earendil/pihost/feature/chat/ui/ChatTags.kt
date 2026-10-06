@@ -22,6 +22,7 @@ object ChatTags {
     const val PERMISSION_ALLOW_ONCE = "chat-allow-once"
     const val PERMISSION_ALLOW_SESSION = "chat-allow-session"
     const val PERMISSION_DENY = "chat-deny"
+    const val NOTICE = "chat-notice"
 
     /** 逐条节点前缀（调用方拼 `-$id`）。 */
     const val USER_PREFIX = "chat-user"
@@ -29,9 +30,17 @@ object ChatTags {
     const val TOOL_PREFIX = "chat-tool"
     const val TOOL_OUTPUT_SUFFIX = "-output"
 
+    /** §4.3：assistant 正文的 markwon 渲染节点（与气泡容器分开打 tag，好定位「渲染体在场」）。 */
+    const val MARKDOWN_SUFFIX = "-md"
+
+    /** §4.3：会话切换的「加载中」占位行。 */
+    const val NOTE_PREFIX = "chat-note"
+
     fun user(id: Int) = "$USER_PREFIX-$id"
     fun assistant(id: Int) = "$ASSISTANT_PREFIX-$id"
     fun thinking(id: Int) = "$ASSISTANT_PREFIX-$id-thinking"
+    fun markdown(id: Int) = "$ASSISTANT_PREFIX-$id$MARKDOWN_SUFFIX"
+    fun note(id: Int) = "$NOTE_PREFIX-$id"
     fun tool(callId: String) = "$TOOL_PREFIX-$callId"
     fun toolOutput(callId: String) = "$TOOL_PREFIX-$callId$TOOL_OUTPUT_SUFFIX"
 }

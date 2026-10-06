@@ -31,25 +31,27 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
-import works.earendil.pihost.feature.chat.TextSegment
+import io.noties.markwon.Markwon
 import works.earendil.pihost.feature.chat.ToolCallRecord
 import works.earendil.pihost.feature.chat.ToolStatus
 import works.earendil.pihost.feature.chat.TranscriptItem
-import works.earendil.pihost.feature.chat.splitFencedSegments
 
 /**
- * 转录列表（规格书 §6）：用户右对齐气泡 + assistant（thinking 折叠 + 正文 + toolcall 卡）
- * + 工具卡。
+ * 转录列表（规格书 §6）：用户右对齐气泡 + assistant（thinking 折叠 + **markwon 正文** + toolcall 卡）
+ * + 工具卡 + 会话切换占位行。
  *
  * **自动滚动**只在「用户已经在底部」时进行（§6 的简单实现）：
  * `derivedStateOf { !listState.canScrollForward }` 就是「已贴底」的事实判据，
  * 用户往上翻历史时新消息不会把视口拽走。
  *
  * **折叠态用本地 remember**：thinking 与工具输出的展开是纯 UI 偏好，
- * 塞进 VM 会让「不可变快照替换」这条纪律多出一倍分支，而 P2D 不需要跨滚动保持。
+ * 塞进 VM 会让「不可变快照替换」这条纪律多出一倍分支，而 P2E 不需要跨滚动保持。
+ *
+ * **markwon 实例走参数**（§9.5）：@Singleton 的那一份由 [ChatViewModel] 转交（见其 KDoc），
+ * 本文件不自建——列表滚动时每条 assistant 各自 build 一次语法表是最容易犯的错。
  */
 @Composable
-fun TranscriptList(items: List<TranscriptItem>, modifier: Modifier = Modifier) {
+fun TranscriptList(items: List<TranscriptItem>, markwon: Markwon, modifier: Modifier = Modifier) {
     val listState = rememberLazyListState()
     val atBottom by remember { derivedStateOf { !listState.canScrollForward } }
     LaunchedEffect(items.size, items.lastOrNull()) {
@@ -68,8 +70,9 @@ fun TranscriptList(items: List<TranscriptItem>, modifier: Modifier = Modifier) {
         items(count = items.size, key = { index -> items[index].id }) { index ->
             when (val item = items[index]) {
                 is TranscriptItem.UserItem -> UserBubble(item)
-                is TranscriptItem.AssistantItem -> AssistantBlock(item)
+                is TranscriptItem.AssistantItem -> AssistantBlock(item, markwon)
                 is TranscriptItem.ToolItem -> ToolCard(item)
+                is TranscriptItem.NoteItem -> NoteRow(item)
             }
         }
     }
@@ -95,7 +98,7 @@ private fun UserBubble(item: TranscriptItem.UserItem) {
 }
 
 @Composable
-private fun AssistantBlock(item: TranscriptItem.AssistantItem) {
+private fun AssistantBlock(item: TranscriptItem.AssistantItem, markwon: Markwon) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -103,7 +106,12 @@ private fun AssistantBlock(item: TranscriptItem.AssistantItem) {
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         if (item.thinking.isNotEmpty()) ThinkingSection(item)
-        BodyText(text = item.text)
+        // §4.3：正文交给 markwon（P2D 的 BodyText/围栏切段已随冒烟件一起退场）
+        MarkdownBody(
+            text = item.text,
+            markwon = markwon,
+            modifier = Modifier.testTag(ChatTags.markdown(item.id)),
+        )
         item.toolCalls.forEach { record -> ToolCallChip(record) }
     }
 }
@@ -125,27 +133,25 @@ private fun ThinkingSection(item: TranscriptItem.AssistantItem) {
 }
 
 /**
- * 正文渲染（§13 偏差 1：P2D 只做 ``` 围栏 → monospace + 灰底，完整 markdown 留 P2E markwon）。
+ * 会话切换占位行（§4.3）。
+ *
+ * 一行居中的灰字，不带气泡、不带折叠交互——它的存在时间以秒计，
+ * 形状越不像消息，用户越不会误读成「pi 回了这句」。
  */
 @Composable
-private fun BodyText(text: String) {
-    if (text.isEmpty()) return
-    val segments = remember(text) { splitFencedSegments(text) }
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        segments.forEach { segment: TextSegment ->
-            if (segment.monospace) {
-                Surface(color = MaterialTheme.colorScheme.surfaceVariant) {
-                    Text(
-                        text = segment.text,
-                        fontFamily = FontFamily.Monospace,
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(8.dp),
-                    )
-                }
-            } else {
-                Text(text = segment.text, style = MaterialTheme.typography.bodyMedium)
-            }
-        }
+private fun NoteRow(item: TranscriptItem.NoteItem) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag(ChatTags.note(item.id)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = item.text,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(vertical = 6.dp),
+        )
     }
 }
 

@@ -71,7 +71,15 @@ class FakeChatEngine(val sessionId: String = SESSION) : ChatEngine {
 
     /** 直接改会话表（验顶栏短码、Restarting→Ready 的运行期变化）。 */
     fun setState(state: SessionState) {
-        _states.update { it + (sessionId to state) }
+        setStateFor(sessionId, state)
+    }
+
+    /**
+     * 给**任意** id 改会话表（§4.3 的 maxParallelSessions 门要演「别的会话已经在跑」：
+     * 门读的是 `sessionStates` 整张表，不是本会话那一条）。
+     */
+    fun setStateFor(id: String, state: SessionState) {
+        _states.update { it + (id to state) }
     }
 
     override suspend fun start(): String {

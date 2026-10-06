@@ -63,7 +63,7 @@ data class ToolCallRecord(
     val parsedName: String? = null,
 )
 
-/** 转录条目（§6 的三类渲染对象）。 */
+/** 转录条目（§6 的三类渲染对象 + §4.3 的切换占位行）。 */
 sealed interface TranscriptItem {
     val id: Int
 
@@ -92,6 +92,16 @@ sealed interface TranscriptItem {
         val status: ToolStatus = ToolStatus.Running,
         val output: String = "",
     ) : TranscriptItem
+
+    /**
+     * 系统占位行（§4.3「transcript 清空 + 『加载中』条目」）。
+     *
+     * 它**不是**气泡、也不是消息：会话切换成功后挂一行灰字，等 pi 的第一条真事件
+     * （`message_start` / `tool_execution_start` …）到达即由 VM 撤掉
+     * （`ChatViewModel.mutateTranscript` 的单点清场），
+     * 超时没等到也自动撤（`SWITCH_NOTE_TIMEOUT_MS`）——不留一条永远「加载中」的死行。
+     */
+    data class NoteItem(override val id: Int, val text: String) : TranscriptItem
 }
 
 /**
@@ -130,35 +140,3 @@ internal fun resultToText(result: JsonElement?): String = when (result) {
     is JsonArray -> contentToText(result)
     else -> result.toString()
 }
-
-/**
- * fenced-code 切段（§6：P2D 正文用 Text + monospace 代码块，完整 markdown 留 P2E）。
- *
- * 只认 ``` 围栏：奇偶交替，围栏内 [CodeSegment.monospace] = true。
- * 没闭合的围栏（流式途中）按「直到文末」处理，避免半句话闪烁。
- */
-internal fun splitFencedSegments(text: String): List<TextSegment> {
-    if (text.isEmpty()) return emptyList()
-    val out = ArrayList<TextSegment>(4)
-    var monospace = false
-    val buffer = StringBuilder()
-    text.lineSequence().forEach { line ->
-        if (line.trimStart().startsWith(FENCE)) {
-            if (buffer.isNotEmpty()) {
-                out.add(TextSegment(buffer.toString(), monospace))
-                buffer.setLength(0)
-            }
-            monospace = !monospace
-        } else {
-            if (buffer.isNotEmpty()) buffer.append('\n')
-            buffer.append(line)
-        }
-    }
-    if (buffer.isNotEmpty()) out.add(TextSegment(buffer.toString(), monospace))
-    return out
-}
-
-/** 正文的一段（P2D 只有「普通」与「``` 围栏内」两类）。 */
-data class TextSegment(val text: String, val monospace: Boolean)
-
-private const val FENCE: String = "```"

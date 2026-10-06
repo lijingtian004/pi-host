@@ -4,7 +4,9 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.noties.markwon.Markwon
 import javax.inject.Inject
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -14,12 +16,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.InstallProgress
 import works.earendil.pihost.core.engine.InstalledRuntime
 import works.earendil.pihost.core.engine.RuntimeInstall
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.engineStartIntent
+import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.rpc.AssistantMessageEvent
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
 import works.earendil.pihost.core.rpc.PiEvent
@@ -49,7 +53,25 @@ class ChatViewModel @Inject constructor(
     app: Application,
     private val engine: ChatEngine,
     private val installer: RuntimeInstall,
+    /** 应用设置快照源（§13 偏差 6：maxParallelSessions 门在 VM 层，读的是内存快照）。 */
+    private val settings: SettingsRepository,
+    /**
+     * @Singleton Markwon（§9.5），由 `di/MarkwonModule` 提供。
+     *
+     * `internal` 而非 public：markwon 是 chat 的 `implementation` 依赖（不进消费者编译类路径），
+     * 公开签名一旦暴露它的类型就是在给 `:app` 挖「unresolved reference」坑；
+     * 同模块的 UI 与单测都能取到，够用。
+     */
+    private val markwonInstance: Markwon,
 ) : AndroidViewModel(app) {
+
+    /**
+     * VM **只转交、不使用**：唯一的消费者是
+     * [works.earendil.pihost.feature.chat.ui.TranscriptList]（经 ChatScreen 传入），
+     * 渲染发生在 `AndroidView` 的 factory/update（主线程）。
+     * 挂在 VM 上是为了让 UI 与单测拿到**同一个**实例，而不是在组合里自建第二份语法表。
+     */
+    internal val markwon: Markwon get() = markwonInstance
 
     private val _uiState = MutableStateFlow<ChatUiState>(ChatUiState.NotInstalled)
 
@@ -85,13 +107,33 @@ class ChatViewModel @Inject constructor(
     /** auto_retry_* 的一句话提示（不新开转录条目）。 */
     val retryNote: StateFlow<String?> = _retryNote.asStateFlow()
 
+    private val _notice = MutableStateFlow<String?>(null)
+
+    /**
+     * 一次性提示（§4.3：并行上限拦截 = snackbar 文案）。
+     *
+     * 与 [retryNote] 的分工：retryNote 是**引擎侧持续状态**（auto_retry 期间一直挂着），
+     * notice 是**本地动作的即时反馈**（发完即走，UI 消费后 [consumeNotice] 清空）。
+     */
+    val notice: StateFlow<String?> = _notice.asStateFlow()
+
     private var sessionId: String? = null
     private var collectorJob: Job? = null
     private var statusJob: Job? = null
     private var permissionTicker: Job? = null
 
+    /** 正文 delta 的待提交草稿 + 它的 debounce 协程（§3.3：80ms 窗口）。 */
+    private val draftText = StringBuilder()
+    private var draftFlushJob: Job? = null
+
+    /** 「加载中」占位条的自动撤除协程（§4.3）。 */
+    private var noteExpiryJob: Job? = null
+
     /** 幂等闩：init 起一次，失败才放开（重试按钮就靠它）。 */
     private var starting = false
+
+    /** 切换/新建会话的进行闩（回执未定之前不接受第二次滚，见 [rollSession]）。 */
+    private var switching = false
 
     private var itemSeq = 0
     private var commandSeq = 0
@@ -126,6 +168,8 @@ class ChatViewModel @Inject constructor(
     fun installAndStart() {
         if (starting) return
         starting = true
+        // 每次重新发起都先擦掉上一条提示：上一次的「并行上限已满」不能糊在下一次的结果上
+        _notice.value = null
         viewModelScope.launch {
             _uiState.value = ChatUiState.Installing(installer.progress.value)
             val mirror = launch(Dispatchers.Unconfined) {
@@ -153,7 +197,31 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 起引擎（§5.1）+ **并行上限门**（§4.3 / §13 偏差 6：门在 VM 层，SessionSupervisor 不加新语义）。
+     *
+     * 判据是「占用配额的会话」= 状态为 Spawning/Ready/Restarting 的条目：
+     * 冻结区的 `sessionStates` 在会话进终态后**仍保留**那条记录（Stopped 是「用户主动停」、
+     * Failed 是「退避额度耗尽」，两者都不再持有 pi 进程），把它们算进占用会让上限
+     * 变成「历史会话总数」，与 §3.4 的「并行」语义不符。
+     *
+     * 拦截后**连 FGS 意图都不发**（通知先于 spawn 是 P2D 偏差 6 的次序，反过来做就是
+     * 「前台服务起来了却不干活」），放开 [starting] 闩让用户改完设置再试。
+     */
     private suspend fun startEngine() {
+        val cap = settings.maxParallelSessions
+        val occupied = engine.sessionStates.value.count { (_, state) ->
+            state is SessionState.Spawning || state is SessionState.Ready || state is SessionState.Restarting
+        }
+        if (occupied >= cap) {
+            val cause = "已达并行上限 $cap（当前 $occupied 条会话在跑），先在设置页调低再新建"
+            _notice.value = cause
+            // §5.1 的 Failed 定义就是「引擎起不来 + 可读原因」，这里正是它，不新增第五态。
+            _uiState.value = ChatUiState.Failed(cause)
+            starting = false
+            return
+        }
+
         val ctx = getApplication<Application>()
         ctx.startForegroundService(engineStartIntent(ctx))
 
@@ -192,6 +260,10 @@ class ChatViewModel @Inject constructor(
         collectorJob?.cancel()
         statusJob?.cancel()
         permissionTicker?.cancel()
+        // 草稿与占位行的协程都属于「本页已经不在了」的范畴：丢弃而不是补写，
+        // 否则 viewModelScope 会在销毁后被一次迟到的 flush 唤起一次无意义的状态提交。
+        draftFlushJob?.cancel()
+        noteExpiryJob?.cancel()
         super.onCleared()
     }
 
@@ -234,6 +306,114 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    // ── 多会话（§4.3：切换 / 新建 = 命令 + 等回执 + 清场）─────────────────────────
+
+    /**
+     * 切到磁盘上的既有会话（`switch_session`，protocol.md §3.4 的 `switchSession`）。
+     *
+     * 与 `:feature:sessions` 的 `openSession` 是**同一个命令的两个消费者**，但职责不同：
+     * 那边只管「发命令 + 导航」（列表页不持有转录），这边必须等成功回执才敢清场——
+     * transcript 是本页的真相源，切失败却把内容清了就是丢数据。
+     */
+    fun switchSession(sessionPath: String) = rollSession(RpcCommand.SwitchSession(sessionPath), "切换会话")
+
+    /**
+     * 新开一个会话（`new_session`）。pi 侧在**同一进程**里换 session 文件，
+     * 因此不涉及 spawn、也不受 maxParallelSessions 门约束（那条门只管 [ChatEngine.start]）。
+     */
+    fun newSession() = rollSession(RpcCommand.NewSession(), "新建会话")
+
+    /** 消费一次性提示（snackbar/banner 自动收起时也调它，与 `:feature:settings` 同形）。 */
+    fun consumeNotice() {
+        _notice.value = null
+    }
+
+    /**
+     * 「发命令 → 等这条命令自己的 Response → 成功才清场」的公共流程（§4.3）。
+     *
+     * 三条实现依据：
+     * 1. **先订阅再发命令**（纪律 1）：collector 起在 `Dispatchers.Unconfined`，
+     *    `SharedFlow.collect` 的注册发生在挂起之前，于是 send 时订阅者已就位；
+     * 2. **超时跑在 viewModelScope 上**（RECON-P2E §5 的教训，与 SettingsViewModel 同源）：
+     *    `Dispatchers.Unconfined` 不实现 `Delay`，`withTimeoutOrNull` 在那里会落到**真实时钟**上，
+     *    虚拟时间测试就永远推不到超时；所以外层协程用 viewModelScope（测试 = UnconfinedTestDispatcher
+     *    的虚拟时钟），只有 collector 那一层用 Unconfined。
+     * 3. **失败不动转录**：notice 报原因，原会话内容一条不少——这是与「成功才清场」一体的设计，
+     *    不是补救。
+     */
+    private fun rollSession(command: RpcCommand, label: String) {
+        val id = sessionId
+        if (id == null) {
+            _notice.value = "${label}失败：引擎尚未就绪"
+            return
+        }
+        if (switching) return // 一次只滚一条：回执未定之前不接受第二次切换
+        switching = true
+        flushDraft() // 草稿属于上一条会话，先落到上一条的转录里
+        viewModelScope.launch {
+            val requestId = nextCommandId()
+            pendingCommandIds.add(requestId)
+            val reply = CompletableDeferred<PiEvent.Response>()
+            val collector = launch(Dispatchers.Unconfined) {
+                engine.events(id)?.collect { event ->
+                    if (event is PiEvent.Response && event.id == requestId) reply.complete(event)
+                }
+            }
+            val sent = runCatching { engine.send(id, command, requestId) }
+            if (sent.isFailure) {
+                collector.cancel()
+                pendingCommandIds -= requestId
+                switching = false
+                _notice.value = "${label}失败：${sent.exceptionOrNull()?.message ?: "未知原因"}"
+                return@launch
+            }
+            val event = withTimeoutOrNull(SESSION_ROLL_TIMEOUT_MS) { reply.await() }
+            collector.cancel()
+            switching = false
+            if (event == null) {
+                pendingCommandIds -= requestId
+                _notice.value = "${label}超时（${SESSION_ROLL_TIMEOUT_MS}ms），已保留原会话"
+                return@launch
+            }
+            pendingCommandIds -= requestId
+            if (!event.success) {
+                _notice.value = "${label}失败：${event.error ?: "pi 侧回了 success=false"}"
+                return@launch
+            }
+            _notice.value = null
+            onSessionRolled()
+        }
+    }
+
+    /** 切换成功的清场（§4.3 原文：turnState=Idle + transcript 清空 + 「加载中」条目）。 */
+    private fun onSessionRolled() {
+        cancelPermissionOnce() // 挂着的权限弹框随旧会话一起作废（补 cancelled 恰好一次）
+        flushDraft()
+        _turnState.value = TurnState.Idle
+        _queueDepth.value = 0
+        _commandResult.value = null
+        _retryNote.value = null
+        showLoadingNote()
+    }
+
+    /** 挂「加载中」占位，并给它一个自动撤身时限（§4.3）。 */
+    private fun showLoadingNote() {
+        noteExpiryJob?.cancel()
+        _transcript.value = listOf(TranscriptItem.NoteItem(nextItemId(), SWITCHING_NOTE_TEXT))
+        noteExpiryJob = viewModelScope.launch {
+            delay(SWITCH_NOTE_TIMEOUT_MS)
+            hideLoadingNote()
+        }
+    }
+
+    /** 撤掉占位行（真内容已经到了就是空操作）。 */
+    private fun hideLoadingNote() {
+        noteExpiryJob?.cancel()
+        noteExpiryJob = null
+        if (_transcript.value.none { it is TranscriptItem.NoteItem }) return
+        _transcript.update { list -> list.filterNot { it is TranscriptItem.NoteItem } }
+    }
+
     /**
      * 权限三选一（§5.2）。全 false = 非法调用，直接忽略。
      *
@@ -274,14 +454,22 @@ class ChatViewModel @Inject constructor(
 
     // ── 入站装配（§5.1 事件映射）─────────────────────────────────────────────────
 
+    /**
+     * 入站装配（§5.1 事件映射）。
+     *
+     * 开头那行 `flushDraft()` 是 §3.3 debounce 的**另一半语义**：只有「正文 delta」
+     * 允许延迟提交，其它任何事件先到都先把草稿落地——否则 `text_end`/`message_end`
+     * 的定稿、工具卡的插入会跑到未提交的文字前面，转录顺序就错了。
+     */
     @Suppress("CyclomaticComplexMethod", "LongMethod")
     private fun onEvent(event: PiEvent) {
+        if (!isTextDelta(event)) flushDraft()
         when (event) {
             is PiEvent.MessageStart -> onMessageStart(event.message)
             is PiEvent.MessageEnd -> onMessageEnd(event.message)
             is PiEvent.MessageUpdate -> event.assistantMessageEvent?.let { onAssistantEvent(it) }
 
-            is PiEvent.ToolExecutionStart -> _transcript.update { list ->
+            is PiEvent.ToolExecutionStart -> mutateTranscript { list ->
                 list + TranscriptItem.ToolItem(
                     id = nextItemId(),
                     callId = event.toolCallId,
@@ -294,7 +482,7 @@ class ChatViewModel @Inject constructor(
 
             is PiEvent.BashExecutionUpdate -> appendBashOutput(event.id, event.delta)
 
-            is PiEvent.ToolExecutionEnd -> _transcript.update { list ->
+            is PiEvent.ToolExecutionEnd -> mutateTranscript { list ->
                 list.map { item ->
                     if (item is TranscriptItem.ToolItem && item.callId == event.toolCallId) {
                         item.copy(
@@ -338,14 +526,14 @@ class ChatViewModel @Inject constructor(
     private fun onMessageStart(message: PiMessage) {
         when (message.role) {
             ROLE_USER -> addUserItem(contentToText(message.content))
-            ROLE_ASSISTANT -> _transcript.update { list -> list + TranscriptItem.AssistantItem(nextItemId()) }
+            ROLE_ASSISTANT -> mutateTranscript { list -> list + TranscriptItem.AssistantItem(nextItemId()) }
             else -> Unit // system / toolResult 不开新气泡（工具结果落进 ToolItem 输出）
         }
     }
 
     private fun onMessageEnd(message: PiMessage) {
         when (message.role) {
-            ROLE_ASSISTANT -> _transcript.update { list ->
+            ROLE_ASSISTANT -> mutateTranscript { list ->
                 list.indexOfLast { it is TranscriptItem.AssistantItem }.takeIf { it >= 0 }?.let { index ->
                     val item = list[index] as TranscriptItem.AssistantItem
                     list.subList(0, index) + item.copy(
@@ -367,7 +555,8 @@ class ChatViewModel @Inject constructor(
     private fun onAssistantEvent(event: AssistantMessageEvent) {
         when (event) {
             is AssistantMessageEvent.TextStart -> ensureAssistant()
-            is AssistantMessageEvent.TextDelta -> updateLastAssistant { it.copy(text = it.text + event.delta) }
+            // 正文 delta 是**唯一**允许延迟提交的事件（§3.3：80ms debounce 后一次性进末条）
+            is AssistantMessageEvent.TextDelta -> appendTextDelta(event.delta)
             is AssistantMessageEvent.TextEnd -> updateLastAssistant {
                 it.copy(text = it.text.ifEmpty { event.content }, settled = true)
             }
@@ -466,6 +655,58 @@ class ChatViewModel @Inject constructor(
 
     // ── transcript 写入 helper（全部「整表替换」）───────────────────────────────
 
+    /**
+     * 转录写入的**唯一**入口：先撤「加载中」占位行，再整表替换（§4.3）。
+     *
+     * 单点清场的理由：占位行的语义是「pi 还没吐出这一页的真内容」，所以判据不能散在
+     * 八个分支里（漏一个分支就会留一行永远挂着的「加载中」）；写在这里，
+     * 任何一条真事件落地都必然带它走。`transform` 必须**纯**——
+     * `StateFlow.update` 是 CAS 重试循环，带副作用的 lambda 会被执行多次。
+     */
+    private inline fun mutateTranscript(transform: (List<TranscriptItem>) -> List<TranscriptItem>) {
+        _transcript.update { list ->
+            val cleaned = if (list.none { it is TranscriptItem.NoteItem }) list else list.filterNot { it is TranscriptItem.NoteItem }
+            transform(cleaned)
+        }
+    }
+
+    /** 正文 delta 的合并窗口（§3.3 原文 80ms）：到点才提交一次，期间只攒草稿。 */
+    private fun appendTextDelta(delta: String) {
+        if (delta.isEmpty()) return
+        draftText.append(delta)
+        draftFlushJob?.cancel()
+        draftFlushJob = viewModelScope.launch {
+            delay(DELTA_DEBOUNCE_MS)
+            flushDraft()
+        }
+    }
+
+    /**
+     * 把草稿一次性提交进末条 assistant。
+     *
+     * 挂 [appendTextDelta] 的挂起协程与 [onEvent] 的「非 delta 事件先到」两条路；
+     * 空草稿时是纯空操作，所以可以无脑在每条路径上调用。
+     */
+    private fun flushDraft() {
+        draftFlushJob?.cancel()
+        draftFlushJob = null
+        if (draftText.isEmpty()) return
+        val chunk = draftText.toString()
+        draftText.setLength(0)
+        mutateTranscript { list ->
+            val index = list.indexOfLast { it is TranscriptItem.AssistantItem }
+            if (index < 0) list + TranscriptItem.AssistantItem(id = nextItemId(), text = chunk)
+            else list.toMutableList().also {
+                val item = it[index] as TranscriptItem.AssistantItem
+                it[index] = item.copy(text = item.text + chunk)
+            }
+        }
+    }
+
+    /** 「只有正文 delta 允许延迟」这条规则的判据（§3.3）。 */
+    private fun isTextDelta(event: PiEvent): Boolean =
+        event is PiEvent.MessageUpdate && event.assistantMessageEvent is AssistantMessageEvent.TextDelta
+
     private fun nextItemId(): Int = ++itemSeq
 
     private fun nextCommandId(): String = "ui-${++commandSeq}"
@@ -473,7 +714,7 @@ class ChatViewModel @Inject constructor(
     /** 本地即时入列 + 去重：pi 的 `message_start(user)` 回声不能把气泡复制一遍。 */
     private fun addUserItem(text: String) {
         if (text.isEmpty()) return
-        _transcript.update { list ->
+        mutateTranscript { list ->
             val echoed = list.lastOrNull() is TranscriptItem.UserItem &&
                 (list.last() as TranscriptItem.UserItem).text == text
             if (echoed) list else list + TranscriptItem.UserItem(nextItemId(), text)
@@ -482,14 +723,14 @@ class ChatViewModel @Inject constructor(
 
     /** delta 到达但没收到 message_start 时，也要有一条可写的 assistant。 */
     private fun ensureAssistant() {
-        _transcript.update { list ->
+        mutateTranscript { list ->
             if (list.lastOrNull() is TranscriptItem.AssistantItem) list
             else list + TranscriptItem.AssistantItem(nextItemId())
         }
     }
 
     private inline fun updateLastAssistant(transform: (TranscriptItem.AssistantItem) -> TranscriptItem.AssistantItem) {
-        _transcript.update { list ->
+        mutateTranscript { list ->
             val index = list.indexOfLast { it is TranscriptItem.AssistantItem }
             if (index < 0) list + TranscriptItem.AssistantItem(nextItemId())
             else list.toMutableList().also { it[index] = transform(it[index] as TranscriptItem.AssistantItem) }
@@ -497,7 +738,7 @@ class ChatViewModel @Inject constructor(
     }
 
     private fun settleLastAssistant() {
-        _transcript.update { list ->
+        mutateTranscript { list ->
             val index = list.indexOfLast { it is TranscriptItem.AssistantItem }
             if (index < 0) list
             else list.toMutableList().also {
@@ -508,7 +749,7 @@ class ChatViewModel @Inject constructor(
 
     private fun appendToolOutput(callId: String, text: String) {
         if (text.isEmpty()) return
-        _transcript.update { list ->
+        mutateTranscript { list ->
             list.map { item ->
                 if (item is TranscriptItem.ToolItem && item.callId == callId) item.copy(output = item.output + text)
                 else item
@@ -519,7 +760,7 @@ class ChatViewModel @Inject constructor(
     /** `bash_execution_update`：id 为 null 时落到最后一条仍在 Running 的工具卡。 */
     private fun appendBashOutput(id: String?, delta: String) {
         if (delta.isEmpty()) return
-        _transcript.update { list ->
+        mutateTranscript { list ->
             val index = list.indexOfLast { item ->
                 item is TranscriptItem.ToolItem && (id != null && item.callId == id ||
                     id == null && item.status == ToolStatus.Running)
@@ -557,3 +798,21 @@ internal fun String.truncate(limit: Int = CAUSE_MAX_LEN): String =
 
 /** 上屏失败原因的最大长度（§6「cause（截断）」）。 */
 private const val CAUSE_MAX_LEN = 240
+
+/**
+ * 正文 delta 的合并窗口（§3.3 原文 80ms）。
+ *
+ * 之所以做成常量而不是 `flow { … }.debounce(80)`：VM 的转录是「整表替换的快照」，
+ * 不是可串联的流；再套一层 Flow 只会让「谁拥有 transcript」这条纪律多一个所有者。
+ * 虚拟时钟测试直接 `advanceTimeBy(DELTA_DEBOUNCE_MS)` 推它。
+ */
+internal const val DELTA_DEBOUNCE_MS: Long = 80L
+
+/** 「加载中」占位行的自动撤身时限：pi 不吐内容时不留死行（§4.3）。 */
+internal const val SWITCH_NOTE_TIMEOUT_MS: Long = 3_000L
+
+/** `switch_session`/`new_session` 等回执的上限（与设置页探针同一档，RECON-P2E §5）。 */
+internal const val SESSION_ROLL_TIMEOUT_MS: Long = 5_000L
+
+/** 占位行文案（UI/VM 测试按同一常量断言，不重复字面量）。 */
+internal const val SWITCHING_NOTE_TEXT: String = "会话切换中…"

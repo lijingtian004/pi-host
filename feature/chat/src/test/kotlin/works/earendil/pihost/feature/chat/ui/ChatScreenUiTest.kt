@@ -38,6 +38,7 @@ import works.earendil.pihost.feature.chat.ChatUiState
 import works.earendil.pihost.feature.chat.ChatViewModel
 import works.earendil.pihost.feature.chat.FakeChatEngine
 import works.earendil.pihost.feature.chat.FakeRuntimeInstall
+import works.earendil.pihost.feature.chat.FakeSettingsRepository
 import works.earendil.pihost.feature.chat.ToolCallRecord
 import works.earendil.pihost.feature.chat.ToolStatus
 import works.earendil.pihost.feature.chat.TranscriptItem
@@ -71,12 +72,19 @@ class ChatScreenUiTest {
 
     private val engine = FakeChatEngine()
     private val installer = FakeRuntimeInstall()
+    private val settings = FakeSettingsRepository()
     private lateinit var vm: ChatViewModel
 
     @Before
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        vm = ChatViewModel(RuntimeEnvironment.getApplication(), engine, installer)
+        vm = ChatViewModel(
+            RuntimeEnvironment.getApplication(),
+            engine,
+            installer,
+            settings,
+            buildMarkwon(RuntimeEnvironment.getApplication()),
+        )
     }
 
     @After
@@ -185,7 +193,9 @@ class ChatScreenUiTest {
             TranscriptItem.ToolItem(4, "call-2", "read", ToolStatus.Error, "ENOENT"),
             TranscriptItem.ToolItem(5, "call-3", "edit", ToolStatus.Running, ""),
         )
-        composeRule.setContent { PiHostTheme { TranscriptList(items = items) } }
+        composeRule.setContent {
+            PiHostTheme { TranscriptList(items = items, markwon = vm.markwon) }
+        }
 
         // TranscriptList 的自动滚动会把视口贴到底（§6），首条因此在屏幕外：
         // 断言可见之前先 performScrollTo()——它沿祖先链对每个可滚动容器做 scrollUntilVisible，
@@ -194,9 +204,10 @@ class ChatScreenUiTest {
         composeRule.onNodeWithTag(ChatTags.user(1)).performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("跑一下分支命令").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag(ChatTags.assistant(2)).performScrollTo().assertIsDisplayed()
-        // 正文：围栏内容仍作为独立段落出现（§13 偏差 1：monospace，不引 markwon）
-        composeRule.onNodeWithText("已在 main 分支").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithText("git status").performScrollTo().assertIsDisplayed()
+        // §4.3 等价调整：正文改由 markwon 经 AndroidView 渲染，`onNodeWithText` 只看 Compose
+        // 语义树的 Text 节点、看不见 interop 里的 TextView，故这里的判据换成「渲染体在场」；
+        // **渲染出的文字内容**由 MarkwonRenderTest（createAndroidComposeRule + 视图遍历）覆盖。
+        composeRule.onNodeWithTag(ChatTags.markdown(2)).performScrollTo().assertIsDisplayed()
         // thinking 默认收起 → 点击展开
         composeRule.onNodeWithText("先看 git 状态").assertDoesNotExist()
         composeRule.onNodeWithTag(ChatTags.thinking(2)).performScrollTo().performClick()
@@ -262,6 +273,36 @@ class ChatScreenUiTest {
         engine.setState(SessionState.Restarting(attempt = 3, backoffMs = 16_000L))
         composeRule.waitForIdle()
         composeRule.onNodeWithTag(ChatTags.ENGINE_STATUS).assertTextEquals("重启第 3 次")
+    }
+
+    // ── ⑥ 并行上限门的 UI 反馈（§4.3：提示 + 不 spawn + 放宽后可重试）─────────────
+
+    @Test
+    fun parallelGateSurfacesTheNoticeBannerAndStaysRetryable() {
+        engine.setStateFor("another-session", SessionState.Ready)
+        settings.setMaxParallel(1)
+
+        composeRule.setContent { PiHostTheme { ChatScreen(viewModel = vm, notificationGate = {}) } }
+        composeRule.onNodeWithTag(ChatTags.INSTALL_BUTTON).performClick()
+        composeRule.waitForIdle()
+
+        // 同一条文案会出现在**两个**节点上（banner 与安装门的 cause），
+        // 所以按 tag 定位、不做全文搜索（onNodeWithText 要求唯一命中）。
+        composeRule.onNodeWithTag(ChatTags.NOTICE).assertIsDisplayed()
+        val cause = (vm.uiState.value as ChatUiState.Failed).cause
+        assertTrue("cause 要写明上限，实为 $cause", cause.contains("并行上限 1"))
+        composeRule.onNodeWithTag(ChatTags.NOTICE).assertTextEquals(cause)
+        // 门拦下 = Failed 分支（「引擎起不来」），重试键必须在
+        composeRule.onNodeWithText("启动失败").assertIsDisplayed()
+        assertEquals("被拦住时一次都不许碰引擎", 0, engine.startCalls.get())
+
+        // 放宽上限后点重试 = 正常走完安装门进主界面（starting 闩已放开）
+        settings.setMaxParallel(2)
+        composeRule.onNodeWithTag(ChatTags.INSTALL_RETRY_BUTTON).performClick()
+        composeRule.waitForIdle()
+        assertEquals(ChatUiState.Ready(FakeChatEngine.SESSION), vm.uiState.value)
+        composeRule.onNodeWithTag(ChatTags.TRANSCRIPT).assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.NOTICE).assertDoesNotExist()
     }
 
     private companion object {

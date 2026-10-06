@@ -3,6 +3,9 @@ package works.earendil.pihost
 import android.Manifest
 import android.app.Application
 import android.os.Looper
+import android.view.View
+import android.view.ViewGroup
+import android.widget.TextView
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -18,6 +21,7 @@ import dagger.hilt.android.testing.HiltAndroidRule
 import dagger.hilt.android.testing.HiltAndroidTest
 import dagger.hilt.android.testing.HiltTestApplication
 import dagger.hilt.android.testing.UninstallModules
+import java.time.Duration
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -100,6 +104,38 @@ class MainActivityTest {
             composeRule.waitForIdle()
             shadowOf(Looper.getMainLooper()).idle()
         }
+    }
+
+    /**
+     * 把主 looper 的时钟**往前推**一个 debounce 窗口（§3.3 的 80ms 合并提交）。
+     *
+     * `idle()` 只跑「已到期」的任务、不前进时钟，而 `viewModelScope` 的 `delay(80)`
+     * 在 Robolectric 的 PAUSED looper 上是一条**未来**消息——不推时钟就永远不冲刷，
+     * 正文停在空串、markwon 的 AndroidView 压根不创建（实测 renderedBody 为空）。
+     * 单独成一只 helper 而不是塞进 [pump]：推进时钟会牵动权限倒计时那条 1s 节拍，
+     * 120ms < 1000ms 不会误触发它，但没必要时不必推进。
+     */
+    private fun pumpDebounceWindow() {
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(DEBOUNCE_PUMP_MS))
+        composeRule.waitForIdle()
+    }
+
+    /**
+     * 宿主视图树里所有 TextView 的真实文本（P2E §4.3 的等价判据）。
+     *
+     * assistant 正文改由 markwon 经 `AndroidView` 渲染后，**不在 Compose 语义树里**：
+     * `onNodeWithText` 只看 Text/InputText/EditableText 语义节点，看不见 interop 里的 TextView，
+     * 所以「正文有没有出现在屏幕上」这类断言一律下移到真实视图层
+     * （气泡/工具卡/输入框这些 Compose 节点仍按 tag/文本断言，一条没少）。
+     */
+    private fun renderedBody(): String {
+        val out = ArrayList<TextView>(8)
+        fun walk(view: View) {
+            if (view is TextView) out.add(view)
+            if (view is ViewGroup) for (i in 0 until view.childCount) walk(view.getChildAt(i))
+        }
+        walk(composeRule.activity.window.decorView)
+        return out.joinToString(separator = "\n") { it.text?.toString().orEmpty() }
     }
 
     /** 点安装按钮 → Ready（顶栏出现即代表 uiState 已是 Ready）。 */
@@ -234,8 +270,8 @@ class MainActivityTest {
         engine.emit(PiEvent.MessageStart(PiMessage(role = "assistant", content = JsonArray(emptyList()))))
         engine.emit(update(AssistantMessageEvent.TextDelta(0, "好的")))
         engine.emit(update(AssistantMessageEvent.TextDelta(0, "，已在 main")))
-        pump()
-        composeRule.onNodeWithText("好的，已在 main").performScrollTo().assertIsDisplayed()
+        pumpDebounceWindow()
+        assertTrue("markwon 渲染体必须带出合并后的正文，实为 ${renderedBody()}", renderedBody().contains("好的，已在 main"))
 
         engine.emit(PiEvent.TurnEnd(message = PiMessage(role = "assistant")))
         pump()
@@ -276,8 +312,8 @@ class MainActivityTest {
         // 所以脚本按 §4.2 的真实形状走：先 text_start 再 delta。
         engine.emit(update(AssistantMessageEvent.TextStart(0)))
         engine.emit(update(AssistantMessageEvent.TextDelta(0, "通知被拒也不影响这一轮")))
-        pump()
-        composeRule.onNodeWithText("通知被拒也不影响这一轮").performScrollTo().assertIsDisplayed()
+        pumpDebounceWindow()
+        assertTrue("通知被拒不阻塞渲染，实为 ${renderedBody()}", renderedBody().contains("通知被拒也不影响这一轮"))
     }
 
     // ── ⑧ 停止通路：VM 的 abort + 服务侧 ACTION_STOP 的意图构造 ───────────────────
@@ -332,6 +368,12 @@ class MainActivityTest {
     }
 
     private companion object {
+        /**
+         * 推时钟的步长：略大于 :feature:chat 的 80ms 合并窗口（跨模块拿不到那个 internal 常量，
+         * 这里按 §3.3 原文取值 + 40ms 余量；改窗口就得同步改这里，是唯一一处重复的字面量）。
+         */
+        const val DEBOUNCE_PUMP_MS = 120L
+
         /** 权限请求（§3.7 形状）；`timeout` 单位毫秒，冻结区 PiEvent.ExtensionUiRequest 原文。 */
         fun uiRequest(id: String, method: String, timeoutMs: Long): PiEvent.ExtensionUiRequest =
             PiEvent.ExtensionUiRequest(

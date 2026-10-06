@@ -32,10 +32,12 @@ import org.robolectric.annotation.Config
 import works.earendil.pihost.core.engine.InstallProgress
 import works.earendil.pihost.core.engine.PiEngineService
 import works.earendil.pihost.core.engine.SessionState
+import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.rpc.AssistantMessageEvent
 import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.PiMessage
 import works.earendil.pihost.core.rpc.RpcCommand
+import works.earendil.pihost.feature.chat.ui.buildMarkwon
 
 /**
  * ChatViewModel 状态机 + 事件装配（规格书 §7 交付物 D 的 VM 侧 ≥9 条，实交 12 条）。
@@ -66,15 +68,25 @@ class ChatViewModelTest {
         val vm: ChatViewModel,
         val engine: FakeChatEngine,
         val installer: FakeRuntimeInstall,
+        val settings: FakeSettingsRepository,
     )
 
     private fun TestScope.rig(
         engine: FakeChatEngine = FakeChatEngine(),
         installer: FakeRuntimeInstall = FakeRuntimeInstall(),
+        settings: FakeSettingsRepository = FakeSettingsRepository(),
     ): Rig {
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         val app = RuntimeEnvironment.getApplication()
-        return Rig(app, ChatViewModel(app, engine, installer), engine, installer)
+        // markwon 走真实装配（buildMarkwon 与 Hilt 的 @Singleton 同一配方）：VM 只转交它，
+        // 但构造点必须与 production 一致，否则「渲染层换实现」这类回归在这里测不出来。
+        return Rig(
+            app,
+            ChatViewModel(app, engine, installer, settings, buildMarkwon(app)),
+            engine,
+            installer,
+            settings,
+        )
     }
 
     /** 逐值快照（Unconfined 收集 → 每次 `value=` 都同步入列，不被 conflation 吞）。 */
@@ -192,6 +204,10 @@ class ChatViewModelTest {
         rig.engine.emit(PiEvent.MessageStart(PiMessage(role = "assistant", content = JsonArray(emptyList()))))
         rig.engine.emit(update(AssistantMessageEvent.TextDelta(0, "好的")))
         rig.engine.emit(update(AssistantMessageEvent.TextDelta(0, "，已切到 main")))
+        // §3.3 等价调整：正文 delta 不再逐条落 transcript，而是攒 80ms 后一次提交
+        // （合并语义与「拼进末条 assistant」这条断言完全同值，只是提交时刻被推迟了一个窗口）。
+        advanceTimeBy(DELTA_DEBOUNCE_MS)
+        runCurrent()
         assertEquals("两段 delta 必须拼进末条 assistant", "好的，已切到 main", rig.assistant().text)
 
         rig.engine.emit(PiEvent.TurnEnd(message = PiMessage(role = "assistant")))
@@ -213,6 +229,7 @@ class ChatViewModelTest {
         rig.engine.emit(update(AssistantMessageEvent.ThinkingDelta(0, "再切分支")))
         rig.engine.emit(update(AssistantMessageEvent.ThinkingEnd(0, "ignored")))
         rig.engine.emit(update(AssistantMessageEvent.TextDelta(0, "正文")))
+        advanceTimeBy(DELTA_DEBOUNCE_MS) // §3.3：正文 delta 走 80ms 合并窗口（thinking 不走）
         runCurrent()
 
         val item = rig.assistant()
@@ -560,6 +577,216 @@ class ChatViewModelTest {
         rig.engine.emit(PiEvent.BashExecutionUpdate(id = "b1", delta = ""))
         runCurrent()
         assertEquals(snapshot, rig.vm.transcript.value)
+    }
+
+    // ── 用例 14：§4.3 switchSession 成功回执后才清场，并挂「加载中」占位 ──────────
+
+    @Test
+    fun `case14 switchSession waits for its own response before wiping the transcript`() = runTest {
+        val rig = rig()
+        ready(rig)
+        // 先攒一点上一条会话的内容（切换失败时这条快照必须原样还在）
+        rig.engine.emit(PiEvent.MessageStart(PiMessage(role = "user", content = textBlocks("上一条会话的问题"))))
+        val before = rig.vm.transcript.value
+
+        val path = "/files/home/.pi/agent/sessions/--p--/a.jsonl"
+        rig.vm.switchSession(path)
+        runCurrent()
+
+        val sent = rig.engine.sent.last()
+        assertEquals("命令必须就是 switch_session(路径)", RpcCommand.SwitchSession(path), sent.command)
+        assertNotNull("必须自带 requestId 才能认出这条回执", sent.id)
+        assertEquals("回执未定之前不许清场", before, rig.vm.transcript.value)
+
+        // 别人的回执不算数（id 不匹配）
+        rig.engine.emit(PiEvent.Response(id = "not-mine", command = "switch_session", success = true))
+        runCurrent()
+        assertEquals(before, rig.vm.transcript.value)
+
+        rig.engine.emit(PiEvent.Response(id = sent.id, command = "switch_session", success = true))
+        runCurrent()
+
+        val rolled = rig.vm.transcript.value
+        assertEquals("切换成功 = 清空 + 一条占位", 1, rolled.size)
+        val note = rolled.single()
+        assertTrue("占位必须是 NoteItem，实为 $note", note is TranscriptItem.NoteItem)
+        assertEquals(SWITCHING_NOTE_TEXT, (note as TranscriptItem.NoteItem).text)
+        assertEquals(TurnState.Idle, rig.vm.turnState.value)
+        assertNull("成功路径不该留提示", rig.vm.notice.value)
+
+        // 真内容到了 → 占位行由写入点单点撤除（§4.3）
+        rig.engine.emit(PiEvent.MessageStart(PiMessage(role = "assistant", content = JsonArray(emptyList()))))
+        runCurrent()
+        assertTrue(rig.vm.transcript.value.none { it is TranscriptItem.NoteItem })
+        assertEquals(1, rig.vm.transcript.value.size)
+    }
+
+    // ── 用例 15：切换失败（success=false / 本地发送失败 / 超时）一律不动转录 ───────
+
+    @Test
+    fun `case15 a failed session switch keeps the transcript and reports the reason`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.vm.sendPrompt("留在原会话的问题")
+        runCurrent()
+        val before = rig.vm.transcript.value
+        assertEquals(1, before.size)
+
+        // ① pi 回了 success=false
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/gone.jsonl")
+        runCurrent()
+        val firstId = rig.engine.sent.last().id
+        rig.engine.emit(PiEvent.Response(id = firstId, command = "switch_session", success = false, error = "会话文件不存在"))
+        runCurrent()
+        assertEquals("失败必须原样保留内容", before, rig.vm.transcript.value)
+        assertTrue("提示要带 pi 给的原因，实为 ${rig.vm.notice.value}", rig.vm.notice.value!!.contains("会话文件不存在"))
+
+        // ② 本地发送就抛（没有活动进程）
+        rig.vm.consumeNotice()
+        rig.engine.sendError = IllegalStateException("no active pi process")
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/b.jsonl")
+        runCurrent()
+        assertEquals(before, rig.vm.transcript.value)
+        assertTrue(rig.vm.notice.value!!.contains("no active pi process"))
+
+        // 闩放开了：清掉错误后还能再发（sendError 若卡住 switching 就永远发不出第二条）
+        rig.engine.sendError = null
+        val sendsBefore = rig.engine.sent.size
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/c.jsonl")
+        runCurrent()
+        assertEquals("上一条失败后 switching 闩必须已放开", sendsBefore + 1, rig.engine.sent.size)
+    }
+
+    // ── 用例 16：切换超时（虚拟时钟推到 SESSION_ROLL_TIMEOUT_MS）─────────────────
+
+    @Test
+    fun `case16 an unanswered switch times out without touching the transcript`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.emit(PiEvent.MessageStart(PiMessage(role = "assistant", content = textBlocks("原样留着"))))
+        val before = rig.vm.transcript.value
+
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/slow.jsonl")
+        runCurrent()
+        assertEquals("超时前同样不许清场", before, rig.vm.transcript.value)
+
+        // 超时跑在 viewModelScope 上（RECON-P2E §5：Unconfined 不实现 Delay，虚拟时钟推不到它）
+        advanceTimeBy(SESSION_ROLL_TIMEOUT_MS)
+        runCurrent()
+        assertTrue("超时要给可读提示，实为 ${rig.vm.notice.value}", rig.vm.notice.value!!.contains("超时"))
+        assertEquals(before, rig.vm.transcript.value)
+        assertTrue(rig.vm.transcript.value.none { it is TranscriptItem.NoteItem })
+    }
+
+    // ── 用例 17：newSession 走同一条流程；占位行有自动撤身时限 ────────────────────
+
+    @Test
+    fun `case17 newSession rolls the transcript and the loading note expires on its own`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.emit(PiEvent.MessageStart(PiMessage(role = "user", content = textBlocks("旧问题"))))
+
+        rig.vm.newSession()
+        runCurrent()
+        assertEquals(RpcCommand.NewSession(), rig.engine.sent.last().command)
+
+        val sentId = rig.engine.sent.last().id
+        rig.engine.emit(PiEvent.Response(id = sentId, command = "new_session", success = true))
+        runCurrent()
+        assertEquals(listOf(SWITCHING_NOTE_TEXT), rig.vm.transcript.value.filterIsInstance<TranscriptItem.NoteItem>().map { it.text })
+
+        // pi 什么都不发（新会话本来就是空的）→ 时限一到占位行自己退场，不留死行
+        advanceTimeBy(SWITCH_NOTE_TIMEOUT_MS)
+        runCurrent()
+        assertTrue("时限到了必须撤干净", rig.vm.transcript.value.isEmpty())
+    }
+
+    // ── 用例 18：maxParallelSessions 门（§4.3 / §13 偏差 6：VM 层自查，不碰引擎）──
+
+    @Test
+    fun `case18 the parallel gate blocks start and raises no foreground service intent`() = runTest {
+        val engine = FakeChatEngine()
+        engine.setStateFor("another-session", SessionState.Ready)
+        val rig = rig(engine = engine, settings = FakeSettingsRepository(AppSettings(maxParallelSessions = 1)))
+
+        rig.vm.installAndStart()
+        runCurrent()
+
+        val state = rig.vm.uiState.value
+        assertTrue("超限应落 Failed（引擎起不来 + 可读原因），实际 $state", state is ChatUiState.Failed)
+        assertEquals("门必须在 spawn 之前拦住", 0, engine.startCalls.get())
+        assertNull("连 FGS 意图都不该发（§13 偏差 6 的次序反过来做就是空起一个前台服务）", shadowOf(rig.app).peekNextStartedService())
+        assertTrue("提示要写明上限，实为 ${rig.vm.notice.value}", rig.vm.notice.value!!.contains("并行上限 1"))
+
+        // 上限放宽后重试即通过（starting 闩已放开）
+        rig.vm.consumeNotice()
+        rig.settings.setMaxParallel(2)
+        val sessionId = ready(rig)
+        assertEquals(FakeChatEngine.SESSION, sessionId)
+        assertEquals(1, engine.startCalls.get())
+    }
+
+    // ── 用例 19：终态会话不占配额（Stopped/Failed 已经没有 pi 进程）───────────────
+
+    @Test
+    fun `case19 terminal sessions do not occupy the parallel quota`() = runTest {
+        val engine = FakeChatEngine()
+        engine.setStateFor("dead", SessionState.Stopped)
+        engine.setStateFor("crashed", SessionState.Failed("退避额度耗尽"))
+        val rig = rig(engine = engine, settings = FakeSettingsRepository(AppSettings(maxParallelSessions = 2)))
+
+        assertEquals(FakeChatEngine.SESSION, ready(rig))
+        assertTrue(rig.vm.uiState.value is ChatUiState.Ready)
+
+        // 第三条才撞门：Ready(本会话) + Ready(另一条) = 2 已达上限
+        engine.setStateFor("second", SessionState.Ready)
+        val blocked = ChatViewModel(
+            rig.app,
+            engine,
+            FakeRuntimeInstall(),
+            FakeSettingsRepository(AppSettings(maxParallelSessions = 2)),
+            buildMarkwon(rig.app),
+        )
+        blocked.installAndStart()
+        runCurrent()
+        assertTrue("两条在跑 + 上限 2 必须拦住，实际 ${blocked.uiState.value}", blocked.uiState.value is ChatUiState.Failed)
+        assertEquals("被拦住的这一次不许碰引擎", 1, engine.startCalls.get())
+    }
+
+    // ── 用例 20：§3.3 正文 delta 的 80ms 合并窗口与强制冲刷 ──────────────────────
+
+    @Test
+    fun `case20 text deltas merge over the debounce window and flush ahead of other events`() = runTest {
+        val rig = rig()
+        ready(rig)
+        val emissions = record(rig.vm.transcript)
+
+        rig.engine.emit(PiEvent.MessageStart(PiMessage(role = "assistant", content = JsonArray(emptyList()))))
+        runCurrent()
+        rig.engine.emit(update(AssistantMessageEvent.TextDelta(0, "一")))
+        rig.engine.emit(update(AssistantMessageEvent.TextDelta(0, "二")))
+        runCurrent()
+        assertEquals("窗口未到不提交", "", rig.assistant().text)
+
+        advanceTimeBy(DELTA_DEBOUNCE_MS)
+        runCurrent()
+        assertEquals("一个窗口一次提交", "一二", rig.assistant().text)
+
+        // 非 delta 事件先到 = 立刻冲刷（否则 text_end 的定稿会跑到未提交文字前面）
+        rig.engine.emit(update(AssistantMessageEvent.TextDelta(0, "三")))
+        runCurrent()
+        assertEquals("窗口未到的三条仍在上一次的值上", "一二", rig.assistant().text)
+        rig.engine.emit(update(AssistantMessageEvent.TextEnd(0, "ignored")))
+        runCurrent()
+        assertEquals("冲刷先于定稿", "一二三", rig.assistant().text)
+        assertTrue(rig.assistant().settled)
+
+        // 「一个窗口一次提交」的可观测证据：正文只提交过两次（不是三条 delta 各提交一次）
+        val committed = emissions
+            .mapNotNull { it.filterIsInstance<TranscriptItem.AssistantItem>().lastOrNull()?.text }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        assertEquals(listOf("一二", "一二三"), committed)
     }
 
     private companion object {

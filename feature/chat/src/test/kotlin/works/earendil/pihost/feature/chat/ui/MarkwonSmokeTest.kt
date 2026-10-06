@@ -48,7 +48,7 @@ class MarkwonSmokeTest {
 
     @Test
     fun `smoke01 markwon core parses markdown into a spanned with real spans`() {
-        val markwon = smokeMarkwon(context)
+        val markwon = buildMarkwon(context)
         val rendered = markwon.render(markwon.parse("# 标题\n\n这是 **粗** 与 `code` 的正文"))
         val plain = rendered.toString()
 
@@ -62,7 +62,7 @@ class MarkwonSmokeTest {
     @Test
     fun `smoke02 androidView interop renders markwon into a live TextView under robolectric`() {
         composeRule.setContent {
-            SmokeMarkdownView(text = "## 冒烟\n\n正文 **b**", modifier = Modifier.testTag(TAG))
+            MarkdownBody(text = "## 冒烟\n\n正文 **b**", markwon = buildMarkwon(context), modifier = Modifier.testTag(TAG))
         }
         composeRule.onNodeWithTag(TAG).assertIsDisplayed()
         composeRule.waitForIdle()
@@ -77,7 +77,7 @@ class MarkwonSmokeTest {
 
     @Test
     fun `smoke03 fenced code is highlighted through prism4j without losing characters`() {
-        val markwon = smokeMarkwon(context)
+        val markwon = buildMarkwon(context)
         val code = "fun main() {\n    println(\"hi\")\n}"
         val plain = markwon.render(markwon.parse("```kotlin\n$code\n```")).toString()
 

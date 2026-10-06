@@ -20,6 +20,9 @@ import works.earendil.pihost.core.engine.InstallProgress
 import works.earendil.pihost.core.engine.RuntimeInstall
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.di.EngineModule
+import works.earendil.pihost.core.engine.settings.AppSettings
+import works.earendil.pihost.core.engine.settings.SettingsRepository
+import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
 import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.RpcCommand
@@ -42,9 +45,18 @@ object AppTestHolder {
     var installer: ScriptedRuntimeInstall = ScriptedRuntimeInstall()
         private set
 
+    /**
+     * 设置面（P2E §4.3）：`ChatViewModel` 现在要 [SettingsRepository] 才能建图
+     * （maxParallelSessions 门读它）。默认快照 = 上限 2，`sessionStates` 初值为空 ⇒
+     * app 侧主路径（安装门 → Ready）不会被门拦住，用例想演拦截就改 [ScriptedSettingsRepository]。
+     */
+    var settings: ScriptedSettingsRepository = ScriptedSettingsRepository()
+        private set
+
     fun reset() {
         engine = RecordingChatEngine()
         installer = ScriptedRuntimeInstall()
+        settings = ScriptedSettingsRepository()
     }
 }
 
@@ -74,6 +86,37 @@ object AppTestEngineModule {
 
     @Provides
     fun runtimeInstall(): RuntimeInstall = AppTestHolder.installer
+
+    @Provides
+    fun settingsRepository(): SettingsRepository = AppTestHolder.settings
+}
+
+/**
+ * [SettingsRepository] 假体：内存快照 + 调用记录，不碰磁盘（app 测试不引 DataStore 规则）。
+ *
+ * 存在的唯一理由是把 P2E 新增的注入依赖补全，让 `@UninstallModules(EngineModule::class)`
+ * 之后 Hilt 仍能建图；设置语义本身的覆盖在 `:core:engine` 的 SettingsRepositoryTest。
+ */
+class ScriptedSettingsRepository(initial: AppSettings = AppSettings()) : SettingsRepository {
+    private val _settings = MutableStateFlow(initial)
+    override val settings: StateFlow<AppSettings> = _settings.asStateFlow()
+
+    val writes = CopyOnWriteArrayList<String>()
+
+    override suspend fun setMemTier(tier: MemTier) {
+        writes.add("mem_tier=${tier.name}")
+        _settings.update { it.copy(memTier = tier) }
+    }
+
+    override suspend fun setMaxParallelSessions(count: Int) {
+        writes.add("max_parallel_sessions=$count")
+        _settings.update { it.copy(maxParallelSessions = count) }
+    }
+
+    override suspend fun setDefaultModel(model: String?) {
+        writes.add("default_model=$model")
+        _settings.update { it.copy(defaultModel = model) }
+    }
 }
 
 /**

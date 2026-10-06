@@ -10,6 +10,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -17,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.feature.chat.ChatUiState
 import works.earendil.pihost.feature.chat.ChatViewModel
@@ -45,33 +47,60 @@ fun ChatScreen(
     val permission by viewModel.permissionRequest.collectAsState()
     val engineStatus by viewModel.engineStatus.collectAsState()
     val retryNote by viewModel.retryNote.collectAsState()
+    val notice by viewModel.notice.collectAsState()
 
     val ready = uiState is ChatUiState.Ready
     notificationGate(ready)
 
+    // §4.3 的 snackbar 语义用「banner + 4s 自动收起」实现：Robolectric 下 SnackbarHost
+    // 的浮层不参与语义树（onNodeWithText 拿不到），banner 是普通节点，可测且与设置页同形。
+    LaunchedEffect(notice) {
+        if (notice != null) {
+            delay(NOTICE_AUTO_DISMISS_MS)
+            viewModel.consumeNotice()
+        }
+    }
+
     Surface(modifier = Modifier
             .fillMaxSize()
             .testTag(ChatTags.SCREEN)) {
-        when {
-            !ready -> InstallGate(
-                state = uiState,
-                onInstall = viewModel::installAndStart,
-                modifier = Modifier.padding(12.dp),
-            )
+        Column(modifier = Modifier.fillMaxSize()) {
+            notice?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .testTag(ChatTags.NOTICE),
+                )
+            }
+            when {
+                !ready -> InstallGate(
+                    state = uiState,
+                    onInstall = viewModel::installAndStart,
+                    modifier = Modifier.padding(12.dp),
+                )
 
-            else -> Column(modifier = Modifier.fillMaxSize()) {
-                EngineTopBar(
-                    sessionId = (uiState as ChatUiState.Ready).sessionId,
-                    engineStatus = engineStatus,
-                    queueDepth = queueDepth,
-                    retryNote = retryNote,
-                )
-                TranscriptList(items = transcript, modifier = Modifier.weight(1f))
-                InputBar(
-                    turnState = turnState,
-                    onSend = viewModel::sendPrompt,
-                    onAbort = viewModel::abort,
-                )
+                else -> Column(modifier = Modifier.fillMaxSize()) {
+                    EngineTopBar(
+                        sessionId = (uiState as ChatUiState.Ready).sessionId,
+                        engineStatus = engineStatus,
+                        queueDepth = queueDepth,
+                        retryNote = retryNote,
+                    )
+                    TranscriptList(
+                        items = transcript,
+                        markwon = viewModel.markwon,
+                        modifier = Modifier.weight(1f),
+                    )
+                    InputBar(
+                        turnState = turnState,
+                        onSend = viewModel::sendPrompt,
+                        onAbort = viewModel::abort,
+                    )
+                }
             }
         }
     }
@@ -134,3 +163,6 @@ fun engineShortCode(sessionId: String, state: SessionState?): String = when (sta
     is SessionState.Failed -> "失败：${state.cause.take(40)}"
     SessionState.Stopped -> "已停止"
 }
+
+/** notice banner 的自动收起时长（与 `:feature:sessions`/`:feature:settings` 同一档）。 */
+private const val NOTICE_AUTO_DISMISS_MS = 4_000L

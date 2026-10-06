@@ -46,6 +46,10 @@ dependencies {
     // 下游（app）不显式声明协程依赖也要能编译。
     api(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
+    // P2E 规格书 §3.4：SettingsRepository 落本模块（EngineModule 的 envFor lambda 要同步读
+    // memTier，见 §2 红线「EnvFactory 冻结、envFor 动态取」——repository 必须在 core 侧，
+    // 否则 core/engine → feature 反向依赖）。
+    api(libs.androidx.datastore.preferences)
     // Hilt：@AndroidEntryPoint 服务 + @Module 装配（规格书 §4.2.2）。
     // 升 api：下游（:feature:chat / :app）注入点要引用 dagger 注解与 @ApplicationContext。
     api(libs.hilt.android)

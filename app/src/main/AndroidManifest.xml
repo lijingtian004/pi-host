@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
+        android:name=".PiHostApp"
         android:allowBackup="false"
         android:label="pi host"
         android:supportsRtl="true"

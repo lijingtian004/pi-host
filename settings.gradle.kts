@@ -21,3 +21,5 @@ include(":core:process")
 include(":core:rpc")
 include(":core:environment")
 include(":core:engine")
+// P2D：Compose 聊天核心链（规格书 §4.1.2）
+include(":feature:chat")

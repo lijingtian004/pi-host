@@ -17,8 +17,9 @@ import works.earendil.pihost.core.engine.PiSpawn
 import works.earendil.pihost.core.engine.RuntimeInstall
 import works.earendil.pihost.core.engine.RuntimeInstallImpl
 import works.earendil.pihost.core.engine.SessionSupervisor
+import works.earendil.pihost.core.engine.settings.DataStoreSettingsRepository
+import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.EnvFactory
-import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.environment.PathLayout
 import works.earendil.pihost.core.process.JvmProcessFactory
 import works.earendil.pihost.core.process.ProcessStarter
@@ -30,8 +31,9 @@ import javax.inject.Singleton
  *
  * 组装件全部来自冻结区的公开工厂：
  * - argv = [PiSpawn]（libDir = `applicationInfo.nativeLibraryDir`、runtimeDir = [PathLayout.runtimeDir]）；
- * - env = `EnvFactory.build(ctx, MemTier.MID)`（规格书写死 MID，与 P2C 实际用的
- *   `MemTier.DEFAULT` 同值 192MB，这里按 §4.2.2 原文取 MID）；
+ * - env = `EnvFactory.build(ctx, settings.memTier)`（P2E §3.4 起改动态取；P2C/P2D 写死
+ *   `MemTier.MID`，与 `MemTier.DEFAULT` 同值 192MB，**默认行为一字未变**，
+ *   只是磁盘上真写了 LOW/HIGH 时下次 spawn 跟着变，§13 偏差 4）；
  * - 工作目录 = [PathLayout.projectDir]`("default")`（P3 才有项目切换）；
  * - starter = [JvmProcessFactory]。
  *
@@ -55,6 +57,20 @@ object EngineModule {
     @Provides
     @Singleton
     fun processStarter(): ProcessStarter = JvmProcessFactory
+
+    /**
+     * 设置仓库（P2E §4.2）。**必须 @Singleton**：DataStore 按文件路径持锁，
+     * 第二条实例直接抛 `IllegalStateException: There are multiple DataStores active for the same file`
+     * （RECON-P2E §3 结论 2 的实测栈顶是 `FileStorage.createConnection(FileStorage.kt:52)`）。
+     *
+     * 绑定挂在 [EngineModule] 而不是单开一个 `SettingsModule`：`:app`/`:core:engine` 的
+     * Hilt 测试一律靠 `@UninstallModules(EngineModule::class)` 换假体，
+     * 同一条 uninstall 就能把引擎面与设置面一起换掉，不用每个测试记两个模块名。
+     */
+    @Provides
+    @Singleton
+    fun settingsRepository(@ApplicationContext ctx: Context): SettingsRepository =
+        DataStoreSettingsRepository.create(ctx)
 
     /** 唯一项目目录名（P2C 的 `EngineRuntime.DEFAULT_PROJECT` 随静态桥一起迁到这里）。 */
     const val DEFAULT_PROJECT: String = "default"
@@ -83,12 +99,17 @@ object EngineModule {
         @EngineScope scope: CoroutineScope,
         starter: ProcessStarter,
         spawn: PiSpawn,
+        settings: SettingsRepository,
         @ApplicationContext ctx: Context,
     ): SessionSupervisor = SessionSupervisor(
         scope = scope,
         starter = starter,
         commandFor = spawn::command,
-        envFor = { EnvFactory.build(ctx, MemTier.MID) },
+        // P2E §3.4 + §13 偏差 4：memTier 热更新只影响**后续** spawn（EnvFactory 冻结、
+        // 每次 spawn 重新 build env），活动会话不受影响。lambda 同步读 SettingsRepository 的
+        // 内存快照 —— 快照由 DataStore 收集器维护，setter 落盘后立刻乐观改写，
+        // 所以这里既不挂起也不碰磁盘（RECON-P2E §3 / §7.6：repository 必须在 core 侧）。
+        envFor = { EnvFactory.build(ctx, settings.memTier) },
         workingDir = PathLayout.projectDir(ctx, DEFAULT_PROJECT).absolutePath,
     )
 

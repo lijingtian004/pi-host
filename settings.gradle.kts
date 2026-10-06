@@ -23,3 +23,6 @@ include(":core:environment")
 include(":core:engine")
 // P2D：Compose 聊天核心链（规格书 §4.1.2）
 include(":feature:chat")
+// P2E：会话列表屏 + 设置屏（规格书 §4.1 / §4.2）
+include(":feature:sessions")
+include(":feature:settings")

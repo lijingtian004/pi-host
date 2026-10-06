@@ -839,6 +839,55 @@ class ChatViewModelTest {
         assertEquals(listOf(RpcCommand.SwitchSession(path)), rig.engine.sent.map { it.command })
     }
 
+    // ── 用例 22（P2F §4.4）：spawn cause 含 error=13 → Failed.cause 追加 EACCES 提示 ──
+
+    @Test
+    fun `case22 an errno 13 spawn failure is humanized into the Failed cause`() = runTest {
+        val engine = FakeChatEngine().apply {
+            startState = SessionState.Failed(
+                "spawn 失败：Cannot run program \"/data/user/0/works.earendil.pihost/lib/libpi_node.so\": " +
+                    "error=13, Permission denied",
+            )
+            stderr = "failed to exec: errno 13"
+        }
+        val rig = rig(engine = engine)
+
+        rig.vm.installAndStart()
+        runCurrent()
+        val failed = rig.vm.uiState.value as ChatUiState.Failed
+
+        assertTrue("必须保留原始 errno 线索：${failed.cause}", failed.cause.contains("error=13"))
+        assertTrue("要出现 errno 13 的人话提示：${failed.cause}", failed.cause.contains("errno 13"))
+        assertTrue("要说明降级已自动试过：${failed.cause}", failed.cause.contains("linker64"))
+        assertTrue("stderr 尾巴不能被挤掉：${failed.cause}", failed.cause.contains("failed to exec"))
+    }
+
+    // ── 用例 23（P2F §4.4）：error=2 → ENOENT 提示；无 errno 的文案原样直通 ──────────
+
+    @Test
+    fun `case23 errno 2 gets the ENOENT hint and errno-less causes stay untouched`() = runTest {
+        val enoent = FakeChatEngine().apply {
+            startState = SessionState.Failed(
+                "spawn 失败：Cannot run program \"/data/user/0/works.earendil.pihost/lib/libpi_node.so\": " +
+                    "error=2, No such file or directory",
+            )
+        }
+        val first = rig(engine = enoent)
+        first.vm.installAndStart()
+        runCurrent()
+        val failed = first.vm.uiState.value as ChatUiState.Failed
+        assertTrue("要出现 ENOENT 提示：${failed.cause}", failed.cause.contains("ENOENT"))
+        assertTrue("提示要同时点到两种可能（exe / 工作目录）：${failed.cause}", failed.cause.contains("工作目录"))
+
+        // 反例：不含 `error=N` 的失败（如引擎抛普通异常）一个字都不许多
+        val plain = FakeChatEngine().apply { startError = IllegalStateException("引擎起不来") }
+        val second = rig(engine = plain)
+        second.vm.installAndStart()
+        runCurrent()
+        val untouched = second.vm.uiState.value as ChatUiState.Failed
+        assertFalse("无 errno 不得追加提示：${untouched.cause}", untouched.cause.contains("errno"))
+    }
+
     private companion object {
         fun update(event: AssistantMessageEvent): PiEvent =
             PiEvent.MessageUpdate(assistantMessageEvent = event)

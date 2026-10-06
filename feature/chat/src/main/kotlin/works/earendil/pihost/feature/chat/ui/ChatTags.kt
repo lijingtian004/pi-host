@@ -11,6 +11,9 @@ object ChatTags {
     const val INSTALL_BUTTON = "chat-install-button"
     const val INSTALL_RETRY_BUTTON = "chat-retry-button"
     const val INSTALL_CAUSE = "chat-install-cause"
+
+    /** P2F §4.2(b)：Failed 屏的「复制详情」（把未截断的 cause 全文送进剪贴板）。 */
+    const val INSTALL_COPY = "chat-install-copy"
     const val TOP_BAR = "chat-top-bar"
     const val ENGINE_STATUS = "chat-engine-status"
     const val QUEUE_BADGE = "chat-queue-badge"

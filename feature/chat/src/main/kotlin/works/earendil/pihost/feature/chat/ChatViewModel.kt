@@ -186,8 +186,12 @@ class ChatViewModel @Inject constructor(
             val exception = outcome.exceptionOrNull()
             val failedStep = installer.progress.value as? InstallProgress.Failed
             if (exception != null || outcome.getOrDefault(false) != true) {
+                // P2F §4.2(c)/§1.1：过一层 ErrnoHint，并**撤掉 .truncate()**——
+                // 240 字符的上限会把「；stderr: 」尾巴整段吃掉，而 Failed 屏与复制键要的正是全文。
                 _uiState.value = ChatUiState.Failed(
-                    cause = (exception?.message ?: failedStep?.message ?: "运行时安装失败").truncate(),
+                    cause = ErrnoHint.humanize(
+                        exception?.message ?: failedStep?.message ?: "运行时安装失败",
+                    ),
                 )
                 starting = false
                 return@launch
@@ -217,7 +221,8 @@ class ChatViewModel @Inject constructor(
             val cause = "已达并行上限 $cap（当前 $occupied 条会话在跑），先在设置页调低再新建"
             _notice.value = cause
             // §5.1 的 Failed 定义就是「引擎起不来 + 可读原因」，这里正是它，不新增第五态。
-            _uiState.value = ChatUiState.Failed(cause)
+            // P2F §4.2(c)：三处 Failed 统一过 ErrnoHint；本条是中文文案、不含 `error=N`，humanize 直通。
+            _uiState.value = ChatUiState.Failed(cause = ErrnoHint.humanize(cause))
             starting = false
             return
         }
@@ -232,8 +237,10 @@ class ChatViewModel @Inject constructor(
             val reason = started.exceptionOrNull()?.message
                 ?: (state as? SessionState.Failed)?.cause
                 ?: "引擎未就绪：$state"
+            // P2F §4.2(c)：spawn 失败在这里第一次变成「人话」——errno 提示追加、全文不截断，
+            // Failed 屏（§4.2(a)(b)）与「复制详情」拿到的就是 libcore 原始消息 + stderr 尾巴。
             _uiState.value = ChatUiState.Failed(
-                cause = "$reason；stderr: ${id?.let { engine.stderrTail(it) }.orEmpty()}".truncate(),
+                cause = ErrnoHint.humanize("$reason；stderr: ${id?.let { engine.stderrTail(it) }.orEmpty()}"),
             )
             starting = false
             return

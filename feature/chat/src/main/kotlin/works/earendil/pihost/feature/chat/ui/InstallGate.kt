@@ -1,16 +1,25 @@
 package works.earendil.pihost.feature.chat.ui
 
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import works.earendil.pihost.core.engine.InstallProgress
@@ -25,6 +34,7 @@ import works.earendil.pihost.feature.chat.ChatUiState
  */
 @Composable
 fun InstallGate(state: ChatUiState, onInstall: () -> Unit, modifier: Modifier = Modifier) {
+    val clipboard = LocalClipboardManager.current
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -57,16 +67,40 @@ fun InstallGate(state: ChatUiState, onInstall: () -> Unit, modifier: Modifier = 
 
             is ChatUiState.Failed -> {
                 Text(text = "启动失败", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    text = state.cause,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.error,
-                    maxLines = 6,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.testTag(ChatTags.INSTALL_CAUSE),
-                )
-                Button(onClick = onInstall, modifier = Modifier.testTag(ChatTags.INSTALL_RETRY_BUTTON)) {
-                    Text("重试")
+                // P2F §4.2(a)：**取消 maxLines=6 + Ellipsis 的截断**。
+                // cause 全文（libcore 的 IOException 消息里有 `error=N`，外加多行 stderr 尾巴）
+                // 是本轮唯一的定位弹药，截到 errno 之前等于没报（P2F §1 成功判据②）。
+                // 做法：外层 Box 限高 280.dp，Text 自己 verticalScroll ——
+                // testTag 仍挂在 Text 上（既有 `onNodeWithTag(INSTALL_CAUSE)` 断言不漂），
+                // 默认换行保留，不折叠、不打码。
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 280.dp)
+                        .border(1.dp, MaterialTheme.colorScheme.outline)
+                        .padding(8.dp),
+                ) {
+                    Text(
+                        text = state.cause,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
+                            .testTag(ChatTags.INSTALL_CAUSE),
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onInstall, modifier = Modifier.testTag(ChatTags.INSTALL_RETRY_BUTTON)) {
+                        Text("重试")
+                    }
+                    // P2F §4.2(b)：一键复制全文，用户可以直接贴给助手（剪贴板内容 == state.cause，不加工）。
+                    OutlinedButton(
+                        onClick = { clipboard.setText(AnnotatedString(state.cause)) },
+                        modifier = Modifier.testTag(ChatTags.INSTALL_COPY),
+                    ) {
+                        Text("复制详情")
+                    }
                 }
             }
 

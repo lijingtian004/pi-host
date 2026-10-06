@@ -139,3 +139,52 @@ C before=0 after=0 completed=false                   ← advanceUntilIdle 对空
   合计 **37 全绿、0 failures/0 errors**，`BUILD SUCCESSFUL`。
 - 冻结区文件（`core/rpc`、`core/process/src/main`、`core/environment`、`docs/protocol.md`、`tools/capture`、
   `tools/runtime-packaging`）本次只读；`core/engine` 既有文件仅 `build.gradle.kts` 允许动（加依赖）。
+
+## 10. 落地期实测新事实（写用例/接线时踩到并已在代码里绕开）
+
+Robolectric 4.16 + android-35 jar（全部经 `javap` 对 jar 逐条核对，不是推测）：
+
+- **`ServiceController` 只有 `create()/attach()/withIntent(Intent)/startCommand(int,int)/destroy()`**：
+  没有 `startCommand(Intent)` 这种便利重载 → 投递意图必须写成
+  `Robolectric.buildService(...).create().withIntent(intent).startCommand(0, 1)`（见 `PiEngineServiceTest`）。
+- **`ShadowService.getForegroundServiceType()` 与 `ShadowNotificationManager.getNotificationChannel(String)`
+  都是 protected**，测试类调不到 → 前台类型判定抽成纯函数 `foregroundTypeForApi(sdk)`（`PiEngineService.kt`）
+  直接单测三档分流；通道断言改用 public 的 `getNotificationChannels()` 再 `.single { it.id == CHANNEL_ID }`。
+- **android-35 的 `Notification` 没有 public `text` 字段、也没有 `getText()`**；`Notification$Action`
+  上没有可见的 `intent`；`Notification.Builder` **没有 `setSilent(boolean)`**（加了就编译不过）。
+  → 正文/标题断言只能走 `shadowOf(notification).contentTitle / contentText`；
+  停止动作的 PendingIntent 改由 `internal stopEngineIntent()` 造，测试里用
+  `shadowOf(pendingIntent).savedIntent` 断 action 与 component。
+- **`shadowOf(Context)` 没有重载**：入参声明成 `Context` 时无法解析返回类型 → 测试里必须
+  `private val app: Application = ApplicationProvider.getApplicationContext()`，再 `shadowOf(app).nextStartedService`。
+- **`Activity.onDestroy()` 是 protected**：测试不能直接调 → 用 `ActivityController<MainActivity>`
+  持有 controller，`@After` 里 `controller.destroy()` 收尾（`MainActivityTest`）。
+- **Robolectric 下 `applicationInfo.nativeLibraryDir` 为 null**：`EngineRuntime.initialize()` 若直接
+  `!!` 会在 :55 抛 KotlinNPE，堆栈看不出原因 → 改成显式 `error("applicationInfo.nativeLibraryDir 为 null：…")`；
+  测试的"重试路径"不真跑 spawn，而是注入 stub supervisor。
+- **`runTest` 的 `advanceTimeBy` 只会触发"已经注册"的定时器**：协程还没执行到 `delay` 时跳时钟等于空跳，
+  用例会以"状态没变化"的假象卡住 → 观察一律用阻塞 pump（`runCurrent()` + `Thread.sleep(2)`，不跳时钟），
+  确认状态真的进到 `Restarting` 之后再 `advanceTimeBy(backoff)`。
+- **`SharedFlow.subscriptionCount` 只在 `MutableSharedFlow` 上有**，`PiSession` 对外暴露的是 `SharedFlow`
+  → 探针要"发命令前先验证订阅"就必须从 `SessionSupervisor` 侧开 `eventSubscriptions(sessionId)`
+  代理到内部 bus 的 `subscriptionCount`（`SessionSupervisor.kt`）。
+
+## 11. 收尾复跑（非缓存真跑）
+
+- 本机：`--no-build-cache :core:process:cleanTest :core:rpc:cleanTest :core:process:test :core:rpc:test`
+  → `BUILD SUCCESSFUL`，两个 test 任务为**执行**状态（不是 UP-TO-DATE/FROM-CACHE）；
+  从 `build/test-results/*/TEST-*.xml` 汇总 `TOTAL=37 failures=0 errors=0 skipped=0`
+  （JvmProcess 3 / GoldenReplay 9 / LineFramer 9 / PiDesktopE2e 1 / PiSession 8 / RpcModel 7）。
+- 编译机：`--no-build-cache` 三模块 clean+test → `BUILD SUCCESSFUL in 53s`，
+  `TOTAL=40 failures=0 errors=0 skipped=0`
+  （app MainActivityTest 7；engine SessionSupervisorTest 11 / PiEngineServiceTest 6 / PiSpawnTest 4 /
+  AssetInstallerTest 5 / RealRuntimeAssetsInstallTest 2；environment EnvFactoryTest 2 / PathLayoutTest 3）。
+- 回传产物：`/root/pi/dist/pi-host-full-debug.apk` = **53397894 bytes**、
+  sha256 = `4d6d12178dd676f3b6fbf1fdd3d6b126531f23150ef213ccab0c87e96bb35df7`，
+  与编译机上 `app/build/outputs/apk/debug/app-debug.apk` 的 sha256/字节数**逐字一致**。
+- `aapt2 dump xmltree`（`/opt/android-sdk/build-tools/34.0.0/aapt2`）确认：
+  `uses-permission` line 12/13/14 = `android.permission.FOREGROUND_SERVICE` /
+  `FOREGROUND_SERVICE_SPECIAL_USE` / `POST_NOTIFICATIONS`；
+  `android:extractNativeLibs=true`；service FQN `works.earendil.pihost.core.engine.PiEngineService`、
+  `exported=false`、`foregroundServiceType=0x40000000`（= specialUse）；
+  `android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE` 的 `android:value="local_ai_coding_agent_engine"`。

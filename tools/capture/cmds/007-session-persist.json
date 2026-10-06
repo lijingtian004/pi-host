@@ -1,0 +1,11 @@
+[
+	{ "cmd": { "type": "prompt", "id": "p1", "message": "echo hello" }, "waitForEvent": "agent_settled", "timeoutMs": 30000 },
+	{ "cmd": { "type": "prompt", "id": "p2", "message": "tell me a long story" }, "waitForEvent": "agent_settled", "timeoutMs": 30000 },
+	{ "cmd": { "type": "get_state", "id": "g1" }, "sleepMs": 600 },
+	{ "cmd": { "type": "get_entries", "id": "g2" }, "sleepMs": 600 },
+	{ "cmd": { "type": "new_session", "id": "n1" }, "sleepMs": 800 },
+	{ "cmd": { "type": "get_state", "id": "g3" }, "sleepMs": 600 },
+	{ "cmd": { "type": "prompt", "id": "p3", "message": "fresh session message" }, "waitForEvent": "agent_settled", "timeoutMs": 30000 },
+	{ "cmd": { "type": "get_state", "id": "g4" }, "sleepMs": 600 },
+	{ "cmd": { "type": "export_html", "id": "e1" }, "sleepMs": 1000 }
+]

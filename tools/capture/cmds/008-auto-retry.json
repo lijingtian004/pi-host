@@ -1,0 +1,11 @@
+[
+	{ "cmd": { "type": "get_state", "id": "g0" }, "sleepMs": 400 },
+	{ "cmd": { "type": "prompt", "id": "p1", "message": "make me fail" }, "waitForEvent": "agent_settled", "timeoutMs": 60000 },
+	{ "cmd": { "type": "get_last_assistant_text", "id": "g1" }, "sleepMs": 400 },
+	{ "cmd": { "type": "prompt", "id": "p2", "message": "make me fail" }, "waitForEvent": "auto_retry_start", "timeoutMs": 15000 },
+	{ "cmd": { "type": "abort_retry", "id": "ar1" }, "waitForEvent": "agent_settled", "timeoutMs": 20000 },
+	{ "cmd": { "type": "get_last_assistant_text", "id": "g2" }, "sleepMs": 400 },
+	{ "cmd": { "type": "set_auto_retry", "id": "sr1", "enabled": false }, "sleepMs": 400 },
+	{ "cmd": { "type": "prompt", "id": "p3", "message": "make me fail" }, "waitForEvent": "agent_settled", "timeoutMs": 30000 },
+	{ "cmd": { "type": "set_auto_retry", "id": "sr2", "enabled": true }, "sleepMs": 400 }
+]

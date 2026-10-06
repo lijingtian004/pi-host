@@ -1,0 +1,10 @@
+[
+	{ "cmd": { "type": "get_state", "id": "g1" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_available_models", "id": "g2" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_available_thinking_levels", "id": "g3" }, "sleepMs": 500 },
+	{ "cmd": { "type": "prompt", "id": "p1", "message": "echo hello" }, "waitForEvent": "agent_settled", "timeoutMs": 30000 },
+	{ "cmd": { "type": "get_state", "id": "g4" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_last_assistant_text", "id": "g5" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_messages", "id": "g6" }, "sleepMs": 800 },
+	{ "cmd": { "type": "quit", "id": "q1" }, "sleepMs": 1500 }
+]

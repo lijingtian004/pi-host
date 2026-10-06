@@ -1,0 +1,8 @@
+[
+	{ "cmd": { "type": "get_commands", "id": "g1" }, "sleepMs": 500 },
+	{ "cmd": { "type": "prompt", "id": "p1", "message": "run the branch command" }, "waitForEvent": "extension_ui_request", "timeoutMs": 30000 },
+	{ "cmd": { "type": "extension_ui_response", "id": "__EXT_ID__", "confirmed": true }, "waitForEvent": "agent_settled", "timeoutMs": 30000 },
+	{ "cmd": { "type": "prompt", "id": "p2", "message": "run the branch command again" }, "waitForEvent": "extension_ui_request", "timeoutMs": 30000 },
+	{ "cmd": { "type": "extension_ui_response", "id": "__EXT_ID__", "cancelled": true }, "waitForEvent": "agent_settled", "timeoutMs": 30000 },
+	{ "cmd": { "type": "get_last_assistant_text", "id": "g2" }, "sleepMs": 500 }
+]

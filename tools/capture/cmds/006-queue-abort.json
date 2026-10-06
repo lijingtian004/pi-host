@@ -1,0 +1,14 @@
+[
+	{ "cmd": { "type": "set_steering_mode", "id": "m1", "mode": "all" }, "sleepMs": 400 },
+	{ "cmd": { "type": "set_follow_up_mode", "id": "m2", "mode": "all" }, "sleepMs": 400 },
+	{ "cmd": { "type": "get_state", "id": "g1" }, "sleepMs": 400 },
+	{ "cmd": { "type": "prompt", "id": "p1", "message": "slow question please answer" }, "sleepMs": 2000 },
+	{ "cmd": { "type": "steer", "id": "s1", "message": "steering mid-turn injection" }, "sleepMs": 800 },
+	{ "cmd": { "type": "follow_up", "id": "f1", "message": "queued follow up question" }, "sleepMs": 800 },
+	{ "cmd": { "type": "abort", "id": "a1" }, "waitForEvent": "agent_settled", "timeoutMs": 20000 },
+	{ "cmd": { "type": "get_last_assistant_text", "id": "g2" }, "sleepMs": 400 },
+	{ "cmd": { "type": "prompt", "id": "p2", "message": "slow question again" }, "sleepMs": 1500 },
+	{ "cmd": { "type": "follow_up", "id": "f2", "message": "another queued followup" }, "sleepMs": 500 },
+	{ "cmd": { "type": "clear_queue", "id": "c1" }, "sleepMs": 500 },
+	{ "cmd": { "type": "abort", "id": "a2" }, "waitForEvent": "agent_settled", "timeoutMs": 20000 }
+]

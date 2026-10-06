@@ -1,0 +1,12 @@
+[
+	{ "cmd": { "type": "bogus_command", "id": "e1" }, "sleepMs": 300 },
+	{ "cmd": { "type": "set_model", "id": "e2", "provider": "mock", "modelId": "no-such-model" }, "sleepMs": 300 },
+	{ "cmd": { "type": "set_thinking_level", "id": "e3", "level": "high" }, "sleepMs": 300 },
+	{ "cmd": { "type": "get_state", "id": "g1" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_commands", "id": "g2" }, "sleepMs": 500 },
+	{ "cmd": { "type": "set_session_name", "id": "g3", "name": "golden-capture" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_state", "id": "g4" }, "sleepMs": 500 },
+	{ "cmd": { "type": "bash", "id": "b1", "command": "echo rpc-bash-works && git branch --show-current" }, "sleepMs": 1500 },
+	{ "cmd": { "type": "get_session_stats", "id": "g5" }, "sleepMs": 500 },
+	{ "cmd": { "type": "export_html", "id": "g6" }, "sleepMs": 1000 }
+]

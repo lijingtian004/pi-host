@@ -1,0 +1,9 @@
+[
+	{ "cmd": { "type": "prompt", "id": "p1", "message": "tell me a long story" }, "waitForEvent": "agent_settled", "timeoutMs": 30000 },
+	{ "cmd": { "type": "get_last_assistant_text", "id": "g2" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_messages", "id": "g3" }, "sleepMs": 500 },
+	{ "cmd": { "type": "fork", "id": "f1" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_fork_messages", "id": "g4" }, "sleepMs": 500 },
+	{ "cmd": { "type": "clone", "id": "c1" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_state", "id": "g5" }, "sleepMs": 500 }
+]

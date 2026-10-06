@@ -1,0 +1,7 @@
+[
+	{ "cmd": { "type": "prompt", "id": "p1", "message": "run the branch command" }, "waitForEvent": "agent_settled", "timeoutMs": 30000 },
+	{ "cmd": { "type": "get_last_assistant_text", "id": "g2" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_session_stats", "id": "g3" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_entries", "id": "g4" }, "sleepMs": 500 },
+	{ "cmd": { "type": "get_tree", "id": "g5" }, "sleepMs": 500 }
+]

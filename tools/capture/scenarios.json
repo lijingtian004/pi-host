@@ -1,0 +1,44 @@
+[
+	{
+		"match": "^echo hello",
+		"response": [{ "type": "text", "text": "hello from mock model" }]
+	},
+	{
+		"match": "^run the branch command",
+		"response": [
+			{ "type": "text", "text": "I'll check the git branch." },
+			{ "type": "toolCall", "name": "bash", "id": "call_mock_git", "arguments": { "command": "git branch --show-current" } }
+		]
+	},
+	{
+		"whenLastRole": "tool",
+		"match": "*",
+		"response": [{ "type": "text", "text": "The current branch is main. (mock answer after tool)" }]
+	},
+	{
+		"match": "^tell me a long story",
+		"delayMs": 1500,
+		"response": [
+			{ "type": "thinking", "thinking": "Let me think about what story to tell. This is mock reasoning." },
+			{ "type": "text", "text": "Once upon a time there was a robot living in a terminal. It compiled Kotlin all day and dreamed of electric sheep. The end." }
+		]
+	},
+	{
+		"match": "^think then talk",
+		"delayMs": 500,
+		"response": [
+			{ "type": "thinking", "thinking": "Reasoning block one." },
+			{ "type": "text", "text": "Answer after thinking." }
+		]
+	},
+	{
+		"match": "^slow question",
+		"delayMs": 6000,
+		"response": [{ "type": "text", "text": "This response is intentionally slow for abort testing." }]
+	},
+	{
+		"match": "^make me fail",
+		"error": 500,
+		"errorMessage": "mock provider hard failure for retry testing"
+	}
+]

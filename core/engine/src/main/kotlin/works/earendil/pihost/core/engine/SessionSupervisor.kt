@@ -142,6 +142,16 @@ open class SessionSupervisor(
      */
     open fun events(sessionId: String): SharedFlow<PiEvent>? = entries[sessionId]?.bus
 
+    /**
+     * 该会话事件总线的**订阅计数**代理。
+     *
+     * 存在的理由：`subscriptionCount` 声明在 `MutableSharedFlow` 上，而 [events] 对外只给
+     * `SharedFlow`（不给 emit 口）——调用方要「先订阅再发命令」就只能从这里取证据。
+     * 与 [PiSession.eventsSubscriptionCount] 同一用途。会话未知 → null。
+     */
+    open fun eventSubscriptions(sessionId: String): StateFlow<Int>? =
+        entries[sessionId]?.bus?.subscriptionCount
+
     /** 代理 [PiSession.stderrRing] 快照（8KB 环）。会话未知或还没有进程 → null。 */
     open fun stderrTail(sessionId: String): String? = entries[sessionId]?.session?.stderrRing?.snapshot()
 

@@ -52,7 +52,8 @@ object EngineRuntime {
         synchronized(this) {
             supervisor?.let { return it }
             val app = ctx.applicationContext
-            val libDir = app.applicationInfo.nativeLibraryDir!!
+            val libDir = app.applicationInfo.nativeLibraryDir
+                ?: error("applicationInfo.nativeLibraryDir 为 null：取不到 libpi_node.so 所在目录，无法 spawn")
             val spawn = PiSpawn(libDir, PathLayout.runtimeDir(app).absolutePath)
             val created = SessionSupervisor(
                 scope = scope,

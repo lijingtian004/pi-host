@@ -15,11 +15,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import works.earendil.pihost.feature.chat.ChatSkeleton
+import works.earendil.pihost.feature.chat.ChatViewModel
+import works.earendil.pihost.feature.chat.ui.ChatScreen
 
 /**
  * 导航骨架（规格书 §4.3）：三条路由，chat 为默认；sessions/settings 只立占位（§13 偏差 2）。
@@ -83,10 +85,10 @@ private fun NavHostController.navigateTo(route: String) {
     }
 }
 
-/** chat 路由（P2D 步骤 2 = 冒烟骨架，步骤 5 换成 ChatScreen + hiltViewModel）。 */
+/** chat 路由（§4.3 + §4.2.3）：真正的聊天主界面，VM 由 Hilt 按导航图作用域创建。 */
 @Composable
-internal fun ChatScreenRoute() {
-    ChatSkeleton()
+internal fun ChatScreenRoute(viewModel: ChatViewModel = hiltViewModel()) {
+    ChatScreen(viewModel = viewModel)
 }
 
 /** sessions/settings 占位（§13 偏差 2：SessionScanner 与 DataStore 留 P2E）。 */

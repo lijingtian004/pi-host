@@ -1,337 +1,348 @@
 package works.earendil.pihost
 
-import android.app.Activity
+import android.Manifest
 import android.app.Application
-import android.content.Context
-import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.StateFlow
+import android.os.Looper
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertTextEquals
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextInput
+import dagger.hilt.android.testing.HiltAndroidRule
+import dagger.hilt.android.testing.HiltAndroidTest
+import dagger.hilt.android.testing.HiltTestApplication
+import dagger.hilt.android.testing.UninstallModules
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
-import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.Robolectric
-import org.robolectric.android.controller.ActivityController
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
-import works.earendil.pihost.core.engine.AssetSource
-import works.earendil.pihost.core.engine.EngineRuntime
 import works.earendil.pihost.core.engine.PiEngineService
 import works.earendil.pihost.core.engine.SessionState
-import works.earendil.pihost.core.engine.SessionSupervisor
-import works.earendil.pihost.core.environment.PathLayout
+import works.earendil.pihost.core.engine.di.EngineModule
+import works.earendil.pihost.core.engine.engineStopIntent
+import works.earendil.pihost.core.rpc.AssistantMessageEvent
 import works.earendil.pihost.core.rpc.PiEvent
+import works.earendil.pihost.core.rpc.PiMessage
 import works.earendil.pihost.core.rpc.RpcCommand
-import java.io.IOException
-import java.io.InputStream
-
-/** 安装失败注入源：manifest 都读不到，`openRuntime` 被调到就是实现错误。 */
-private class BrokenAssetSource : AssetSource {
-    override fun openManifest(): InputStream = throw IOException(BROKEN_CAUSE)
-
-    override fun openRuntime(): InputStream = throw AssertionError("manifest 都没读到，不该打开 zip")
-}
-
-private const val BROKEN_CAUSE: String = "资产缺失：runtime/manifest.json（测试注入）"
+import works.earendil.pihost.feature.chat.ui.ChatTags
 
 /**
- * MainActivity 接线（既有 2 条用例逐字保留 + 新增 5 条）。
+ * app 接线测试（规格书 §7「app 测试 ≥7 条，等价重写 P2C 覆盖」）。
  *
- * 与 P2A/P2B 唯一的适配点（RECON §7）：`setContentView` 从裸 TextView 换成
- * `LinearLayout{TextView, Button×3, TextView}`，所以 [versionTextView] 多剥一层容器；
- * 两条既有断言的**文本内容一个字符都没改**——首行仍是
- * `pi-android host (P2 shell)\nruntime: <版本>`。
+ * **覆盖面对照（§2 红线：不缩水）**：
+ * | P2C 的 7 条 | 本文件的等价面 |
+ * | --- | --- |
+ * | 未安装 → 屏显 not installed | ①cleanSandbox…installGate（`运行时未安装` + 安装按钮） |
+ * | 已装 → 版本上屏 | ②installButton…（安装门 → Ready → 顶栏短码 = sessionId 前 8 位） |
+ * | renderState 四档 | ⑨topBarShortCode…（Ready/Restarting/Failed/Stopped 四档 + 队列徽标） |
+ * | 启动引擎 → FGS 意图 | ②（同一条 ACTION_START 断言，含组件名） |
+ * | 测试 RPC → 先订阅再发 + 应答渲染 | ⑥promptRoundTrip…（同一条通路，改为 prompt/流式）+ 探针本体在 `ChatViewModelTest case10` |
+ * | 安装失败显因可重试 | ③installFailure… |
+ * | 无会话提示 + ACTION_STOP | ⑧stopIntent…（含「安装失败绝不起 FGS」）|
+ * 通知分支（P2C 用 grantPermissions 走通）→ ⑦，另加 ④NavHost 占位、⑤权限桥弹框。
  *
- * 时序：Activity 的状态回显一律 `mainHandler.post` 回主线程，
- * 所以测试用 [drain]（idle 主 looper）+ [awaitFor]（等真实线程）推进，
- * 500ms 轮询在 PAUSED looper 下不会自动跑，不影响断言确定性。
+ * **三条 Hilt + Robolectric 配方**（RECON-P2D §3 实测）：
+ * 1. `@Config(application = HiltTestApplication::class)` + [`@HiltAndroidTest`]
+ *    + `@UninstallModules(EngineModule::class)`：真装配（PiSpawn/JvmProcessFactory）
+ *    整块换成 [AppTestEngineModule]，于是 Robolectric 里不需要 `nativeLibraryDir` 也能建图；
+ * 2. [OutermostRule] 的 `order = -1` 必须比 hiltRule(0)/composeRule(1) 更外层——
+ *    `createAndroidComposeRule` 在**规则阶段**就起 Activity，`@Before` 里换假体已经晚了一步；
+ * 3. provider 不带 scope（见 [AppTestHolder]），所以每次注入点都重新取值，
+ *    拿到的是本用例刚 reset 出来的那一对。
+ *
+ * **`qualifiers = "w420dp-h2400dp"`**：Robolectric 默认屏 320×470dp，
+ * LazyColumn 视口外的条目根本不进组成树，`onNode…` 会报「节点不存在」。
+ * 拉长视口后转录/弹框都真正参与布局，`assertIsDisplayed` 才在验渲染而不是验存在。
+ *
+ * **pump()**：`viewModelScope` 跑在 Robolectric 的 main looper 上，Compose 的 `waitForIdle()`
+ * 只保证帧与 recomposition 收敛，不保证 pending 的 main task 跑完；
+ * 所以每条用例统一 [pump]（waitForIdle + idle 主 looper）两轮。
  */
+@HiltAndroidTest
+@UninstallModules(EngineModule::class)
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35])
+@Config(sdk = [35], application = HiltTestApplication::class, qualifiers = "w420dp-h2400dp")
 class MainActivityTest {
 
-    /** `Shadows.shadowOf` 没有 `shadowOf(Context)` 重载，取 started services 必须是 Application。 */
-    private val app: Application
-        get() = RuntimeEnvironment.getApplication()
+    @get:Rule(order = -1)
+    val swapDoubles = OutermostRule { AppTestHolder.reset() }
 
-    private val ctx: Context
-        get() = app
+    @get:Rule(order = 0)
+    val hiltRule = HiltAndroidRule(this)
 
-    @Before
-    fun clearSandbox() {
-        PathLayout.runtimeDir(ctx).deleteRecursively()
-        EngineRuntime.reset()
-        assertFalse(ctx.filesDir.resolve("runtime").exists())
+    @get:Rule(order = 1)
+    val composeRule = createAndroidComposeRule<MainActivity>()
+
+    private val engine: RecordingChatEngine get() = AppTestHolder.engine
+    private val installer: ScriptedRuntimeInstall get() = AppTestHolder.installer
+
+    /** `startForegroundService` 的记录挂在 Application 上（ShadowService 没有 activity 重载）。 */
+    private val app: Application get() = RuntimeEnvironment.getApplication()
+
+    private fun pump() {
+        repeat(2) {
+            composeRule.waitForIdle()
+            shadowOf(Looper.getMainLooper()).idle()
+        }
     }
 
-    @After
-    fun releaseRuntime() {
-        // Activity.onDestroy 是 protected，测试不能直接调——统一由 controller 收尾，
-        // 停掉 500ms 轮询与探针/安装协程，避免跨用例串扰。
-        controller?.destroy()
-        controller = null
-        EngineRuntime.reset()
+    /** 点安装按钮 → Ready（顶栏出现即代表 uiState 已是 Ready）。 */
+    private fun enterReady() {
+        composeRule.onNodeWithTag(ChatTags.INSTALL_BUTTON).performClick()
+        pump()
+        composeRule.onNodeWithTag(ChatTags.TOP_BAR).assertIsDisplayed()
     }
 
-    private var controller: ActivityController<MainActivity>? = null
+    // ── ① NavHost 的 chat 是起始路由，干净沙箱 = 安装门 ──────────────────────────
 
-    /** 记录调用 + 自带会话表/事件总线的 stub（本工程无 Mockito，靠 open 继承）。 */
-    private class StubSupervisor : SessionSupervisor(
-        scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
-        starter = { _, _, _ -> throw AssertionError("测试不该 spawn 真进程") },
-        commandFor = { listOf("stub") },
-        envFor = { emptyMap() },
-        workingDir = null,
-    ) {
-        val states = MutableStateFlow<Map<String, SessionState>>(emptyMap())
-        override val sessionStates: StateFlow<Map<String, SessionState>> get() = states
+    @Test
+    fun `chat route is the start destination and a clean sandbox shows the install gate`() {
+        composeRule.onNodeWithText(Nav.TITLE).assertIsDisplayed()
+        composeRule.onNodeWithText(Nav.ENTRY_SESSIONS).assertIsDisplayed()
+        composeRule.onNodeWithText(Nav.ENTRY_SETTINGS).assertIsDisplayed()
 
-        private val bus = MutableSharedFlow<PiEvent>(
-            extraBufferCapacity = 8,
-            onBufferOverflow = BufferOverflow.SUSPEND,
+        composeRule.onNodeWithText("运行时未安装").assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.INSTALL_BUTTON).assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.TOP_BAR).assertDoesNotExist()
+        assertEquals("没点安装就绝不该起引擎", 0, engine.startCalls.get())
+        assertEquals("没点安装就绝不该装运行时", 0, installer.calls.get())
+    }
+
+    // ── ② 安装 → FGS 意图（先于 spawn，§13 偏差 6）→ Ready → 顶栏短码 ──────────────
+
+    @Test
+    fun `install button runs the gate, posts the engine foreground service intent and reaches ready`() {
+        enterReady()
+
+        assertEquals(1, engine.startCalls.get())
+        val intent = shadowOf(app).peekNextStartedService()
+        assertTrue("必须发出 FGS 启动意图", intent != null)
+        assertEquals(PiEngineService.ACTION_START, intent!!.action)
+        assertEquals(PiEngineService::class.java.name, intent.component?.className)
+
+        composeRule.onNodeWithTag(ChatTags.ENGINE_STATUS)
+            .assertTextEquals("就绪 ${RecordingChatEngine.SESSION.take(8)}")
+        composeRule.onNodeWithTag(ChatTags.TRANSCRIPT).assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.INPUT).assertIsEnabled()
+    }
+
+    // ── ③ 安装失败：独立文案 + 真原因 + 可重试，且绝不起引擎 ──────────────────────
+
+    @Test
+    fun `install failure keeps its own cause and the retry then succeeds`() {
+        installer.outcome = ScriptedRuntimeInstall.Outcome.Failure
+        composeRule.onNodeWithTag(ChatTags.INSTALL_BUTTON).performClick()
+        pump()
+
+        composeRule.onNodeWithText("启动失败").assertIsDisplayed()
+        composeRule.onNodeWithText("sha256 mismatch on bin/node").assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.INSTALL_CAUSE).assertIsDisplayed()
+        assertEquals("安装失败绝不能起引擎", 0, engine.startCalls.get())
+        assertNull("安装失败绝不能发 FGS 意图", shadowOf(app).peekNextStartedService())
+        // 失败不得被冲成「未安装」
+        composeRule.onNodeWithText("运行时未安装").assertDoesNotExist()
+
+        installer.outcome = ScriptedRuntimeInstall.Outcome.Success
+        composeRule.onNodeWithTag(ChatTags.INSTALL_RETRY_BUTTON).performClick()
+        pump()
+        composeRule.onNodeWithTag(ChatTags.TOP_BAR).assertIsDisplayed()
+        assertEquals(2, installer.calls.get())
+        assertEquals(1, engine.startCalls.get())
+    }
+
+    // ── ④ sessions/settings 占位路由（§13 偏差 2）+ 回退到 chat ──────────────────
+
+    @Test
+    fun `placeholder routes render P2E and back navigation returns to chat`() {
+        composeRule.onNodeWithText(Nav.ENTRY_SESSIONS).performClick()
+        pump()
+        composeRule.onNodeWithTag(Nav.TAG_SESSIONS).assertIsDisplayed()
+        composeRule.onAllNodesWithText(Nav.PLACEHOLDER)[0].assertIsDisplayed()
+
+        composeRule.onNodeWithText(Nav.ENTRY_SETTINGS).performClick()
+        pump()
+        composeRule.onNodeWithTag(Nav.TAG_SETTINGS).assertIsDisplayed()
+
+        composeRule.activity.onBackPressedDispatcher.onBackPressed()
+        pump()
+        composeRule.onNodeWithTag(Nav.TAG_SESSIONS).assertIsDisplayed()
+
+        composeRule.activity.onBackPressedDispatcher.onBackPressed()
+        pump()
+        composeRule.onNodeWithText("运行时未安装").assertIsDisplayed()
+    }
+
+    // ── ⑤ 权限桥：Ready 屏上弹框，「允许一次」与「拒绝」各自回写 ──────────────────
+
+    @Test
+    fun `permission dialog over the ready screen writes allow-once and deny back through the engine`() {
+        enterReady()
+
+        // timeout 给到 600s：pump() 会 idle 主 looper，倒计时不该在用例中途把弹框吃掉
+        engine.emit(uiRequest("p1", "confirm", timeoutMs = 600_000L))
+        pump()
+        composeRule.onNodeWithTag(ChatTags.PERMISSION_DIALOG).assertIsDisplayed()
+        composeRule.onNodeWithText("method=confirm｜剩余 600s").assertIsDisplayed()
+        composeRule.onNodeWithText("pi 请求执行 confirm").assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.INPUT).assertIsNotEnabled()
+
+        composeRule.onNodeWithTag(ChatTags.PERMISSION_ALLOW_ONCE).performClick()
+        pump()
+        composeRule.onNodeWithTag(ChatTags.PERMISSION_DIALOG).assertDoesNotExist()
+        assertEquals(listOf("p1"), engine.uiResponses.map { it.id })
+        assertEquals(true, engine.uiResponses.single().confirmed)
+
+        engine.emit(uiRequest("p2", "input", timeoutMs = 600_000L))
+        pump()
+        composeRule.onNodeWithTag(ChatTags.PERMISSION_DENY).performClick()
+        pump()
+        assertEquals("p2", engine.uiResponses.last().id)
+        assertEquals(true, engine.uiResponses.last().cancelled)
+    }
+
+    // ── ⑥ prompt 往返：用户气泡即时入列 → 流式 delta → TurnEnd 解禁输入 ────────────
+
+    @Test
+    fun `prompt round trip streams the answer into the transcript and frees the input`() {
+        enterReady()
+
+        composeRule.onNodeWithTag(ChatTags.INPUT).performTextInput("跑一下分支命令")
+        composeRule.onNodeWithTag(ChatTags.SEND).performClick()
+        pump()
+
+        assertEquals(RpcCommand.Prompt(message = "跑一下分支命令"), engine.sent.last().command)
+        assertEquals("ui-1", engine.sent.last().id)
+        composeRule.onNodeWithText("跑一下分支命令").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.INPUT).assertIsNotEnabled()
+
+        engine.emit(PiEvent.MessageStart(PiMessage(role = "assistant", content = JsonArray(emptyList()))))
+        engine.emit(update(AssistantMessageEvent.TextDelta(0, "好的")))
+        engine.emit(update(AssistantMessageEvent.TextDelta(0, "，已在 main")))
+        pump()
+        composeRule.onNodeWithText("好的，已在 main").performScrollTo().assertIsDisplayed()
+
+        engine.emit(PiEvent.TurnEnd(message = PiMessage(role = "assistant")))
+        pump()
+        composeRule.onNodeWithTag(ChatTags.INPUT).assertIsEnabled()
+
+        // 工具卡：状态灯（isError → 红点）与输出区
+        engine.emit(PiEvent.ToolExecutionStart(toolCallId = "call-9", toolName = "bash", args = null))
+        engine.emit(
+            PiEvent.ToolExecutionEnd(
+                toolCallId = "call-9",
+                toolName = "bash",
+                result = JsonObject(mapOf("content" to JsonPrimitive("On branch main"))),
+                isError = true,
+            ),
         )
-
-        override fun events(sessionId: String): SharedFlow<PiEvent> = bus
-
-        override fun eventSubscriptions(sessionId: String): StateFlow<Int> = bus.subscriptionCount
-
-        var sends = 0
-        var lastRequestId: String? = null
-
-        /** **发命令那一刻**总线上的订阅者数量：证明「先订阅再发」真的成立，而不是靠推断。 */
-        var subscribersAtSend = -1
-
-        fun subscribersNow(): Int = bus.subscriptionCount.value
-
-        override suspend fun send(sessionId: String, command: RpcCommand, id: String?): String {
-            sends++
-            lastRequestId = id
-            subscribersAtSend = bus.subscriptionCount.value
-            bus.emit(
-                PiEvent.Response(
-                    id = id,
-                    command = "get_state",
-                    success = true,
-                    data = JsonObject(mapOf("messageCount" to JsonPrimitive(0))),
-                ),
-            )
-            return id ?: "c-1"
-        }
+        pump()
+        composeRule.onNodeWithTag(ChatTags.tool("call-9")).performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.toolOutput("call-9")).performScrollTo().performClick()
+        pump()
+        composeRule.onNodeWithText("On branch main").performScrollTo().assertIsDisplayed()
     }
 
-    private fun launch(): MainActivity {
-        val created = Robolectric.buildActivity(MainActivity::class.java).setup()
-        controller = created
-        return created.get()
+    // ── ⑦ POST_NOTIFICATIONS：Ready 时请求一次（§6 末条）─────────────────────────
+
+    @Config(sdk = [34], qualifiers = "w420dp-h2400dp", application = HiltTestApplication::class)
+    @Test
+    fun `ready screen requests the notification permission once when it is not granted`() {
+        shadowOf(composeRule.activity).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
+        enterReady()
+
+        val request = shadowOf(composeRule.activity).lastRequestedPermission
+        assertTrue("Ready 必须请求一次 POST_NOTIFICATIONS", request != null)
+        assertEquals(Manifest.permission.POST_NOTIFICATIONS, request!!.requestedPermissions.single())
+        // 「拒绝不阻塞」的可观测面：请求发出后 Ready 屏照常渲染
+        composeRule.onNodeWithTag(ChatTags.TOP_BAR).assertIsDisplayed()
+
+        // text_delta 只写「末条 assistant」，没有 TextStart/MessageStart 建条目时不凭空造气泡，
+        // 所以脚本按 §4.2 的真实形状走：先 text_start 再 delta。
+        engine.emit(update(AssistantMessageEvent.TextStart(0)))
+        engine.emit(update(AssistantMessageEvent.TextDelta(0, "通知被拒也不影响这一轮")))
+        pump()
+        composeRule.onNodeWithText("通知被拒也不影响这一轮").performScrollTo().assertIsDisplayed()
     }
 
-    private fun versionTextView(): TextView {
-        val content = launch().findViewById<FrameLayout>(android.R.id.content)
-        return (content.getChildAt(0) as LinearLayout).getChildAt(0) as TextView
-    }
-
-    private fun drain() {
-        shadowOf(android.os.Looper.getMainLooper()).idle()
-    }
-
-    private fun awaitFor(activity: MainActivity, label: String, condition: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + 5_000
-        while (true) {
-            drain()
-            if (condition()) return
-            assertTrue(
-                "awaitFor[$label] 5s 内未成立，屏显=「${activity.statusView.text}」",
-                System.currentTimeMillis() < deadline,
-            )
-            Thread.sleep(5)
-        }
-    }
-
-    /** 预置安装标记：跳过 50MB 解包，让「启动引擎」走 initialize→FGS 分支（RECON §7 取舍）。 */
-    private fun presetMarker(version: String = "2026.10.06-1") {
-        val marker = PathLayout.installedMarker(ctx)
-        marker.parentFile!!.mkdirs()
-        marker.writeText("""{"runtimeVersion":"$version"}""")
-    }
-
-    // ── 既有 2 条（文本断言原样保留）────────────────────────────────────────────
+    // ── ⑧ 停止通路：VM 的 abort + 服务侧 ACTION_STOP 的意图构造 ───────────────────
 
     @Test
-    fun `reports runtime not installed on a clean sandbox`() {
-        assertEquals("pi-android host (P2 shell)\nruntime: not installed", versionTextView().text.toString())
-    }
+    fun `abort is offered only while streaming and the stop intent targets the engine service`() {
+        enterReady()
 
-    @Test
-    fun `reports the installed runtime version from the marker`() {
-        presetMarker("2026.10.06-1")
+        composeRule.onNodeWithTag(ChatTags.ABORT).assertIsNotEnabled()
+        composeRule.onNodeWithTag(ChatTags.INPUT).performTextInput("中止我")
+        composeRule.onNodeWithTag(ChatTags.SEND).performClick()
+        pump()
+        composeRule.onNodeWithTag(ChatTags.ABORT).assertIsEnabled()
+        composeRule.onNodeWithTag(ChatTags.ABORT).performClick()
+        pump()
+
         assertEquals(
-            "pi-android host (P2 shell)\nruntime: 2026.10.06-1",
-            versionTextView().text.toString(),
+            listOf(RpcCommand.Prompt(message = "中止我"), RpcCommand.Abort),
+            engine.sent.map { it.command },
         )
+        // 停止意图的构造契约（服务侧的 STOP→stopSelf 见 PiEngineServiceWiringTest）
+        val stop = engineStopIntent(app)
+        assertEquals(PiEngineService.ACTION_STOP, stop.action)
+        assertEquals(PiEngineService::class.java.name, stop.component?.className)
     }
 
-    // ── 新增 1：未安装 → renderState() 直出「运行时未安装」───────────────────────
+    // ── ⑨ 顶栏短码四档 + 队列徽标（P2C「renderState 四档」的等价面）────────────────
 
     @Test
-    fun `renderState reports the missing runtime before anything else`() {
-        val activity = launch()
-        EngineRuntime.reset()
-        activity.renderState()
-        assertEquals(MainActivity.STATUS_NOT_INSTALLED, activity.statusView.text.toString())
+    fun `top bar short code follows the session state and the queue badge counts pending items`() {
+        enterReady()
+        composeRule.onNodeWithTag(ChatTags.ENGINE_STATUS).assertTextEquals("就绪 aaaaaaaa")
+        composeRule.onNodeWithTag(ChatTags.QUEUE_BADGE).assertDoesNotExist()
 
-        // 装上运行时但没 initialize → 下一档文案
-        presetMarker()
-        activity.renderState()
-        assertEquals(MainActivity.STATUS_NOT_INITIALIZED, activity.statusView.text.toString())
+        engine.setState(SessionState.Restarting(attempt = 2, backoffMs = 4_000L))
+        pump()
+        composeRule.onNodeWithTag(ChatTags.ENGINE_STATUS).assertTextEquals("重启第 2 次")
 
-        // initialize 后空闲
-        EngineRuntime.supervisor = StubSupervisor()
-        activity.renderState()
-        assertEquals(MainActivity.STATUS_IDLE, activity.statusView.text.toString())
+        engine.setState(SessionState.Failed("spawn 失败：ENOENT"))
+        pump()
+        composeRule.onNodeWithTag(ChatTags.ENGINE_STATUS).assertTextEquals("失败：spawn 失败：ENOENT")
 
-        // 有会话 → 逐条列出状态
-        (EngineRuntime.supervisor as StubSupervisor).states.value = mapOf(
-            "11111111-2222-3333-4444-555555555555" to SessionState.Ready,
-            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" to SessionState.Restarting(2, 4_000L),
-        )
-        activity.renderState()
-        val text = activity.statusView.text.toString()
-        assertTrue("应含两条会话：$text", text.contains("会话 2"))
-        assertTrue("Ready → 就绪：$text", text.contains("11111111=就绪"))
-        assertTrue("Restarting 带次数与退避：$text", text.contains("aaaaaaaa=重启第2次(退避4000ms)"))
+        engine.setState(SessionState.Stopped)
+        pump()
+        composeRule.onNodeWithTag(ChatTags.ENGINE_STATUS).assertTextEquals("已停止")
+
+        engine.setState(SessionState.Ready)
+        engine.emit(PiEvent.QueueUpdate(steering = listOf("a"), followUp = listOf("b", "c")))
+        pump()
+        composeRule.onNodeWithTag(ChatTags.QUEUE_BADGE).assertIsDisplayed()
+        composeRule.onNodeWithText("3 queued").assertIsDisplayed()
     }
 
-    // ── 新增 2：点「启动引擎」→ initialize + startForegroundService(ACTION_START) ──
+    private companion object {
+        /** 权限请求（§3.7 形状）；`timeout` 单位毫秒，冻结区 PiEvent.ExtensionUiRequest 原文。 */
+        fun uiRequest(id: String, method: String, timeoutMs: Long): PiEvent.ExtensionUiRequest =
+            PiEvent.ExtensionUiRequest(
+                id = id,
+                method = method,
+                title = "确认执行",
+                message = "pi 请求执行 $method",
+                timeout = timeoutMs,
+            )
 
-    @Test
-    fun `start engine button initializes and posts the foreground service start intent`() {
-        presetMarker()
-        val stub = StubSupervisor()
-        EngineRuntime.supervisor = stub
-        val activity = launch()
-        shadowOf(activity).grantPermissions(android.Manifest.permission.POST_NOTIFICATIONS)
-
-        activity.startButton.performClick()
-        drain()
-
-        val started = shadowOf(app).nextStartedService
-        assertNotNull("必须发出 FGS 启动意图", started)
-        assertEquals(PiEngineService.ACTION_START, started!!.action)
-        assertEquals(PiEngineService::class.java.name, started.component!!.className)
-        // 已注入 stub → initialize 必须幂等复用，不新建 supervisor
-        assertEquals(stub, EngineRuntime.supervisor)
-        assertEquals(MainActivity.STATUS_IDLE, activity.statusView.text.toString())
-    }
-
-    // ── 新增 3：点「测试 RPC」→ 先订阅再发 get_state → 应答渲染进状态行 ───────────
-
-    @Test
-    fun `probe button sends get_state and renders the matching response`() {
-        presetMarker()
-        val stub = StubSupervisor()
-        stub.states.value = mapOf("s-ready" to SessionState.Ready)
-        EngineRuntime.supervisor = stub
-        val activity = launch()
-
-        activity.probeButton.performClick()
-        awaitFor(activity, "应答已渲染") {
-            activity.statusView.text.startsWith(MainActivity.PROBE_PREFIX)
-        }
-        assertEquals(1, stub.sends)
-        // 关键断言：命令发出时收集协程已在总线上（1 个订阅者），应答不会掉进无订阅的窗口
-        assertEquals("send 前必须已有订阅者", 1, stub.subscribersAtSend)
-        assertTrue(
-            "requestId 由 UI 侧生成并回显：${stub.lastRequestId}",
-            stub.lastRequestId == "ui-1",
-        )
-        val text = activity.statusView.text.toString()
-        assertTrue("应答 JSON 落地：$text", text.contains("\"command\":\"get_state\""))
-        assertTrue("应答 id 必须与请求一致：$text", text.contains("ui-1"))
-    }
-
-    // ── 新增 4：安装失败必须显因、可重试、不起 FGS，且与「未安装/空闲」可区分 ─────
-
-    @Test
-    fun `install failure shows the real cause and stays retryable`() {
-        val activity = launch()
-        activity.assetSourceFactory = { BrokenAssetSource() }
-
-        activity.startButton.performClick()
-        drain()
-        assertTrue("点击后必须先进安装态并置灰", !activity.startButton.isEnabled)
-        awaitFor(activity, "失败原因上屏") {
-            activity.statusView.text.startsWith(MainActivity.STATUS_INSTALL_FAILED_PREFIX)
-        }
-
-        val text = activity.statusView.text.toString()
-        assertTrue("屏上必须有真实原因：$text", text.contains(BROKEN_CAUSE))
-        assertTrue("必须提示可重试：$text", text.contains("重试"))
-        assertTrue("失败后按钮恢复可点", activity.startButton.isEnabled)
-        assertNull("安装失败绝不能起 FGS", shadowOf(app).nextStartedService)
-        assertTrue("首行仍是未安装：${activity.versionView.text}", "${activity.versionView.text}".contains("not installed"))
-
-        // renderState 不得把失败冲成「未安装」或「空闲」
-        activity.renderState()
-        val after = activity.statusView.text.toString()
-        assertTrue(after.startsWith(MainActivity.STATUS_INSTALL_FAILED_PREFIX))
-        assertNotEquals(MainActivity.STATUS_NOT_INSTALLED, after)
-        assertNotEquals(MainActivity.STATUS_IDLE, after)
-
-        // 重试：运行时这次就位（预置 marker）→ 陈旧失败位必须清除并顺势起引擎。
-        // 这里塞 stub 而非走真实 initialize：真实 spawn 通路归「start engine button」用例，
-        // Robolectric 的 applicationInfo.nativeLibraryDir 为 null，真 initialize 会（正确地）拒绝。
-        presetMarker("retry-1")
-        val retryStub = StubSupervisor()
-        EngineRuntime.supervisor = retryStub
-        activity.startButton.performClick()
-        drain()
-        awaitFor(activity, "重试后失败文案清除") {
-            !activity.statusView.text.startsWith(MainActivity.STATUS_INSTALL_FAILED_PREFIX)
-        }
-        val restarted = shadowOf(app).nextStartedService
-        assertNotNull("重试成功必须发出 FGS 启动意图", restarted)
-        assertEquals(PiEngineService.ACTION_START, restarted!!.action)
-    }
-
-    // ── 新增 5：无 Ready 会话时「测试 RPC」只给提示；「停止引擎」发 ACTION_STOP ────
-
-    @Test
-    fun `probe without a ready session explains itself and stop posts the stop intent`() {
-        presetMarker()
-        val stub = StubSupervisor()
-        stub.states.value = mapOf("spawning" to SessionState.Spawning)
-        EngineRuntime.supervisor = stub
-        val activity = launch()
-
-        activity.probeButton.performClick()
-        drain()
-        val hint = activity.statusView.text.toString()
-        assertTrue("应提示没有活动会话：$hint", hint.startsWith("测试 RPC：没有活动会话"))
-        assertEquals(0, stub.sends)
-
-        activity.stopButton.performClick()
-        drain()
-        val stopped = shadowOf(app).nextStartedService
-        assertNotNull(stopped)
-        assertEquals(PiEngineService.ACTION_STOP, stopped!!.action)
-        assertEquals(PiEngineService::class.java.name, stopped.component!!.className)
+        fun update(event: AssistantMessageEvent): PiEvent.MessageUpdate =
+            PiEvent.MessageUpdate(assistantMessageEvent = event)
     }
 }

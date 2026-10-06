@@ -323,6 +323,26 @@ class ChatViewModel @Inject constructor(
      */
     fun newSession() = rollSession(RpcCommand.NewSession(), "新建会话")
 
+    /**
+     * 「别的页已经替我切过了」的落地钩子（§4.4：`:feature:sessions` 点行 → 发 `switch_session`
+     * → 导航到 `chat/{sessionId}`）。
+     *
+     * 只做 [onSessionRolled] 的清场，**绝不发命令**：命令是 sessions 屏发的，这里再发一次
+     * 就是同一目标切两遍；而 `[rollSession]` 的「等成功回执才清场」在这里也用不上——
+     * 本页没有那条 requestId，等下去只会超时并糊一条假提示。
+     *
+     * 为什么必须有这个方法：`ChatViewModel` 在 app 侧是 **Activity 作用域**（见 `AppNavHost` 的
+     * `ChatScreenRoute`），从 sessions 回进聊天页**不会重建 VM**——不重建就没有 `init`，
+     * 也就没人把上一条会话的转录换成新会话。清场只能显式调用。
+     *
+     * 未 Ready（安装门/失败态）时直接返回：那时根本没有会话可清，
+     * 硬清会把「运行时未安装」的界面洗成一条占位行。
+     */
+    fun onExternalSessionRoll() {
+        if (_uiState.value !is ChatUiState.Ready) return
+        onSessionRolled()
+    }
+
     /** 消费一次性提示（snackbar/banner 自动收起时也调它，与 `:feature:settings` 同形）。 */
     fun consumeNotice() {
         _notice.value = null

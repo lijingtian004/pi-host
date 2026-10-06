@@ -11,7 +11,6 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
-import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -21,6 +20,7 @@ import dagger.hilt.android.testing.HiltAndroidRule
 import dagger.hilt.android.testing.HiltAndroidTest
 import dagger.hilt.android.testing.HiltTestApplication
 import dagger.hilt.android.testing.UninstallModules
+import java.io.File
 import java.time.Duration
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.serialization.json.JsonArray
@@ -45,6 +45,10 @@ import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.PiMessage
 import works.earendil.pihost.core.rpc.RpcCommand
 import works.earendil.pihost.feature.chat.ui.ChatTags
+import works.earendil.pihost.feature.sessions.SessionScanner
+import works.earendil.pihost.feature.sessions.ui.SessionsTags
+import works.earendil.pihost.feature.settings.ui.SettingsStrings
+import works.earendil.pihost.feature.settings.ui.SettingsTags
 
 /**
  * app 接线测试（规格书 §7「app 测试 ≥7 条，等价重写 P2C 覆盖」）。
@@ -59,7 +63,8 @@ import works.earendil.pihost.feature.chat.ui.ChatTags
  * | 测试 RPC → 先订阅再发 + 应答渲染 | ⑥promptRoundTrip…（同一条通路，改为 prompt/流式）+ 探针本体在 `ChatViewModelTest case10` |
  * | 安装失败显因可重试 | ③installFailure… |
  * | 无会话提示 + ACTION_STOP | ⑧stopIntent…（含「安装失败绝不起 FGS」）|
- * 通知分支（P2C 用 grantPermissions 走通）→ ⑦，另加 ④NavHost 占位、⑤权限桥弹框。
+ * 通知分支（P2C 用 grantPermissions 走通）→ ⑦，权限桥弹框 → ⑤；
+ * P2E 的 §4.4 四路由另加三条：④ 真屏可达 + 回退顺序、④b 路由表自洽、④c `chat/{sessionId}` 落地不重生。
  *
  * **三条 Hilt + Robolectric 配方**（RECON-P2D §3 实测）：
  * 1. `@Config(application = HiltTestApplication::class)` + [`@HiltAndroidTest`]
@@ -145,6 +150,26 @@ class MainActivityTest {
         composeRule.onNodeWithTag(ChatTags.TOP_BAR).assertIsDisplayed()
     }
 
+    /**
+     * 往**真实磁盘**写一条 pi 会话 jsonl，让 `:feature:sessions` 的真 scanner 扫得到它。
+     *
+     * 根目录取 [SessionScanner.sessionsRoot]（= `filesDir/home/.pi/agent/sessions`），
+     * 与 DI 里 `SessionsModule` 给 scanner 的那个根**同一个表达式**，所以不需要任何反射或改路；
+     * 目录名用 pi 的 cwd 编码规则（`--data-proj-default--` ← `/data/proj/default`）。
+     * 行形状照 `SessionScannerTest` 的 s01：首行 `type:"session"` 头 + 一条 user message。
+     */
+    private fun seedSession(sessionId: String, cwd: String = "/data/proj/default"): File {
+        val dir = File(SessionScanner.sessionsRoot(app), "--data-proj-default--")
+        assertTrue("sessions 目录必须建得出来：${dir.absolutePath}", dir.mkdirs())
+        val file = File(dir, "2026-10-06T11-22-33-444Z_$sessionId.jsonl")
+        val header = """{"type":"session","version":3,"id":"$sessionId",""" +
+            """"timestamp":"2026-10-06T11:22:33.444Z","cwd":"$cwd"}"""
+        val user = """{"type":"message","timestamp":"2026-10-06T11:22:34.000Z",""" +
+            """"message":{"role":"user","content":[{"type":"text","text":"把 P2E 跑完"}]}}"""
+        file.writeText(listOf(header, user).joinToString(separator = "\n", postfix = "\n"))
+        return file
+    }
+
     // ── ① NavHost 的 chat 是起始路由，干净沙箱 = 安装门 ──────────────────────────
 
     @Test
@@ -202,26 +227,101 @@ class MainActivityTest {
         assertEquals(1, engine.startCalls.get())
     }
 
-    // ── ④ sessions/settings 占位路由（§13 偏差 2）+ 回退到 chat ──────────────────
+    // ── ④ 顶栏 → sessions/settings **真屏**（§4.4 四路由），返回逐层回退到 chat ─────
 
+    /**
+     * P2D 的 ④ 验的是「占位屏 + P2E 字样」，P2E 之后占位屏已删除，等价面换成：
+     * 路由可达（真屏自己的 tag）、空态引导在（§4.1 末条）、回退顺序不变。
+     *
+     * **一律按 tag 定位**：sessions 屏自己的标题也是「会话」、它的顶栏还有一颗「设置」按钮，
+     * 进入真屏后 `onNodeWithText` 会同时命中两条（app 顶栏 + 屏内顶栏），
+     * 这正是 [Nav.TAG_ENTRY_SESSIONS] 这组标签存在的原因。
+     */
     @Test
-    fun `placeholder routes render P2E and back navigation returns to chat`() {
-        composeRule.onNodeWithText(Nav.ENTRY_SESSIONS).performClick()
+    fun `top bar reaches the real sessions and settings screens and back unwinds to chat`() {
+        composeRule.onNodeWithTag(Nav.TAG_ENTRY_SESSIONS).performClick()
         pump()
-        composeRule.onNodeWithTag(Nav.TAG_SESSIONS).assertIsDisplayed()
-        composeRule.onAllNodesWithText(Nav.PLACEHOLDER)[0].assertIsDisplayed()
+        composeRule.onNodeWithTag(SessionsTags.SCREEN).assertIsDisplayed()
+        composeRule.onNodeWithTag(SessionsTags.EMPTY).assertIsDisplayed()
+        composeRule.onNodeWithTag(SessionsTags.FAB_NEW).assertIsDisplayed()
 
-        composeRule.onNodeWithText(Nav.ENTRY_SETTINGS).performClick()
+        composeRule.onNodeWithTag(Nav.TAG_ENTRY_SETTINGS).performClick()
         pump()
-        composeRule.onNodeWithTag(Nav.TAG_SETTINGS).assertIsDisplayed()
+        composeRule.onNodeWithTag(SettingsTags.SCREEN).assertIsDisplayed()
+        composeRule.onNodeWithTag(SettingsTags.CARD_VERSION).performScrollTo().assertIsDisplayed()
+        // §4.4 第二条：memTier 变更提示「下次启动会话生效」必须在设置屏上说得出
+        composeRule.onNodeWithText(SettingsStrings.TIER_HINT).performScrollTo().assertIsDisplayed()
 
         composeRule.activity.onBackPressedDispatcher.onBackPressed()
         pump()
-        composeRule.onNodeWithTag(Nav.TAG_SESSIONS).assertIsDisplayed()
+        composeRule.onNodeWithTag(SessionsTags.SCREEN).assertIsDisplayed()
 
         composeRule.activity.onBackPressedDispatcher.onBackPressed()
         pump()
         composeRule.onNodeWithText("运行时未安装").assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.INSTALL_BUTTON).assertIsDisplayed()
+    }
+
+    // ── ④b 路由表自洽：chat/{sessionId} 的 pattern 与 chatRoute() 拼法同源 ──────────
+
+    @Test
+    fun `route table keeps the parameterized chat pattern in sync with the helper`() {
+        assertEquals("chat", Nav.ROUTE_CHAT)
+        assertEquals("sessions", Nav.ROUTE_SESSIONS)
+        assertEquals("settings", Nav.ROUTE_SETTINGS)
+        assertEquals("chat/{sessionId}", Nav.ROUTE_CHAT_SESSION)
+
+        val id = "11111111-2222-4444-8888-555555555555"
+        assertEquals(
+            "带参路由必须由 chatRoute() 拼出，否则 pattern 与实参两套真相",
+            Nav.ROUTE_CHAT_SESSION.replace("{${Nav.ARG_SESSION_ID}}", id),
+            Nav.chatRoute(id),
+        )
+        assertEquals(Nav.ROUTE_CHAT, Nav.chatRoute(null))
+        assertEquals("空白 id 等于没有 id", Nav.ROUTE_CHAT, Nav.chatRoute("   "))
+    }
+
+    // ── ④c 四路由的最后一条：点列表某行 → switch_session → 落到 chat/{sessionId} ─────
+
+    /**
+     * 这条是 §4.4「四路由全实装」里唯一带真实语义的一条，也是**唯一能钉死
+     * 「聊天页 VM 是 Activity 作用域」的测试**：
+     *
+     * [works.earendil.pihost.AppNavHost] 把 `chat` 与 `chat/{sessionId}` 绑到同一个
+     * ChatViewModel 实例上，正是为了「从列表页回聊天页**不重建 VM**」。
+     * 一旦有人把 `hiltViewModel(chatOwner)` 改回默认的条目作用域，
+     * 新 VM 的 `init` 会再走一遍 installAndStart → `engine.start()`，
+     * 于是 [startCalls] 从 1 变 2 —— 这条断言当场红。真实后果是每进一次列表就多 spawn 一条 pi 进程。
+     *
+     * scanner 用**真实现**（`SessionsModule` 提供的 `PiSessionScanner`，根目录 =
+     * `$HOME/.pi/agent/sessions` = Robolectric 沙箱的 `filesDir/home/…`），
+     * 所以列表要有行就必须往磁盘写一条真 jsonl（形状照 `SessionScannerTest` 的 s01）。
+     */
+    @Test
+    fun `tapping a session row switches the session and lands on chat without a second spawn`() {
+        val seeded = seedSession("11111111-2222-4444-8888-555555555555")
+        enterReady()
+
+        composeRule.onNodeWithTag(Nav.TAG_ENTRY_SESSIONS).performClick()
+        pump()
+        composeRule.onNodeWithTag(SessionsTags.row(seeded.absolutePath)).performScrollTo().performClick()
+        pump()
+
+        assertEquals(
+            "点行只发 switch_session，启动责任留在聊天页",
+            listOf(RpcCommand.SwitchSession(seeded.absolutePath)),
+            engine.sent.map { it.command },
+        )
+        assertEquals(
+            "聊天页 VM 必须与起始 chat 条目共用，重建就是一条多余的 spawn",
+            1,
+            engine.startCalls.get(),
+        )
+        composeRule.onNodeWithTag(SessionsTags.SCREEN).assertDoesNotExist()
+        composeRule.onNodeWithTag(ChatTags.TRANSCRIPT).assertIsDisplayed()
+        // 外部切换 → VM 只做清场（§4.3 的「加载中」占位行），不发第二条命令
+        composeRule.onNodeWithText("会话切换中…").assertIsDisplayed()
+        assertEquals(1, engine.sent.size)
     }
 
     // ── ⑤ 权限桥：Ready 屏上弹框，「允许一次」与「拒绝」各自回写 ──────────────────

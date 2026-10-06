@@ -54,7 +54,13 @@ kotlin {
 }
 
 dependencies {
+    // §4.4 四路由全实装：sessions/settings 从 P2D 的占位屏换成真屏，app 因此要多两条 project 边。
+    // 全部 implementation（不是 api）：app 只消费各 feature 的 @Composable 入口，
+    // 不把 feature 的类型再转露给任何人（app 测试要引用 SessionsTags/SettingsTags 时，
+    // implementation 对本模块的 test 源集本来就可见 —— Gradle 的 testImplementation 继承 implementation）。
     implementation(project(":feature:chat"))
+    implementation(project(":feature:sessions"))
+    implementation(project(":feature:settings"))
     implementation(project(":core:engine"))
     implementation(project(":core:environment"))
 

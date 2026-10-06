@@ -789,6 +789,56 @@ class ChatViewModelTest {
         assertEquals(listOf("一二", "一二三"), committed)
     }
 
+    // ── 用例 21：§4.4 外部（sessions 屏）已切完 → 本页只清场、绝不重发命令 ─────────
+
+    /**
+     * 钉三件事：
+     * 1. **未 Ready 时惰性**：安装门/失败态下清场会把「运行时未安装」洗成一条占位行，
+     *    用户就再也按不到安装按钮了 —— 必须原样不动；
+     * 2. **不发命令**：`switch_session` 已由 `:feature:sessions` 发过，这里再发就是同一目标切两遍；
+     * 3. **不占 `switching` 闩**：外部滚完之后，本页自己的 `switchSession` 仍要能发出去。
+     */
+    @Test
+    fun `case21 an external session roll clears without sending and is inert before Ready`() = runTest {
+        // ① NotInstalled：一行都不许动
+        val rig = rig()
+        assertEquals("装配后的初态就是安装门", ChatUiState.NotInstalled, rig.vm.uiState.value)
+        rig.vm.onExternalSessionRoll()
+        runCurrent()
+        assertTrue(rig.vm.transcript.value.isEmpty())
+        assertNull(rig.vm.notice.value)
+        assertEquals(0, rig.engine.sent.size)
+
+        // ② Ready：清场 + 挂占位，零命令
+        ready(rig)
+        rig.engine.emit(PiEvent.MessageStart(PiMessage(role = "user", content = textBlocks("上一条会话的问题"))))
+        runCurrent()
+        rig.engine.emit(update(AssistantMessageEvent.TextStart(0)))
+        rig.engine.emit(update(AssistantMessageEvent.TextDelta(0, "写了一半")))
+        runCurrent()
+        assertEquals("草稿还压在窗口里", "", rig.assistant().text)
+
+        rig.vm.onExternalSessionRoll()
+        runCurrent()
+
+        assertEquals("外部滚不发任何 RPC", 0, rig.engine.sent.size)
+        val rolled = rig.vm.transcript.value
+        assertEquals("上一条的内容整条换掉，只剩占位", 1, rolled.size)
+        val note = rolled.single()
+        assertTrue("占位必须是 NoteItem，实为 $note", note is TranscriptItem.NoteItem)
+        assertEquals(SWITCHING_NOTE_TEXT, (note as TranscriptItem.NoteItem).text)
+        assertEquals(TurnState.Idle, rig.vm.turnState.value)
+        assertEquals(0, rig.vm.queueDepth.value)
+        assertNull(rig.vm.commandResult.value)
+        assertNull("成功路径不该留提示", rig.vm.notice.value)
+
+        // ③ 闩没被吃掉：本页自己发起的切换照常发得出去（而且恰好一条）
+        val path = "/files/home/.pi/agent/sessions/--p--/b.jsonl"
+        rig.vm.switchSession(path)
+        runCurrent()
+        assertEquals(listOf(RpcCommand.SwitchSession(path)), rig.engine.sent.map { it.command })
+    }
+
     private companion object {
         fun update(event: AssistantMessageEvent): PiEvent =
             PiEvent.MessageUpdate(assistantMessageEvent = event)

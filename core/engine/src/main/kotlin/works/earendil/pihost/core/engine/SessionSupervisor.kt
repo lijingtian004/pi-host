@@ -71,8 +71,12 @@ sealed interface SessionState {
  *
  * 每会话恢复用 host 生成的 UUID 作 `--session-id`（见 [PiSpawn]），
  * 因此崩溃重启后 argv 里的 session id 不变，会话文件续用。
+ *
+ * **为什么是 `open`**：本工程不引 Mockito（规格书 §2：不新增第三方依赖），
+ * 而 [PiEngineService] / MainActivity 的测试需要注入「记录调用的 stub 监督者」，
+ * 唯一通路是继承——故对外 API 全部 `open`，内部实现细节仍是 private。
  */
-class SessionSupervisor(
+open class SessionSupervisor(
     private val scope: CoroutineScope,
     private val starter: ProcessStarter,
     private val commandFor: (sessionId: String) -> List<String>,
@@ -90,7 +94,7 @@ class SessionSupervisor(
     private val _sessionStates = MutableStateFlow<Map<String, SessionState>>(emptyMap())
 
     /** key = sessionId（host 生成的 UUID）。每次转移替换整张 map 快照，保证引用透明。 */
-    val sessionStates: StateFlow<Map<String, SessionState>> = _sessionStates.asStateFlow()
+    open val sessionStates: StateFlow<Map<String, SessionState>> = _sessionStates.asStateFlow()
 
     private val entries = ConcurrentHashMap<String, Entry>()
 
@@ -100,7 +104,7 @@ class SessionSupervisor(
      * 挂起直到首个 [SessionState.Ready] 或终态（[SessionState.Failed]/[SessionState.Stopped]），
      * 返回 sessionId（= argv 里的 `--session-id`，重启后不变）。
      */
-    suspend fun start(): String {
+    open suspend fun start(): String {
         val sessionId = UUID.randomUUID().toString()
         val entry = Entry(sessionId)
         entries[sessionId] = entry
@@ -115,7 +119,7 @@ class SessionSupervisor(
      * 用户主动停：置停止标志 → 会话活着则优雅 close → [SessionState.Stopped]。
      * 未知 id / 已终态的 id 直接返回（幂等，无副作用）。
      */
-    suspend fun stop(sessionId: String) {
+    open suspend fun stop(sessionId: String) {
         val entry = entries[sessionId] ?: return
         entry.stopRequested.set(true)
         entry.stopSignal.complete(Unit)
@@ -126,7 +130,7 @@ class SessionSupervisor(
     }
 
     /** 全部 [stop]，并发推进，等全部进终态。 */
-    suspend fun shutdownAll() {
+    open suspend fun shutdownAll() {
         val ids = entries.keys.toList()
         coroutineScope { ids.map { id -> launch { stop(id) } } }
         ids.forEach { entries[it]?.watcher?.cancel() }
@@ -136,16 +140,16 @@ class SessionSupervisor(
      * 代理该会话的 [PiSession.events]（转发后的稳定 flow：进程重启后订阅者不用重订阅）。
      * 无 replay ⇒ 与 PiSession 同一条纪律：**先订阅再发命令**。会话未知 → null。
      */
-    fun events(sessionId: String): SharedFlow<PiEvent>? = entries[sessionId]?.bus
+    open fun events(sessionId: String): SharedFlow<PiEvent>? = entries[sessionId]?.bus
 
     /** 代理 [PiSession.stderrRing] 快照（8KB 环）。会话未知或还没有进程 → null。 */
-    fun stderrTail(sessionId: String): String? = entries[sessionId]?.session?.stderrRing?.snapshot()
+    open fun stderrTail(sessionId: String): String? = entries[sessionId]?.session?.stderrRing?.snapshot()
 
     /**
      * 向该会话的活动进程发命令（`测试 RPC` 按钮的发送通路，规格书 §7）。
      * 返回用于关联 response 的 id；无活动进程 → [IllegalStateException]。
      */
-    suspend fun send(sessionId: String, command: RpcCommand, id: String? = null): String {
+    open suspend fun send(sessionId: String, command: RpcCommand, id: String? = null): String {
         val session = entries[sessionId]?.session
             ?: throw IllegalStateException("会话 $sessionId 没有活动 pi 进程")
         val requestId = id ?: session.nextId()

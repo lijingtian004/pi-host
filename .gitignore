@@ -3,3 +3,10 @@ build/
 *.iml
 .kotlin/
 local.properties
+
+# P2B 运行时打包产物（脚本入 git，产物不入）
+tools/runtime-packaging/out/
+
+# job A/B 铺进 app 的真实资产：107M so + 8M zip，不进 git
+app/src/main/jniLibs/
+app/src/main/assets/

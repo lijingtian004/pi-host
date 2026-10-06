@@ -1,0 +1,29 @@
+# termux-pins.tsv — Termux arm64 包版本钉死表（reproducible build 的唯一版本来源）
+# 生成方式（真实索引，非手抄）：
+#   curl -fsSL https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages
+#   python3 pkg-index.py <Packages> --tsv <包名...>   # 索引日期 2026-10-06 抓取
+# 字段：package <TAB> version <TAB> repo 相对路径 <TAB> sha256
+# job A（build-jniLibs.sh）与 job B（build-pi-runtime.sh）都从这里取包，下载后强制校验 sha256。
+nodejs-lts	24.18.0-1	pool/main/n/nodejs-lts/nodejs-lts_24.18.0-1_aarch64.deb	490f4d08c45b25a7ea7db6ee466ebb3ee61f07083260b85332704ed018f59a87
+bash	5.3.20	pool/main/b/bash/bash_5.3.20_aarch64.deb	26b5b3ab5b0ac0e3b372ac1e7ddd89270519c1eb25b88fe4175485c2de8086b2
+git	2.56.0	pool/main/g/git/git_2.56.0_aarch64.deb	dcdd22c5fdf7bdb5b825a03a17441d43858ed8515fea57fbb37eb42e733ca82f
+coreutils	9.11-1	pool/main/c/coreutils/coreutils_9.11-1_aarch64.deb	5fe326e19256ac2f0a2b278e780e26a848746a43ff37105cbdeddd4c527ccf57
+ca-certificates	1:2026.09.25	pool/main/c/ca-certificates/ca-certificates_1:2026.09.25_all.deb	57fab24bf4561bfdd35afe71bc1929914e51c35458cfd1fca2b15e54bc8df7af
+openssl	1:3.6.5	pool/main/o/openssl/openssl_1:3.6.5_aarch64.deb	a2fb7856875e63ef6b90442752e05974813372c3ca86d2513a78ea43c67a0f8b
+libc++	30	pool/main/libc/libc++/libc++_30_aarch64.deb	53d0b84a7ba7459024257cb94d5b136fe13ef858567f65a8064b35950799f2ca
+c-ares	1.34.8	pool/main/c/c-ares/c-ares_1.34.8_aarch64.deb	7681fc23e822d7988ba8b2adf3468f93ae68f724dda365cff1385096a9fa87e6
+libicu	78.3	pool/main/libi/libicu/libicu_78.3_aarch64.deb	f536403f65a08fe0df6e7304184e902d54def77d5c3bd5edfd9109d57601d276
+libsqlite	3.53.4	pool/main/libs/libsqlite/libsqlite_3.53.4_aarch64.deb	0e909ce0d50fe123305446cd22e0c5edf535d40344b9b065fbdcdee52f53198d
+zlib	1.3.2	pool/main/z/zlib/zlib_1.3.2_aarch64.deb	75e7d0af17fcc3b40004309fdc00a1ddb9ae08346dce5e269902c34ac3966ac9
+libandroid-support	29-1	pool/main/liba/libandroid-support/libandroid-support_29-1_aarch64.deb	f2f145d6135ad4843ac9670153be3e3944dc1e6f1736d46d2306c28f2b86f517
+libiconv	1.19	pool/main/libi/libiconv/libiconv_1.19_aarch64.deb	fe9481b1dc101c6c3552943f25435109fd522aecc615ae49594f9fbee863bb37
+readline	8.3.6	pool/main/r/readline/readline_8.3.6_aarch64.deb	616cc73009bc0223f61caed8dd09455714455aa5ea5e180126e2f69c4c775136
+pcre2	10.49	pool/main/p/pcre2/pcre2_10.49_aarch64.deb	c27995e5f52b8ecc9b8b3e662eb08e49f82a18bfd3f34343936acc7b23964724
+libcurl	8.22.0	pool/main/libc/libcurl/libcurl_8.22.0_aarch64.deb	e780d925d977c32a3cfe6a2c7d340f0726618786deee98b0cb8b601efb93a8c9
+libandroid-selinux	14.0.0.11-1	pool/main/liba/libandroid-selinux/libandroid-selinux_14.0.0.11-1_aarch64.deb	00afd8c34087c2864737b51fd9d104dc5e955f6ec3c0f50c0c7ef5b4a56866b9
+libgmp	6.3.0-2	pool/main/libg/libgmp/libgmp_6.3.0-2_aarch64.deb	5a3c1325638946ca212ddcb89bffb2c4459b4c90757d6e69f820e176534037fa
+ncurses	6.6.20260307+really6.5.20250830	pool/main/n/ncurses/ncurses_6.6.20260307+really6.5.20250830_aarch64.deb	f44bbfdc3d42ec0217bffa978309390e59cea5a48a9a83226d4a496c42ad0b99
+libnghttp2	1.70.0	pool/main/libn/libnghttp2/libnghttp2_1.70.0_aarch64.deb	ab2e0a3408fe4934ffdf774bd5049a265db2e6db62dcb651baecbecfb81e3f0b
+libnghttp3	1.18.0	pool/main/libn/libnghttp3/libnghttp3_1.18.0_aarch64.deb	0be2ee96def3608afaf24eb0b4b55f3484a37c95ea21bb1d6d85c7d543467603
+libngtcp2	1.25.0	pool/main/libn/libngtcp2/libngtcp2_1.25.0_aarch64.deb	f471bad7f4329b6b0b4aedf124e0a23a35f6ac99bfbae73304136f8bfd570fc3
+libssh2	1.11.1-2	pool/main/libs/libssh2/libssh2_1.11.1-2_aarch64.deb	1add4e0a926b848814e7e2f1817ea28b123c54cabd5bbc4e5cfd65291cbad84e

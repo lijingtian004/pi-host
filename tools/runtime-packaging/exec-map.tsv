@@ -1,0 +1,17 @@
+# exec-map.tsv — 要进 jniLibs 的可执行体（job A）
+#
+# 选入判据（spawn 链，方案 §4.4 + REPORT.md 第 3 节 readelf 实测）：
+#   node  ← 主进程 argv[0]
+#   bash  ← pi 的 Bash 工具 spawn $SHELL -c
+#   git   ← 分支展示/提交；coreutils ← bash 脚本里最基本的 posix 工具（Termux 是 multicall，
+#           bin/* 全是 9 字节软链，只需带 coreutils 一个 ELF）
+#   git-remote-http ← bin/git 的 DT_NEEDED 里**没有** libcurl，Termux 的 https 传输走
+#                     外部 helper；不带它就 clone 不了 https 仓库（代价：整个 libcurl 闭包）
+# 不选：git-daemon / git-http-backend / git-imap-send / scalar / git-shell / openssh（见报告）
+#
+# 列：package <TAB> 包内 $PREFIX 相对路径 <TAB> jniLibs 目标名
+nodejs-lts	bin/node	libpi_node.so
+bash	bin/bash	libpi_bash.so
+git	bin/git	libpi_git.so
+git	libexec/git-core/git-remote-http	libpi_git_remote_http.so
+coreutils	bin/coreutils	libpi_coreutils.so

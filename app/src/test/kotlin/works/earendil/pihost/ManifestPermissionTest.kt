@@ -72,15 +72,18 @@ class ManifestPermissionTest {
             declared.contains(Manifest.permission.POST_NOTIFICATIONS))
     }
 
-    // ── ③ 版本必须升到 versionCode=2 / versionName=0.1.1（§2 红线「版本必须升」） ────
+    // ── ③ 版本必须升到 versionCode=3 / versionName=0.1.2（§2 红线「版本必须升」） ────
 
     @Test
-    fun `03 the apk identity is bumped to versionCode 2 and versionName 0 point 1 point 1`() {
+    fun `03 the apk identity is bumped to versionCode 3 and versionName 0 point 1 point 2`() {
         val info = app.packageManager.getPackageInfo(app.packageName, 0)
-        // 用 2L：longVersionCode 是 Long，写字面量 2 会落到 assertEquals(String, Object, Object)
-        // 那条重载上，Integer(2) != Long(2) 会假红——这是 JUnit 装箱陷阱，不是版本没升。
-        assertEquals("versionCode 不升，真机会装成同版本、覆盖不掉带 bug 的旧包", 2L, info.longVersionCode)
-        assertEquals("0.1.1", info.versionName)
+        // 用 3L：longVersionCode 是 Long，写字面量 3 会落到 assertEquals(String, Object, Object)
+        // 那条重载上，Integer(3) != Long(3) 会假红——这是 JUnit 装箱陷阱，不是版本没升。
+        assertEquals("versionCode 不升，真机会装成同版本、覆盖不掉带 bug 的旧包", 3L, info.longVersionCode)
+        assertEquals("0.1.2", info.versionName)
         assertEquals("works.earendil.pihost", info.packageName)
+        // 单调性单列一条：P2F 发的是 2，P2G 发的是 3。写死 3L 已经隐含这件事，
+        // 但这条的失败信息会直接说出「必须严格大于上一版」，排查 adb install -r 拒装时少绕一步。
+        assertTrue("必须严格高于 P2F 的 2，否则覆盖安装被拒", info.longVersionCode > 2L)
     }
 }

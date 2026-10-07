@@ -215,7 +215,8 @@ class FakeModelCredentialSource(initial: List<ProviderEntry> = emptyList()) : Mo
     }
 }
 
-/** 一条 `get_state` 的成功应答（data 里塞 [n] 个键，用来把「前 500 字截断」这条语义撑出来）。 */fun probeResponse(id: String?, success: Boolean = true, keys: Int = 1, error: String? = null): PiEvent.Response {
+/** 一条 `get_state` 的成功应答（data 里塞 [n] 个键，用来把「前 500 字截断」这条语义撑出来）。 */
+fun probeResponse(id: String?, success: Boolean = true, keys: Int = 1, error: String? = null): PiEvent.Response {
     val body = buildString {
         append('{')
         for (i in 1..keys) {

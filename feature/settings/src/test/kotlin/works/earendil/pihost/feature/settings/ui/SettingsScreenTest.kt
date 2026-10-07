@@ -112,6 +112,18 @@ class SettingsScreenTest {
         )
     }
 
+    /**
+     * 输入框的**显示形态**——即 `SemanticsProperties.EditableText`，它是
+     * `PasswordVisualTransformation` 之后的串（编译机实测：草稿 `sk-x` 时该属性是 `••••`，
+     * 而真值另住在 `InputText`）。§4.2 点名要这个变换，所以它必须有一条能咬人的断言。
+     */
+    private fun keyFieldDisplay(): String {
+        val node = composeRule.onNodeWithTag(SettingsTags.CREDENTIAL_KEY_FIELD)
+            .fetchSemanticsNode("密钥输入框（tag=${SettingsTags.CREDENTIAL_KEY_FIELD}）")
+        return node.config.getOrNull(SemanticsProperties.EditableText)?.toString()
+            ?: "<节点上没有 EditableText 属性>"
+    }
+
     private class Rig(
         val vm: SettingsViewModel,
         val repository: FakeSettingsRepository,
@@ -337,6 +349,8 @@ class SettingsScreenTest {
 
         composeRule.onNodeWithTag(SettingsTags.CREDENTIAL_KEY_FIELD).performTextInput("sk-live-value")
         pump()
+        // 屏幕上此刻必须是 13 个圆点，不是明文（§4.2 点名的 PasswordVisualTransformation）
+        assertEquals("•".repeat("sk-live-value".length), keyFieldDisplay())
         composeRule.onNodeWithTag(SettingsTags.CREDENTIAL_SAVE).assertIsEnabled().performClick()
         pump()
 
@@ -406,6 +420,8 @@ class SettingsScreenTest {
         // 草稿必须还在（§4.2「失败不清输入」），且全树只有输入框这**一个**节点持有明文；
         // 屏幕上的显示文本里搜不到它——圆点挡的是屏幕，明文只住在 InputText 这一个属性里。
         assertKeyValue("sk-x")
+        // 草稿留着，但屏幕上仍是四个圆点（变换没被撤掉）
+        assertEquals("•".repeat("sk-x".length), keyFieldDisplay())
         assertKeyNotEchoed("sk-x")
         composeRule.onNodeWithTag(SettingsTags.credentialRow("deepseek")).assertDoesNotExist()
     }

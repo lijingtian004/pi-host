@@ -233,3 +233,6 @@ bash /root/pi/.tools/bbuild.sh gradle ':feature:chat:testDebugUnitTest \
   156 + 28 = 184 编译机，加本机 37 = 221。
 - 提交：`fac7e54` → `261cb06` → `635f120` → `fca8964` → 本报告（第 5 步「矩阵 + 双端落盘」本身不产生源码改动，
   其产物就是本报告的 §7 数字与 sha256，故与第 6 步合并成这一个 commit）。
+- 一处如实纠偏：提交 `fca8964` 标题写的「16 用例绿」是照规格书 §7 门槛（`app ≥16`）写的，
+  实测 `:app` 是 **17**（MainActivityTest 11 + ManifestPermissionTest 3 + PiEngineServiceWiringTest 3）。
+  门槛仍满足，数字以本报告 §7 为准。

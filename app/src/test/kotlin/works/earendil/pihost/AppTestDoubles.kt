@@ -1,11 +1,14 @@
 package works.earendil.pihost
 
+import android.content.Context
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
+import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
+import javax.inject.Singleton
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,8 +24,10 @@ import works.earendil.pihost.core.engine.RuntimeInstall
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.di.EngineModule
 import works.earendil.pihost.core.engine.settings.AppSettings
+import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
+import works.earendil.pihost.core.environment.PathLayout
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
 import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.RpcCommand
@@ -89,6 +94,21 @@ object AppTestEngineModule {
 
     @Provides
     fun settingsRepository(): SettingsRepository = AppTestHolder.settings
+
+    /**
+     * 凭据面（P2G §4.1）：`SettingsViewModel` 多了一条注入边，卸载了 `EngineModule` 的测试图必须补上，
+     * 否则 Hilt 在建图阶段就缺绑定（`:app` 的设置路由会真造这个 VM，见 `MainActivityTest:241-253`）。
+     *
+     * 这里给的是**真类 + 假目录**：`ModelCredentialStore(PathLayout.homeDir(ctx))` 的 `ctx` 是
+     * Robolectric 沙箱 Application，`filesDir` 指向每沙箱唯一的临时目录，所以：
+     * - 写的是临时盘上的 `home/.pi/agent/auth.json`，不碰任何设备路径（P2F §7.1 的越界教训）；
+     * - 语义与生产一致（原子读-改-写真的跑），而凭据写入的完整覆盖在 `:core:engine` 的
+     *   `ModelCredentialStoreTest`（17 条），`:app` 只需要这条边能让图建起来 + 列表是空的。
+     */
+    @Provides
+    @Singleton
+    fun modelCredentialStore(@ApplicationContext ctx: Context): ModelCredentialStore =
+        ModelCredentialStore(PathLayout.homeDir(ctx))
 }
 
 /**

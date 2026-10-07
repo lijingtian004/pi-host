@@ -19,6 +19,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.settings.AppSettings
+import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.RpcCommand
@@ -44,16 +45,24 @@ class SettingsViewModelTest {
         val repository: FakeSettingsRepository,
         val engine: FakeEngine,
         val info: FakeRuntimeInfo,
+        val credentials: FakeModelCredentialSource,
     )
 
     private fun TestScope.rig(
         settings: AppSettings = AppSettings(),
         engine: FakeEngine = FakeEngine(),
         info: FakeRuntimeInfo = FakeRuntimeInfo(),
+        credentials: FakeModelCredentialSource = FakeModelCredentialSource(),
     ): Rig {
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         val repository = FakeSettingsRepository(settings)
-        return Rig(SettingsViewModel(repository, engine, info), repository, engine, info)
+        return Rig(
+            SettingsViewModel(repository, engine, info, credentials),
+            repository,
+            engine,
+            info,
+            credentials,
+        )
     }
 
     /** 就绪的引擎：探针只有在有活会话时才发得出命令。 */
@@ -215,7 +224,7 @@ class SettingsViewModelTest {
         repository.writeError = IllegalStateException("disk full")
         repository.applyToSnapshot = false
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        val vm = SettingsViewModel(repository, FakeEngine(), FakeRuntimeInfo())
+        val vm = SettingsViewModel(repository, FakeEngine(), FakeRuntimeInfo(), FakeModelCredentialSource())
 
         vm.setMemTier(MemTier.LOW)
         runCurrent()
@@ -357,5 +366,91 @@ class SettingsViewModelTest {
 
         val done = rig.vm.probe.value as ProbeState.Done
         assertEquals("data 为空时退回 command 名，卡片不能是空白", "get_state", done.text)
+    }
+
+    // ── t13 凭据（P2G §4.2）：进屏读一次 + 保存的成功面 ───────────────────────────
+
+    @Test
+    fun `t13 entering the screen reads the credential list once`() = runTest {
+        val stored = listOf(ProviderEntry("deepseek", true), ProviderEntry("anthropic", false))
+        val rig = rig(credentials = FakeModelCredentialSource(stored))
+
+        assertEquals("构造里的 refreshCredentials 必须已经跑完（Unconfined main）", stored, rig.vm.credentials.value)
+        assertEquals(1, rig.credentials.snapshotCalls.get())
+    }
+
+    @Test
+    fun `t14 a saved credential refreshes the list, clears the draft and explains the timing`() = runTest {
+        val rig = rig()
+
+        rig.vm.onCredentialDraftChange("sk-secret-value")
+        assertEquals("sk-secret-value", rig.vm.credentialDraft.value)
+
+        rig.vm.saveCredential("deepseek", "sk-secret-value")
+        runCurrent()
+
+        assertEquals(listOf(FakeModelCredentialSource.Save("deepseek", "sk-secret-value")), rig.credentials.saves.toList())
+        assertEquals(listOf(ProviderEntry("deepseek", keyConfigured = true)), rig.vm.credentials.value)
+        assertEquals("§4.2：保存成功后清空输入框", "", rig.vm.credentialDraft.value)
+        assertEquals("§4.2 原文那条 notice", SettingsStrings.CREDENTIAL_SAVED, rig.vm.notice.value)
+        assertTrue(
+            "生效时机必须写清「新会话」",
+            rig.vm.notice.value!!.contains("新会话生效") && rig.vm.notice.value!!.contains("停止后重开"),
+        )
+    }
+
+    @Test
+    fun `t15 a blank key never reaches the store`() = runTest {
+        val rig = rig()
+
+        for (blank in listOf("", "   ", "\t")) {
+            rig.vm.onCredentialDraftChange(blank)
+            rig.vm.saveCredential("deepseek", blank)
+            runCurrent()
+        }
+
+        assertTrue("§4.2：空 key 保存不触发写入", rig.credentials.saves.isEmpty())
+        assertEquals(SettingsStrings.CREDENTIAL_BLANK_KEY, rig.vm.notice.value)
+        assertEquals("没写成功就不该冒出已配置行", emptyList<ProviderEntry>(), rig.vm.credentials.value)
+    }
+
+    @Test
+    fun `t16 a store blowup surfaces the reason and keeps the draft`() = runTest {
+        val credentials = FakeModelCredentialSource()
+        val rig = rig(credentials = credentials)
+
+        credentials.boom = java.io.IOException("无法创建目录：/x/.pi/agent")
+        rig.vm.onCredentialDraftChange("sk-x")
+        rig.vm.saveCredential("deepseek", "sk-x")
+        runCurrent()
+
+        val notice = rig.vm.notice.value!!
+        assertTrue("失败要带原因：$notice", notice.startsWith("写入失败：") && notice.contains("无法创建目录"))
+        assertEquals("写失败时输入框不清空，让人原地重试", "sk-x", rig.vm.credentialDraft.value)
+        assertEquals(emptyList<ProviderEntry>(), rig.vm.credentials.value)
+
+        rig.vm.consumeNotice()
+        credentials.boom = null
+        rig.vm.clearCredential("groq")
+        runCurrent()
+        assertEquals(listOf("groq"), credentials.clears.toList())
+        assertTrue("清除也要说生效时机", rig.vm.notice.value!!.contains("新会话生效"))
+    }
+
+    @Test
+    fun `t17 a failed first read shows an empty list instead of a notice`() = runTest {
+        val credentials = FakeModelCredentialSource()
+        credentials.boom = java.io.IOException("读不动")
+
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val vm = SettingsViewModel(FakeSettingsRepository(), FakeEngine(), FakeRuntimeInfo(), credentials)
+
+        assertEquals("进屏读失败 → 空列表（不是半成品）", emptyList<ProviderEntry>(), vm.credentials.value)
+        assertNull("读失败不弹 notice：列表空着已经说明问题", vm.notice.value)
+
+        credentials.boom = null
+        vm.refreshCredentials()
+        runCurrent()
+        assertEquals("重读口是有效的", 2, credentials.snapshotCalls.get())
     }
 }

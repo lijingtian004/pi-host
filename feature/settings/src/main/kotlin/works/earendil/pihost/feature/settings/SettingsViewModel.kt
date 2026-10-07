@@ -15,6 +15,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.settings.AppSettings
+import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.PiEvent
@@ -67,12 +68,18 @@ sealed interface ProbeState {
  *    管道阻塞时不会来；没有超时就是一张永久转圈的卡片。
  * 4. **版本卡片读磁盘**：[RuntimeInfoSource.read] 是阻塞 IO，放 `Dispatchers.IO`；
  *    假体那侧不挂起（见 [runtimeInfo] 的类型是接口），所以测试里不需要真线程。
+ * 5. **凭据只走 auth.json、只报状态不报内容**（P2G §4.2 + §2 红线）：[credentialStore] 是
+ *    [ModelCredentialSource] 接口，阻塞 IO 与线程切换都在实现侧（见它的 KDoc），VM 不做调度决定；
+ *    页面能拿到的只有 [ProviderEntry]（providerId + 已配置旗），**没有任何一条路能把 key 回到 UI**；
+ *    写入失败只报「原因」，而原因来自 [java.io.IOException] 的 message（内容只有路径，见
+ *    [works.earendil.pihost.core.engine.settings.ModelCredentialStore]），不掺入凭据。
  */
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val repository: SettingsRepository,
     private val engine: ChatEngine,
     private val runtimeInfo: RuntimeInfoSource,
+    private val credentialStore: ModelCredentialSource,
 ) : ViewModel() {
 
     /** 三键快照，直接转发仓库的流（UI `collectAsState`）。 */
@@ -93,8 +100,87 @@ class SettingsViewModel @Inject constructor(
     /** 一次性提示（memTier「下次启动会话生效」/ 写盘失败）；消费后清掉。 */
     val notice: StateFlow<String?> = _notice.asStateFlow()
 
+    private val _credentials = MutableStateFlow<List<ProviderEntry>>(emptyList())
+
+    /**
+     * 已配置 provider 的行（§4.2）。**只有 providerId 与「已配置」旗**——这是本屏唯一允许出现的
+     * 凭据相关信息（§2 红线「UI 永不回显已存 key」）。
+     */
+    val credentials: StateFlow<List<ProviderEntry>> = _credentials.asStateFlow()
+
+    private val _credentialDraft = MutableStateFlow("")
+
+    /**
+     * key 输入框的草稿（放在 VM 而不是 `remember` 里，只为一条：§4.2 要求「保存成功后清空输入框」，
+     * 而清空这个动作只有知道写盘结果的 VM 才该发起）。
+     */
+    val credentialDraft: StateFlow<String> = _credentialDraft.asStateFlow()
+
     init {
         refreshRuntimeInfo()
+        refreshCredentials()
+    }
+
+    /**
+     * 重读 auth.json（进屏一次 + 每次写后）。
+     *
+     * 读失败**不进 notice**：进屏首帧就该有这张列表，磁盘抖动时显示「还没配置」比弹一条提示更诚实
+     * （§4.2 只要求保存/清除的失败进 notice）。
+     */
+    fun refreshCredentials() {
+        viewModelScope.launch {
+            _credentials.value = runCatching { credentialStore.snapshot() }.getOrDefault(emptyList())
+        }
+    }
+
+    /** 输入框变化。 */
+    fun onCredentialDraftChange(value: String) {
+        _credentialDraft.value = value
+    }
+
+    /**
+     * 写凭据（§4.2）：成功 → 刷列表 + 清输入框 + notice「已保存，新会话生效（对话进行中请停止后重开）」；
+     * 失败 → notice 说原因，列表与输入框都不动（让人能原地重试）。
+     *
+     * 空 key 第一道门是 UI 的禁用按钮，这里是**第二道**：直接调 VM 也写不进一条空凭据
+     * （core 侧 `require` 是第三道，§4.1 第 ⑦ 条）。
+     */
+    fun saveCredential(providerId: String, apiKey: String) {
+        if (apiKey.isBlank()) {
+            _notice.value = SettingsStrings.CREDENTIAL_BLANK_KEY
+            return
+        }
+        viewModelScope.launch {
+            val outcome = runCatching {
+                credentialStore.save(providerId, apiKey)
+                credentialStore.snapshot()
+            }
+            outcome.fold(
+                onSuccess = { rows ->
+                    _credentials.value = rows
+                    _credentialDraft.value = ""
+                    _notice.value = SettingsStrings.CREDENTIAL_SAVED
+                },
+                onFailure = { throwable -> _notice.value = SettingsStrings.credentialWriteFailed(reasonOf(throwable)) },
+            )
+        }
+    }
+
+    /** 撤销一个 provider 的凭据（§4.2）：成功后同样刷新列表 + notice，生效时机与保存一致。 */
+    fun clearCredential(providerId: String) {
+        viewModelScope.launch {
+            val outcome = runCatching {
+                credentialStore.clear(providerId)
+                credentialStore.snapshot()
+            }
+            outcome.fold(
+                onSuccess = { rows ->
+                    _credentials.value = rows
+                    _notice.value = SettingsStrings.credentialCleared(providerId)
+                },
+                onFailure = { throwable -> _notice.value = SettingsStrings.credentialWriteFailed(reasonOf(throwable)) },
+            )
+        }
     }
 
     /**
@@ -241,6 +327,15 @@ class SettingsViewModel @Inject constructor(
         val reason = this?.message ?: this?.javaClass?.simpleName ?: "未知"
         return ProbeState.Unavailable(SettingsStrings.PROBE_SEND_FAILED + reason, retryable = true)
     }
+
+    /**
+     * 写盘失败的人话原因（§4.2 notice）。
+     *
+     * message 优先：store 抛的都是 `java.io.IOException("无法创建目录：…")` 这种**只含路径**的句子；
+     * 没有 message 才退回类名。两条都不会带出凭据内容。
+     */
+    private fun reasonOf(throwable: Throwable?): String =
+        throwable?.message?.takeIf { it.isNotBlank() } ?: throwable?.javaClass?.simpleName ?: "未知"
 
     companion object {
         /** 探针应答的等待上限（比 `:feature:chat` 的握手超时短——这是 UI 上的一个按钮，不该让人等 10 秒）。 */

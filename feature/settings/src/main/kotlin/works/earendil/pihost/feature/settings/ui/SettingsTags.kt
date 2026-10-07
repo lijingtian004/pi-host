@@ -28,12 +28,37 @@ object SettingsTags {
 
     const val NOTICE: String = "settings-notice"
 
+    // ── §4.2 模型接入（新 tag 前缀照旧：`SCREEN + "-credential"` 系列，同 `:177` 的 `-model` 先例）──
+
+    const val CREDENTIAL_SECTION: String = "screen-settings-credential"
+    const val CREDENTIAL_PROVIDER_BUTTON: String = "screen-settings-credential-provider"
+    const val CREDENTIAL_PICKER: String = "screen-settings-credential-picker"
+    const val CREDENTIAL_KEY_FIELD: String = "screen-settings-credential-key"
+    const val CREDENTIAL_SAVE: String = "screen-settings-credential-save"
+    const val CREDENTIAL_REFRESH: String = "screen-settings-credential-refresh"
+    const val CREDENTIAL_EMPTY: String = "screen-settings-credential-empty"
+
     /** 三选一按枚举名打 tag，测试不依赖中文文案。 */
     fun tier(tier: MemTier): String = "settings-tier-${tier.name}"
+
+    /** 下拉里的一个 provider 行（tag 用 providerId，文案改展示名也不破测试）。 */
+    fun credentialProviderItem(providerId: String): String =
+        "screen-settings-credential-provider-item-$providerId"
+
+    /** 已配置列表的一行。 */
+    fun credentialRow(providerId: String): String = "screen-settings-credential-row-$providerId"
+
+    /** 已配置一行的清除按钮。 */
+    fun credentialClear(providerId: String): String = "screen-settings-credential-clear-$providerId"
 
     init {
         // 与上面三个常量保持一致（Kotlin 侧只有一处真相：tag 名由枚举派生）
         check(MEM_TIER_LOW == tier(MemTier.LOW) && MEM_TIER_MID == tier(MemTier.MID) && MEM_TIER_HIGH == tier(MemTier.HIGH))
+        // 同理：credential 系列的公共前缀必须就是规格书 §4.2 写的 `SCREEN + "-credential"`
+        check(CREDENTIAL_SECTION == "$SCREEN-credential")
+        check(CREDENTIAL_PROVIDER_BUTTON == "$CREDENTIAL_SECTION-provider")
+        check(CREDENTIAL_KEY_FIELD == "$CREDENTIAL_SECTION-key")
+        check(CREDENTIAL_SAVE == "$CREDENTIAL_SECTION-save")
     }
 }
 
@@ -81,6 +106,39 @@ object SettingsStrings {
 
     const val MODEL_PI_DEFAULT: String = "pi 内置默认（未指定）"
     const val MODEL_HINT: String = "模型切换不在本里程碑（P2E 只读显示）。"
+
+    // ── §4.2 模型接入 ──────────────────────────────────────────────────────────────
+
+    const val SECTION_CREDENTIAL: String = "模型接入"
+
+    /** 生效时机说清楚：pi 只在 spawn 时读一次凭据（§3 定案），热加载不做，页面也不许暗示它会做。 */
+    const val CREDENTIAL_HINT: String = "选提供方、填 API 密钥，写进 pi 的 auth.json；已在对话里的会话不吃新凭据。"
+
+    const val CREDENTIAL_PROVIDER_LABEL: String = "提供方"
+    const val CREDENTIAL_KEY_LABEL: String = "API 密钥"
+    const val CREDENTIAL_SAVE: String = "保存"
+    const val CREDENTIAL_CLEAR: String = "清除"
+
+    /** 手工重读 auth.json（用户可能在文件管理器里动过，或换了台设备）。 */
+    const val CREDENTIAL_REFRESH: String = "重读列表"
+    const val CREDENTIAL_PICKER_TITLE: String = "选择提供方"
+    const val CREDENTIAL_PICKER_CANCEL: String = "取消"
+    const val CREDENTIAL_NONE: String = "还没配置任何提供方。"
+
+    /** 已配置一行的两种状态（§2 红线：只显示状态，永不回显 key）。 */
+    const val CREDENTIAL_CONFIGURED: String = "已配置"
+    const val CREDENTIAL_NO_KEY: String = "无可用密钥"
+
+    /** §4.2 原文那条 notice。 */
+    const val CREDENTIAL_SAVED: String = "已保存，新会话生效（对话进行中请停止后重开）"
+
+    const val CREDENTIAL_BLANK_KEY: String = "密钥是空的，没有写入。"
+
+    fun credentialCleared(providerId: String): String =
+        "已清除 $providerId，新会话生效（对话进行中请停止后重开）"
+
+    /** 写盘/撤销失败：原因只来自 IOException 的 message（内容是路径，不含凭据，见 VM 的 reasonOf）。 */
+    fun credentialWriteFailed(reason: String): String = "写入失败：$reason"
 
     const val NOTICE_AUTO_DISMISS_HINT: String = "（稍后自动收起）"
 

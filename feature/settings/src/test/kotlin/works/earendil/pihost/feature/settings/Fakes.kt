@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.update
 import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.settings.AppSettings
+import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
@@ -170,8 +171,51 @@ class FakeRuntimeInfo(
     }
 }
 
-/** 一条 `get_state` 的成功应答（data 里塞 [n] 个键，用来把「前 500 字截断」这条语义撑出来）。 */
-fun probeResponse(id: String?, success: Boolean = true, keys: Int = 1, error: String? = null): PiEvent.Response {
+/**
+ * 凭据面假体（P2G §4.2「注入 fake store」）。
+ *
+ * 三条纪律：
+ * 1. **不挂起、不碰线程**——真实现自己 hop `Dispatchers.IO`（见 [ModelCredentialSource] 的 KDoc），
+ *    假体留在这里，`runTest` 与 Robolectric 的 `pump()` 才是纯虚拟时钟的；
+ * 2. **不持 key 明文**——[rows] 里只有 `ProviderEntry`，与生产面同形；[saves] 记的是**收到的入参**，
+ *    用来断言「key 确实送进了写入调用」，而不是「UI 能读回 key」；
+ * 3. [boom] 一置非 null，三个方法全抛 → 演 §4.2「失败进 notice」那条分支。
+ *    为什么用旗而不是真文件权限：编译机是 root，`chmod`/只读目录都拦不住它（P2F §7.1 同一课）。
+ */
+class FakeModelCredentialSource(initial: List<ProviderEntry> = emptyList()) : ModelCredentialSource {
+
+    /** 一次写入调用（providerId + 送进来的 key）。 */
+    data class Save(val providerId: String, val apiKey: String)
+
+    val saves = CopyOnWriteArrayList<Save>()
+    val clears = CopyOnWriteArrayList<String>()
+    val snapshotCalls = AtomicInteger(0)
+
+    var boom: Throwable? = null
+
+    private val rows = initial.toMutableList()
+
+    override suspend fun snapshot(): List<ProviderEntry> {
+        snapshotCalls.incrementAndGet()
+        boom?.let { throw it }
+        return rows.toList()
+    }
+
+    override suspend fun save(providerId: String, apiKey: String) {
+        saves.add(Save(providerId, apiKey))
+        boom?.let { throw it }
+        rows.removeAll { it.providerId == providerId }
+        rows.add(ProviderEntry(providerId, keyConfigured = true))
+    }
+
+    override suspend fun clear(providerId: String) {
+        clears.add(providerId)
+        boom?.let { throw it }
+        rows.removeAll { it.providerId == providerId }
+    }
+}
+
+/** 一条 `get_state` 的成功应答（data 里塞 [n] 个键，用来把「前 500 字截断」这条语义撑出来）。 */fun probeResponse(id: String?, success: Boolean = true, keys: Int = 1, error: String? = null): PiEvent.Response {
     val body = buildString {
         append('{')
         for (i in 1..keys) {

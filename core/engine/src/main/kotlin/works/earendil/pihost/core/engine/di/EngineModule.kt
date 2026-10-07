@@ -21,6 +21,7 @@ import works.earendil.pihost.core.engine.RuntimeInstallImpl
 import works.earendil.pihost.core.engine.SessionSupervisor
 import works.earendil.pihost.core.engine.SpawnDiagnosticsSink
 import works.earendil.pihost.core.engine.settings.DataStoreSettingsRepository
+import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.EnvFactory
 import works.earendil.pihost.core.environment.PathLayout
@@ -101,6 +102,22 @@ object EngineModule {
     @Singleton
     fun settingsRepository(@ApplicationContext ctx: Context): SettingsRepository =
         DataStoreSettingsRepository.create(ctx)
+
+    /**
+     * 模型凭据仓库（P2G §4.1）：`homeDir` 取冻结区现成的 [PathLayout.homeDir]（RECON-P2G §1 实测 `:34`），
+     * 于是落点 = `filesDir/home/.pi/agent/auth.json`，与 pi 的 `getAgentDir()`（`config.ts:605-611`）
+     * + `getAuthPath()`（`:623-625`）逐段对齐；同一条 `homeDir` 通路 P2F 已在生产里写过诊断文件
+     * （见上面 [processStarter] 的 `:79`）。
+     *
+     * 凭据**不进 DataStore**（§2 红线：明文 XML 落盘 + 备份面），也不进 env（§9 定案：`EnvFactory`
+     * 的 11 个键不动）。绑在 [EngineModule] 而不是 `SettingsModule`：与 [settingsRepository] 同一条理由——
+     * `:app`/`:core:engine` 的 Hilt 测试靠一条 `@UninstallModules(EngineModule::class)` 整体换假体，
+     * 新增一条 binding 就得同步补进 `AppTestEngineModule`（P2E 的 `ScriptedSettingsRepository` 是同一先例）。
+     */
+    @Provides
+    @Singleton
+    fun modelCredentialStore(@ApplicationContext ctx: Context): ModelCredentialStore =
+        ModelCredentialStore(PathLayout.homeDir(ctx))
 
     /** 唯一项目目录名（P2C 的 `EngineRuntime.DEFAULT_PROJECT` 随静态桥一起迁到这里）。 */
     const val DEFAULT_PROJECT: String = "default"

@@ -24,7 +24,7 @@
 
 顶栏 `ChatScreen.kt:163` 的 `take(40)` 按 §4.2(d) **不动**，`MainActivityTest:455-457` 保持绿（§7 表 `:app` 行）。
 
-## 3. 改动清单（P2F 独占，`git diff --name-status fac7e54^..HEAD` 共 18 个路径）
+## 3. 改动清单（P2F 独占，`git diff --name-status fac7e54^..HEAD` 共 **19 个路径**：9 新增 / 10 修改）
 
 **core/engine（§4.1）**
 - `core/engine/src/main/kotlin/works/earendil/pihost/core/engine/SessionSupervisor.kt` M — spawn 前 mkdirs（:223）
@@ -45,7 +45,8 @@
 - `app/build.gradle.kts` M — versionCode 2 / versionName 0.1.1
 - `app/src/test/kotlin/works/earendil/pihost/ManifestPermissionTest.kt` A(3)
 
-**docs**：`docs/RECON-P2F.md` A（155 行）。红线复核见 §5。
+**docs**：`docs/RECON-P2F.md` A（155 行）+ 本报告 `docs/REPORT-P2F.md` A。
+红线复核见 §5。
 
 ## 4. 变异检查（证明护栏不是假阳）
 
@@ -70,7 +71,7 @@
   `git diff --stat 1f77127..HEAD -- core/rpc core/process/src/main core/environment docs/protocol.md tools/capture tools/runtime-packaging app/src/main/jniLibs`
   → **无输出**（空）。同一集合再按 P2F 独占范围 `fac7e54^..HEAD` 复核一次，同样空；
   再加 `gradle/libs.versions.toml`（白名单）一起测，也是空。
-- **P2F 全部改动只有 18 个路径**（`git diff --name-status fac7e54^..HEAD`，逐条列在 §3），
+- **P2F 全部改动只有 19 个路径**（`git diff --name-status fac7e54^..HEAD`，逐条列在 §3），
   全部落在 `core/engine`、`feature/chat`、`app`、`docs` 四个允许区。
 - **公共 API 不变**：`git diff fac7e54^..HEAD -- core/engine/src/main` 里被删的声明行只有
   一条 `- fun processStarter(): ProcessStarter`，对应新的一条
@@ -225,7 +226,9 @@ bash /root/pi/.tools/bbuild.sh gradle ':feature:chat:testDebugUnitTest \
 
 ## 10. 计数汇总（改动清单 + 测试计数）
 
-- 改动：18 个路径（新增 8 文件 / 修改 10 文件），全部在 `core/engine`、`feature/chat`、`app`、`docs`；
+- 改动：19 个路径（新增 9 / 修改 10；`git diff --shortstat fac7e54..99980f1` = 1490 insertions(+) / 20 deletions(-)，
+  取报告初版那个 commit 为基准，免得把本报告的自我增长算进代码量），
+  全部在 `core/engine`、`feature/chat`、`app`、`docs` 四个允许区；
   新增主源码 214 行（`ExecFallbackStarter.kt` 115 + `SpawnDiagnosticsSink.kt` 62 + `ErrnoHint.kt` 37，含 KDoc；`wc -l` 实测），另有 `InstallGate.kt`/`ChatViewModel.kt`/`SessionSupervisor.kt`/`EngineModule.kt` 四处定点改动，未删除任何既有公共函数。
 - 测试：编译机 **184** 全绿（environment 5 / engine 68 / chat 47 / sessions 25 / settings 22 / app 17），
   本机 **37** 全绿（process 3 + rpc 34，含真跑的 e2e 1）→ **合计 221 用例，0 红 0 跳过**；

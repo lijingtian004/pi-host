@@ -25,9 +25,12 @@ import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.di.EngineModule
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore
+import works.earendil.pihost.core.engine.settings.RelayEndpointStore
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.environment.PathLayout
+import works.earendil.pihost.feature.settings.FileRelayEndpointSource
+import works.earendil.pihost.feature.settings.RelayEndpointSource
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
 import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.RpcCommand
@@ -109,6 +112,27 @@ object AppTestEngineModule {
     @Singleton
     fun modelCredentialStore(@ApplicationContext ctx: Context): ModelCredentialStore =
         ModelCredentialStore(PathLayout.homeDir(ctx))
+
+    /**
+     * 中转面（P2H §3.3）：`SettingsViewModel` 的第五个依赖是 [RelayEndpointSource]，
+     * 而它的实现 [FileRelayEndpointSource] 要 [RelayEndpointStore] —— 后者由 `EngineModule` 提供，
+     * 本文件一条 `@UninstallModules(EngineModule::class)` 把它连同凭据面一起卸载掉了，
+     * 于是**这里必须补的就是这条 store 边**（与上面 [modelCredentialStore] 完全同一课，P2G §8 第 4 条）。
+     *
+     * 规格书 §3.3 原文写的是「补 RelayEndpointStore/RelayEndpointSource 注入边」，实测只需前者：
+     * `RelayEndpointSource` 的接口→实现边住在**没有被卸载**的 `SettingsModule` 里，
+     * 这里再给一条就是 `DuplicateBindings`（编译期直接失败，不是运行期才炸）。
+     * 报告 §8 记这条偏差。
+     *
+     * 同样是**真类 + 假目录**：Robolectric 沙箱 Application 的 `filesDir` 每沙箱唯一，
+     * 落盘的是临时 `home/.pi/agent/models.json` + `settings.json`，不碰设备路径；
+     * 中转读写的完整覆盖在 `:core:engine` 的 `RelayEndpointStoreTest`（31 条）与
+     * `:feature:settings` 的两张测试表（57 条），`:app` 只要这条边能让图建起来 + 列表是空的。
+     */
+    @Provides
+    @Singleton
+    fun relayEndpointStore(@ApplicationContext ctx: Context): RelayEndpointStore =
+        RelayEndpointStore(PathLayout.homeDir(ctx))
 }
 
 /**

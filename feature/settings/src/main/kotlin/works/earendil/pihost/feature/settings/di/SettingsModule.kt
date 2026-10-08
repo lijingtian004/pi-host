@@ -41,4 +41,16 @@ object SettingsModule {
     @Provides
     @Singleton
     fun modelCredentialSource(impl: FileModelCredentialSource): ModelCredentialSource = impl
+
+    /**
+     * 中转面（P2H §3.2）：与 [modelCredentialSource] 同一条形状的转发边。
+     *
+     * 被包的 `RelayEndpointStore` 本体**不在这里提供**——它由 `:core:engine` 的 `EngineModule` 提供
+     * （§3.1 把它放在凭据 store 旁边，两张表同一个 `homeDir` 通路），
+     * 于是 `:app`/`:core:engine` 的测试一条 `@UninstallModules(EngineModule::class)` 仍然同时换掉
+     * 引擎面、设置面、凭据面与中转面；卸载侧要补的 store 边见 `AppTestDoubles`。
+     */
+    @Provides
+    @Singleton
+    fun relayEndpointSource(impl: FileRelayEndpointSource): RelayEndpointSource = impl
 }

@@ -22,6 +22,7 @@ import works.earendil.pihost.core.engine.SessionSupervisor
 import works.earendil.pihost.core.engine.SpawnDiagnosticsSink
 import works.earendil.pihost.core.engine.settings.DataStoreSettingsRepository
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore
+import works.earendil.pihost.core.engine.settings.RelayEndpointStore
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.EnvFactory
 import works.earendil.pihost.core.environment.PathLayout
@@ -118,6 +119,19 @@ object EngineModule {
     @Singleton
     fun modelCredentialStore(@ApplicationContext ctx: Context): ModelCredentialStore =
         ModelCredentialStore(PathLayout.homeDir(ctx))
+
+    /**
+     * 第三方中转站端点仓库（P2H §3.1）：`models.json` + `settings.json`，与 [modelCredentialStore]
+     * 同一个 `homeDir` 通路（`PathLayout.homeDir(ctx)`），所以三张表必然同目录 = `filesDir/home/.pi/agent/`。
+     *
+     * 同样绑在 [EngineModule] 而不是单开模块：`:app`/`:core:engine` 的 Hilt 测试靠一条
+     * `@UninstallModules(EngineModule::class)` 整体换假体，新增一条 binding 就得同步补进
+     * `AppTestEngineModule`（P2G §8 第 4 条同一课）。
+     */
+    @Provides
+    @Singleton
+    fun relayEndpointStore(@ApplicationContext ctx: Context): RelayEndpointStore =
+        RelayEndpointStore(PathLayout.homeDir(ctx))
 
     /** 唯一项目目录名（P2C 的 `EngineRuntime.DEFAULT_PROJECT` 随静态桥一起迁到这里）。 */
     const val DEFAULT_PROJECT: String = "default"

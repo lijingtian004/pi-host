@@ -7,7 +7,9 @@ import dagger.hilt.components.SingletonComponent
 import javax.inject.Singleton
 import works.earendil.pihost.feature.settings.AndroidRuntimeInfo
 import works.earendil.pihost.feature.settings.FileModelCredentialSource
+import works.earendil.pihost.feature.settings.FileRelayEndpointSource
 import works.earendil.pihost.feature.settings.ModelCredentialSource
+import works.earendil.pihost.feature.settings.RelayEndpointSource
 import works.earendil.pihost.feature.settings.RuntimeInfoSource
 
 /**

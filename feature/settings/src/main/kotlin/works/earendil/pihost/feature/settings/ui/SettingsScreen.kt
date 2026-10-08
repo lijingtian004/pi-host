@@ -36,8 +36,12 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
+import works.earendil.pihost.core.engine.settings.RelayEndpointStore
+import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
 import works.earendil.pihost.core.environment.MemTier
+import works.earendil.pihost.feature.settings.parseModelIds
 import works.earendil.pihost.feature.settings.ProbeState
+import works.earendil.pihost.feature.settings.RelayDraft
 import works.earendil.pihost.feature.settings.RuntimeInfo
 import works.earendil.pihost.feature.settings.SettingsViewModel
 
@@ -69,6 +73,9 @@ fun SettingsScreen(
     val notice by viewModel.notice.collectAsState()
     val credentials by viewModel.credentials.collectAsState()
     val draft by viewModel.credentialDraft.collectAsState()
+    val relays by viewModel.relays.collectAsState()
+    val defaultRelay by viewModel.defaultRelay.collectAsState()
+    val relayDraft by viewModel.relayDraft.collectAsState()
 
     LaunchedEffect(notice) {
         if (notice != null) {
@@ -111,6 +118,17 @@ fun SettingsScreen(
                 onSave = viewModel::saveCredential,
                 onClear = viewModel::clearCredential,
                 onRefresh = viewModel::refreshCredentials,
+            )
+            HorizontalDivider()
+            RelaySection(
+                configured = relays,
+                defaultProvider = defaultRelay,
+                draft = relayDraft,
+                onDraftChange = viewModel::onRelayDraftChange,
+                onSave = viewModel::saveRelay,
+                onSetDefault = viewModel::setRelayDefault,
+                onClear = viewModel::clearRelay,
+                onRefresh = viewModel::refreshRelays,
             )
             HorizontalDivider()
             ProbeCard(state = probe, onRun = viewModel::runProbe, onClear = viewModel::clearProbe)
@@ -332,6 +350,229 @@ private fun CredentialPickerDialog(
             TextButton(onClick = onDismiss) { Text(SettingsStrings.CREDENTIAL_PICKER_CANCEL) }
         },
         modifier = Modifier.testTag(SettingsTags.CREDENTIAL_PICKER),
+    )
+}
+
+/**
+ * 列表行里 baseUrl 的显示上限（§3.2「截断显示」）。
+ *
+ * 为什么截断而不是 wrap：这一行还要放「设为默认」「清除」两个按钮和一枚「默认」徽标，
+ * 而中转地址普遍是 `https://xxx.example.com/v1/xxx` 这种 40+ 字符的串，
+ * 让它自由换行会把两个按钮挤出屏幕宽度。地址**不是**凭据（§3.1），所以完整值随时可以在
+ * 「接口地址」输入框里重新读到（编辑同一行时先点它填回草稿即可）。
+ */
+private const val RELAY_URL_DISPLAY_LIMIT = 36
+
+/**
+ * 自定义中转（规格书 P2H §3.2）：四个输入框 + api 选择器 + 保存，下方是已配置列表。
+ *
+ * 四条形状决定：
+ * - **api 选择器用 `AlertDialog` + `RadioButton`**（§3.2 原文「RadioButton Dialog 同现有 provider picker 形状」）：
+ *   provider 那个下拉为什么不用 `ExposedDropdownMenu`，理由在 [CredentialSection] 的 KDoc 里已经交过
+ *   （material3 1.3→1.5 的 `menuAnchor` 签名漂移 + `Popup` 窗口在 Robolectric 零先例），这里不重做一遍；
+ * - **保存按钮的启用条件是三个必填项，密钥不在内**（§3.2：留空 = 沿用已存 key，所以空 key 是合法输入）；
+ *   VM 里还有同一套三道门，UI 只是第一道；
+ * - **行格式 = `providerId · baseUrl · N 个模型`**（§3.2 原文），默认行前面多一枚「默认」徽标，
+ *   数据来自 `settings.json`（[defaultProvider]），不是本地布尔；
+ * - **`RelayEntry` 里没有 apiKey**：这一层连*尝试*显示密钥的字段都拿不到，跟凭据通路一样不是靠 UI 克制
+ *   （§2 红线）。密钥输入框带 `PasswordVisualTransformation`，且 hint 明写「留空 = 沿用已存密钥」。
+ */
+@Composable
+private fun RelaySection(
+    configured: List<RelayEntry>,
+    defaultProvider: String?,
+    draft: RelayDraft,
+    onDraftChange: ((RelayDraft) -> RelayDraft) -> Unit,
+    onSave: (providerId: String, baseUrl: String, api: String, modelIds: List<String>, apiKey: String?) -> Unit,
+    onSetDefault: (providerId: String, modelId: String) -> Unit,
+    onClear: (providerId: String) -> Unit,
+    onRefresh: () -> Unit,
+) {
+    var pickerOpen by remember { mutableStateOf(false) }
+    val modelIds = parseModelIds(draft.models)
+
+    Section(tag = SettingsTags.RELAY_SECTION, title = SettingsStrings.SECTION_RELAY) {
+        Text(SettingsStrings.RELAY_HINT, style = MaterialTheme.typography.bodySmall)
+        OutlinedTextField(
+            value = draft.providerId,
+            onValueChange = { value -> onDraftChange { it.copy(providerId = value) } },
+            label = { Text(SettingsStrings.RELAY_ID_LABEL) },
+            supportingText = { Text(SettingsStrings.RELAY_ID_HINT, style = MaterialTheme.typography.bodySmall) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().testTag(SettingsTags.RELAY_ID_FIELD),
+        )
+        OutlinedTextField(
+            value = draft.baseUrl,
+            onValueChange = { value -> onDraftChange { it.copy(baseUrl = value) } },
+            label = { Text(SettingsStrings.RELAY_URL_LABEL) },
+            placeholder = { Text("https://relay.example.com/v1") },
+            supportingText = { Text(SettingsStrings.RELAY_URL_HINT, style = MaterialTheme.typography.bodySmall) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().testTag(SettingsTags.RELAY_URL_FIELD),
+        )
+        OutlinedTextField(
+            value = draft.models,
+            onValueChange = { value -> onDraftChange { it.copy(models = value) } },
+            label = { Text(SettingsStrings.RELAY_MODELS_LABEL) },
+            placeholder = { Text("deepseek-chat,gpt-4o") },
+            supportingText = { Text(SettingsStrings.RELAY_MODELS_HINT, style = MaterialTheme.typography.bodySmall) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().testTag(SettingsTags.RELAY_MODELS_FIELD),
+        )
+        OutlinedTextField(
+            value = draft.apiKey,
+            onValueChange = { value -> onDraftChange { it.copy(apiKey = value) } },
+            label = { Text(SettingsStrings.RELAY_KEY_LABEL) },
+            supportingText = { Text(SettingsStrings.RELAY_KEY_HINT, style = MaterialTheme.typography.bodySmall) },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth().testTag(SettingsTags.RELAY_KEY_FIELD),
+        )
+        OutlinedButton(
+            onClick = { pickerOpen = true },
+            modifier = Modifier.testTag(SettingsTags.RELAY_API_BUTTON),
+        ) {
+            Text(
+                "${SettingsStrings.RELAY_API_LABEL}：" + RelayEndpointStore.apiDisplayName(draft.api),
+            )
+        }
+        // 选中项自带一句「为什么是它」——§3.2 要求默认项标注适用面，说在选择器旁边才看得见
+        RelayEndpointStore.RELAY_APIS.firstOrNull { it.api == draft.api }?.note?.let { note ->
+            Text(note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            // 三道门的第一道（VM 里还有第二道，core 的 require 是第三道）；空密钥**不在**条件里
+            OutlinedButton(
+                onClick = { onSave(draft.providerId, draft.baseUrl, draft.api, modelIds, draft.apiKey) },
+                enabled = draft.providerId.isNotBlank() && draft.baseUrl.isNotBlank() && modelIds.isNotEmpty(),
+                modifier = Modifier.testTag(SettingsTags.RELAY_SAVE),
+            ) { Text(SettingsStrings.RELAY_SAVE) }
+            TextButton(
+                onClick = onRefresh,
+                modifier = Modifier.testTag(SettingsTags.RELAY_REFRESH),
+            ) { Text(SettingsStrings.RELAY_REFRESH) }
+        }
+
+        if (configured.isEmpty()) {
+            Text(
+                SettingsStrings.RELAY_NONE,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.testTag(SettingsTags.RELAY_EMPTY),
+            )
+        } else {
+            configured.forEach { entry ->
+                val isDefault = entry.providerId == defaultProvider
+                Row(
+                    modifier = Modifier.fillMaxWidth().testTag(SettingsTags.relayRow(entry.providerId)),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (isDefault) {
+                        Text(
+                            SettingsStrings.RELAY_DEFAULT_BADGE,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.testTag(SettingsTags.RELAY_DEFAULT_BADGE),
+                        )
+                    }
+                    Text(
+                        relayRowText(entry),
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    // §2 红线在这一行只剩两种字：已配置 / 无可用密钥。`RelayEntry` 里没有 key 字段，
+                    // 所以这里连*可能*打印明文的数据都拿不到（与凭据列表同一套措辞）。
+                    Text(
+                        if (entry.keyConfigured) SettingsStrings.CREDENTIAL_CONFIGURED else SettingsStrings.CREDENTIAL_NO_KEY,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (entry.keyConfigured) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        },
+                        modifier = Modifier.testTag(SettingsTags.relayRowKey(entry.providerId)),
+                    )
+                    OutlinedButton(
+                        // 没有模型 id 就钉不了默认（pi 的 defaultModel 必须指向一个真实 id）
+                        onClick = { entry.modelIds.firstOrNull()?.let { onSetDefault(entry.providerId, it) } },
+                        enabled = entry.modelIds.isNotEmpty(),
+                        modifier = Modifier.testTag(SettingsTags.relaySetDefault(entry.providerId)),
+                    ) { Text(SettingsStrings.RELAY_SET_DEFAULT) }
+                    TextButton(
+                        onClick = { onClear(entry.providerId) },
+                        modifier = Modifier.testTag(SettingsTags.relayClear(entry.providerId)),
+                    ) { Text(SettingsStrings.RELAY_CLEAR) }
+                }
+            }
+        }
+    }
+
+    if (pickerOpen) {
+        RelayApiPickerDialog(
+            selected = draft.api,
+            onPick = { api ->
+                onDraftChange { it.copy(api = api) }
+                pickerOpen = false
+            },
+            onDismiss = { pickerOpen = false },
+        )
+    }
+}
+
+/** §3.2 原文的行格式：`providerId · baseUrl（截断）· N 个模型`。 */
+private fun relayRowText(entry: RelayEntry): String {
+    val url = if (entry.baseUrl.length > RELAY_URL_DISPLAY_LIMIT) {
+        entry.baseUrl.take(RELAY_URL_DISPLAY_LIMIT) + "…"
+    } else {
+        entry.baseUrl
+    }
+    return "${entry.providerId} · $url · " + String.format(SettingsStrings.RELAY_MODEL_COUNT, entry.modelIds.size)
+}
+
+/** api 选择对话框：固定五项（§3.2），每行一个 RadioButton，tag 用 api 原值。 */
+@Composable
+private fun RelayApiPickerDialog(
+    selected: String,
+    onPick: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(SettingsStrings.RELAY_API_PICKER_TITLE) },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                RelayEndpointStore.RELAY_APIS.forEach { option ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        // tag 打在 RadioButton 本身：`Selected` 语义只住在这个节点上，
+                        // 「选中项展示」那条用例要断的是它，而不是行里那两行文字。
+                        RadioButton(
+                            selected = option.api == selected,
+                            onClick = { onPick(option.api) },
+                            modifier = Modifier.testTag(SettingsTags.relayApiItem(option.api)),
+                        )
+                        Column {
+                            Text(option.displayName, style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                option.note ?: option.api,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text(SettingsStrings.RELAY_API_PICKER_CANCEL) }
+        },
+        modifier = Modifier.testTag(SettingsTags.RELAY_API_PICKER),
     )
 }
 

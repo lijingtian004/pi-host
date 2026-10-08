@@ -20,6 +20,7 @@ import org.robolectric.annotation.Config
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
+import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.RpcCommand
@@ -46,6 +47,7 @@ class SettingsViewModelTest {
         val engine: FakeEngine,
         val info: FakeRuntimeInfo,
         val credentials: FakeModelCredentialSource,
+        val relays: FakeRelayEndpointSource,
     )
 
     private fun TestScope.rig(
@@ -53,15 +55,17 @@ class SettingsViewModelTest {
         engine: FakeEngine = FakeEngine(),
         info: FakeRuntimeInfo = FakeRuntimeInfo(),
         credentials: FakeModelCredentialSource = FakeModelCredentialSource(),
+        relays: FakeRelayEndpointSource = FakeRelayEndpointSource(),
     ): Rig {
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         val repository = FakeSettingsRepository(settings)
         return Rig(
-            SettingsViewModel(repository, engine, info, credentials),
+            SettingsViewModel(repository, engine, info, credentials, relays),
             repository,
             engine,
             info,
             credentials,
+            relays,
         )
     }
 
@@ -224,7 +228,7 @@ class SettingsViewModelTest {
         repository.writeError = IllegalStateException("disk full")
         repository.applyToSnapshot = false
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        val vm = SettingsViewModel(repository, FakeEngine(), FakeRuntimeInfo(), FakeModelCredentialSource())
+        val vm = SettingsViewModel(repository, FakeEngine(), FakeRuntimeInfo(), FakeModelCredentialSource(), FakeRelayEndpointSource())
 
         vm.setMemTier(MemTier.LOW)
         runCurrent()
@@ -443,7 +447,7 @@ class SettingsViewModelTest {
         credentials.boom = java.io.IOException("读不动")
 
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        val vm = SettingsViewModel(FakeSettingsRepository(), FakeEngine(), FakeRuntimeInfo(), credentials)
+        val vm = SettingsViewModel(FakeSettingsRepository(), FakeEngine(), FakeRuntimeInfo(), credentials, FakeRelayEndpointSource())
 
         assertEquals("进屏读失败 → 空列表（不是半成品）", emptyList<ProviderEntry>(), vm.credentials.value)
         assertNull("读失败不弹 notice：列表空着已经说明问题", vm.notice.value)
@@ -452,5 +456,166 @@ class SettingsViewModelTest {
         vm.refreshCredentials()
         runCurrent()
         assertEquals("重读口是有效的", 2, credentials.snapshotCalls.get())
+    }
+
+    // ── t18…t25 自定义中转（P2H §3.2 的 VM 面）─────────────────────────────────────
+
+    private fun relay(providerId: String = "my-relay", modelIds: List<String> = listOf("deepseek-chat")) =
+        RelayEntry(providerId, "https://relay.example.com/v1", "openai-completions", modelIds, true)
+
+    @Test
+    fun `t18 entering the screen reads both the relay rows and the default pointer`() = runTest {
+        val relays = FakeRelayEndpointSource(initial = listOf(relay()), initialDefault = "my-relay")
+        val rig = rig(relays = relays)
+
+        assertEquals(listOf("my-relay"), rig.vm.relays.value.map { it.providerId })
+        assertEquals("徽标的数据源必须是 settings.json 那一次读", "my-relay", rig.vm.defaultRelay.value)
+        assertEquals(1, relays.snapshotCalls.get())
+        assertEquals(1, relays.defaultCalls.get())
+    }
+
+    @Test
+    fun `t19 saving a relay refreshes rows, clears the text drafts and keeps the chosen api`() = runTest {
+        val rig = rig()
+        rig.vm.onRelayDraftChange {
+            it.copy(providerId = "my-relay", baseUrl = "https://relay.example.com/v1", models = "deepseek-chat", apiKey = "sk-x", api = "pi-messages")
+        }
+
+        rig.vm.saveRelay("my-relay", "https://relay.example.com/v1", "pi-messages", listOf("deepseek-chat"), "sk-x")
+        runCurrent()
+
+        assertEquals(listOf("my-relay"), rig.vm.relays.value.map { it.providerId })
+        val draft = rig.vm.relayDraft.value
+        assertEquals("四个文本框全清空", listOf("", "", "", ""), listOf(draft.providerId, draft.baseUrl, draft.models, draft.apiKey))
+        assertEquals("api 是选择器，不跟着清空", "pi-messages", draft.api)
+        assertEquals(SettingsStrings.RELAY_SAVED, rig.vm.notice.value)
+    }
+
+    @Test
+    fun `t20 a blank relay key is converted to null so the stored key is reused`() = runTest {
+        val relays = FakeRelayEndpointSource(initial = listOf(relay()))
+        val rig = rig(relays = relays)
+
+        for (blank in listOf(null, "", "   ", "\t")) {
+            rig.vm.saveRelay("my-relay", "https://new.example.com/v1", "openai-completions", listOf("gpt-4o"), blank)
+            runCurrent()
+        }
+
+        assertTrue(relays.saves.isNotEmpty())
+        assertTrue("空白 key 一律换算成 null", relays.saves.all { it.apiKey == null })
+        assertTrue("沿用下来的行仍然「已配置」", rig.vm.relays.value.single().keyConfigured)
+        assertEquals("https://new.example.com/v1", rig.vm.relays.value.single().baseUrl)
+    }
+
+    @Test
+    fun `t21 the three blank gates never reach the source`() = runTest {
+        val relays = FakeRelayEndpointSource()
+        val rig = rig(relays = relays)
+
+        rig.vm.saveRelay("", "https://r.example.com/v1", "openai-completions", listOf("m1"), "sk-x")
+        runCurrent()
+        assertEquals(SettingsStrings.RELAY_BLANK_ID, rig.vm.notice.value)
+
+        rig.vm.saveRelay("my-relay", "   ", "openai-completions", listOf("m1"), "sk-x")
+        runCurrent()
+        assertEquals(SettingsStrings.RELAY_BLANK_URL, rig.vm.notice.value)
+
+        rig.vm.saveRelay("my-relay", "https://r.example.com/v1", "openai-completions", emptyList(), "sk-x")
+        runCurrent()
+        assertEquals(SettingsStrings.RELAY_BLANK_MODELS, rig.vm.notice.value)
+
+        assertEquals("三道门一次都不许打到磁盘", emptyList<FakeRelayEndpointSource.Save>(), relays.saves)
+        assertEquals("只有进屏那一次读取", 1, relays.snapshotCalls.get())
+    }
+
+    @Test
+    fun `t22 pinning the default re-reads settings json instead of trusting the argument`() = runTest {
+        val relays = FakeRelayEndpointSource(initial = listOf(relay("relay-a"), relay("relay-b")))
+        val rig = rig(relays = relays)
+
+        rig.vm.setRelayDefault("relay-a", "deepseek-chat")
+        runCurrent()
+
+        assertEquals(listOf(FakeRelayEndpointSource.Pin("relay-a", "deepseek-chat")), relays.pins.toList())
+        assertEquals("relay-a", rig.vm.defaultRelay.value)
+        assertEquals(SettingsStrings.RELAY_DEFAULT_SET, rig.vm.notice.value)
+
+        // 参数说一套、磁盘回一套时以磁盘为准：假体的 defaultProvider 仍然返回 relay-a，
+        // 这里改成「钉不存在的 id」走空白门，VM 不许发写入
+        rig.vm.setRelayDefault("ghost", "")
+        runCurrent()
+        assertEquals(1, relays.pins.size)
+        assertEquals(SettingsStrings.RELAY_NO_MODEL, rig.vm.notice.value)
+    }
+
+    @Test
+    fun `t23 clearing a relay drops the row and the badge pointing at it`() = runTest {
+        val relays = FakeRelayEndpointSource(initial = listOf(relay("relay-a"), relay("relay-b")), initialDefault = "relay-a")
+        val rig = rig(relays = relays)
+
+        rig.vm.clearRelay("relay-a")
+        runCurrent()
+
+        assertEquals(listOf("relay-b"), rig.vm.relays.value.map { it.providerId })
+        assertNull("悬空默认不能亮着", rig.vm.defaultRelay.value)
+        assertTrue(rig.vm.notice.value!!.contains("relay-a"))
+        // 空白 id 直接吞掉：既不写磁盘也不留一条莫名其妙的 notice
+        val notices = rig.vm.notice.value
+        rig.vm.clearRelay("  ")
+        runCurrent()
+        assertEquals(notices, rig.vm.notice.value)
+        assertEquals(listOf("relay-a"), relays.clears.toList())
+    }
+
+    @Test
+    fun `t24 a default pointer to a vanished row is filtered out on refresh`() = runTest {
+        // 手改磁盘能造出这个脏状态：settings.json 指着一条 models.json 里已经没有的 provider。
+        // 假体不演它（那是 core 侧的语义），所以这里用一条匿名 source 直接喂给 VM。
+        val dirty = object : RelayEndpointSource {
+            override suspend fun snapshot(): List<RelayEntry> = listOf(relay("still-here"))
+            override suspend fun defaultProvider(): String? = "ghost-relay"
+            override suspend fun save(providerId: String, baseUrl: String, api: String, modelIds: List<String>, apiKey: String?) = Unit
+            override suspend fun clear(providerId: String) = Unit
+            override suspend fun setDefault(providerId: String, modelId: String) = Unit
+        }
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val vm = SettingsViewModel(FakeSettingsRepository(), FakeEngine(), FakeRuntimeInfo(), FakeModelCredentialSource(), dirty)
+
+        assertEquals(listOf("still-here"), vm.relays.value.map { it.providerId })
+        assertNull("settings.json 指着一条已经不存在的行 → 徽标不该亮", vm.defaultRelay.value)
+    }
+
+    @Test
+    fun `t25 a relay write failure keeps the draft and says why`() = runTest {
+        val relays = FakeRelayEndpointSource()
+        relays.boom = java.io.IOException("无法创建目录：/x/.pi/agent")
+        val rig = rig(relays = relays)
+        rig.vm.onRelayDraftChange { it.copy(providerId = "my-relay", baseUrl = "https://r.example.com/v1", models = "m1", apiKey = "sk-x") }
+
+        rig.vm.saveRelay("my-relay", "https://r.example.com/v1", "openai-completions", listOf("m1"), "sk-x")
+        runCurrent()
+
+        val notice = rig.vm.notice.value!!
+        assertTrue("失败要带原因：$notice", notice.startsWith("写入失败：") && notice.contains("无法创建目录"))
+        val draft = rig.vm.relayDraft.value
+        assertEquals("写失败时四个框都留着，让人原地重试", listOf("my-relay", "https://r.example.com/v1", "m1", "sk-x"), listOf(draft.providerId, draft.baseUrl, draft.models, draft.apiKey))
+        assertEquals(emptyList<RelayEntry>(), rig.vm.relays.value)
+
+        // 清除与钉选走同一套失败通路
+        rig.vm.consumeNotice()
+        relays.boom = java.io.IOException("磁盘满")
+        rig.vm.clearRelay("my-relay")
+        runCurrent()
+        assertTrue(rig.vm.notice.value!!.contains("磁盘满"))
+    }
+
+    @Test
+    fun `t26 parseModelIds folds commas spaces blanks and duplicates`() {
+        assertEquals(listOf("a", "b"), parseModelIds("a, b"))
+        assertEquals(listOf("a", "b"), parseModelIds("a，b"))
+        assertEquals(listOf("a"), parseModelIds("  a ,,  ，a "))
+        assertEquals(emptyList<String>(), parseModelIds(""))
+        assertEquals(emptyList<String>(), parseModelIds(" , ， "))
+        assertEquals(listOf("deepseek-chat"), parseModelIds("deepseek-chat"))
     }
 }

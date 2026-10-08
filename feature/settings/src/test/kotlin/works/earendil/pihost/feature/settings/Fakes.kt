@@ -14,6 +14,7 @@ import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
+import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
@@ -212,6 +213,94 @@ class FakeModelCredentialSource(initial: List<ProviderEntry> = emptyList()) : Mo
         clears.add(providerId)
         boom?.let { throw it }
         rows.removeAll { it.providerId == providerId }
+    }
+}
+
+/**
+ * 中转面假体（P2H §3.2「UI 测试（Robolectric，fake source）」的注入点）。
+ *
+ * 四条纪律，前三条与 [FakeModelCredentialSource] 逐字同源：
+ * 1. **不挂起、不碰线程**——真实现自己 hop `Dispatchers.IO`，假体留在这里才能让 `runTest`
+ *    与 `pump()` 都跑在虚拟时钟上；
+ * 2. **不持 key 明文**——[rows] 里只有 `RelayEntry`（带 `keyConfigured` 旗），
+ *    [saves] 记的是**收到的入参**：§3.2 要断言的是「留空 key 时送进去的是 null」，
+ *    不是「能把 key 读回来」；
+ * 3. [boom] 非 null → 四个写方法全抛，演「写盘失败进 notice、草稿还在」那条分支
+ *    （为什么不用真文件权限：编译机是 root，`chmod` 拦不住它，P2F §7.1 同一课）；
+ * 4. **默认指针与行联动**：[clear] 把默认也一起清掉——这是 core 侧 `RelayEndpointStore.clear`
+ *    的第 ⑩ 条语义（不留悬空指针），假体照抄，UI 才可能演「删掉默认那一行 → 徽标一起没了」。
+ *    而 `rows` 里删不掉、默认却指着不存在的 id 这种脏状态**故意不做**：VM 侧还有一层
+ *    `takeIf { rows.any { … } }` 兜底，两条路都通到同一个显示结果。
+ */
+class FakeRelayEndpointSource(
+    initial: List<RelayEntry> = emptyList(),
+    initialDefault: String? = null,
+) : RelayEndpointSource {
+
+    /** 一次写入调用（五个入参原样记下来，apiKey 可能是 null）。 */
+    data class Save(
+        val providerId: String,
+        val baseUrl: String,
+        val api: String,
+        val modelIds: List<String>,
+        val apiKey: String?,
+    )
+
+    /** 一次钉选默认（provider + model）。 */
+    data class Pin(val providerId: String, val modelId: String)
+
+    val saves = CopyOnWriteArrayList<Save>()
+    val clears = CopyOnWriteArrayList<String>()
+    val pins = CopyOnWriteArrayList<Pin>()
+    val snapshotCalls = AtomicInteger(0)
+    val defaultCalls = AtomicInteger(0)
+
+    var boom: Throwable? = null
+
+    private val rows = initial.toMutableList()
+    private var default: String? = initialDefault
+
+    override suspend fun snapshot(): List<RelayEntry> {
+        snapshotCalls.incrementAndGet()
+        boom?.let { throw it }
+        return rows.toList()
+    }
+
+    override suspend fun defaultProvider(): String? {
+        defaultCalls.incrementAndGet()
+        boom?.let { throw it }
+        return default
+    }
+
+    override suspend fun save(providerId: String, baseUrl: String, api: String, modelIds: List<String>, apiKey: String?) {
+        saves.add(Save(providerId, baseUrl, api, modelIds, apiKey))
+        boom?.let { throw it }
+        // 空白 key = 沿用已存（core 侧语义），假体同样按这个规则落 `keyConfigured`
+        val keepsExistingKey = apiKey.isNullOrBlank() &&
+            rows.firstOrNull { it.providerId == providerId }?.keyConfigured == true
+        rows.removeAll { it.providerId == providerId }
+        rows.add(
+            RelayEntry(
+                providerId = providerId,
+                baseUrl = baseUrl,
+                api = api,
+                modelIds = modelIds,
+                keyConfigured = keepsExistingKey || !apiKey.isNullOrBlank(),
+            ),
+        )
+    }
+
+    override suspend fun clear(providerId: String) {
+        clears.add(providerId)
+        boom?.let { throw it }
+        rows.removeAll { it.providerId == providerId }
+        if (default == providerId) default = null
+    }
+
+    override suspend fun setDefault(providerId: String, modelId: String) {
+        pins.add(Pin(providerId, modelId))
+        boom?.let { throw it }
+        default = providerId
     }
 }
 

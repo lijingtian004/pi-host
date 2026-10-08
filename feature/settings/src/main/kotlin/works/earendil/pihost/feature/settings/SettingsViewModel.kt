@@ -16,6 +16,7 @@ import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
+import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.PiEvent
@@ -73,6 +74,11 @@ sealed interface ProbeState {
  *    页面能拿到的只有 [ProviderEntry]（providerId + 已配置旗），**没有任何一条路能把 key 回到 UI**；
  *    写入失败只报「原因」，而原因来自 [java.io.IOException] 的 message（内容只有路径，见
  *    [works.earendil.pihost.core.engine.settings.ModelCredentialStore]），不掺入凭据。
+ * 6. **中转与凭据同一条红线，但落点不同**（P2H §3.2 + §2）：[relayStore] 写的是 pi 的
+ *    `models.json`/`settings.json`，`apiKey` 字段是凭据 —— 不进 DataStore（前三键与它无关）、
+ *    不进日志、不回显；出参只有 [RelayEntry]（`keyConfigured` 旗），而 [baseUrl] **不是**凭据，
+ *    按 §3.1 的判断可以上屏（用户要能看见自己填的地址）。唯一比凭据通路多出来的语义：
+ *    [saveRelay] 的空白 key 是「沿用」而不是「抹掉」，这条转换必须在 VM 里发生，不能让 UI 猜。
  */
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
@@ -80,6 +86,7 @@ class SettingsViewModel @Inject constructor(
     private val engine: ChatEngine,
     private val runtimeInfo: RuntimeInfoSource,
     private val credentialStore: ModelCredentialSource,
+    private val relayStore: RelayEndpointSource,
 ) : ViewModel() {
 
     /** 三键快照，直接转发仓库的流（UI `collectAsState`）。 */
@@ -116,9 +123,25 @@ class SettingsViewModel @Inject constructor(
      */
     val credentialDraft: StateFlow<String> = _credentialDraft.asStateFlow()
 
+    private val _relays = MutableStateFlow<List<RelayEntry>>(emptyList())
+
+    /** 已配置的中转行（P2H §3.2）。**没有 apiKey**——§2 红线在类型上的体现，同 [credentials]。 */
+    val relays: StateFlow<List<RelayEntry>> = _relays.asStateFlow()
+
+    private val _defaultRelay = MutableStateFlow<String?>(null)
+
+    /** `settings.json` 里钉着的默认中转（驱动列表行首那枚「默认」徽标，§3.2）。 */
+    val defaultRelay: StateFlow<String?> = _defaultRelay.asStateFlow()
+
+    private val _relayDraft = MutableStateFlow(RelayDraft())
+
+    /** 中转表单的五个字段（四个输入框 + 选中的 api）。 */
+    val relayDraft: StateFlow<RelayDraft> = _relayDraft.asStateFlow()
+
     init {
         refreshRuntimeInfo()
         refreshCredentials()
+        refreshRelays()
     }
 
     /**
@@ -179,6 +202,123 @@ class SettingsViewModel @Inject constructor(
                     _notice.value = SettingsStrings.credentialCleared(providerId)
                 },
                 onFailure = { throwable -> _notice.value = SettingsStrings.credentialWriteFailed(reasonOf(throwable)) },
+            )
+        }
+    }
+
+    /**
+     * 重读两张表（进屏一次 + 每次写后，§3.2）。
+     *
+     * 两件事一起办：models.json 的行与 settings.json 的默认指针是**两个文件**，
+     * 任何一次写入都可能动到其中之一（`clear` 就会连带清悬空默认），所以每次刷新都成对读回来，
+     * 不留下「行没了、徽标还亮着」这种半新半旧的列表。
+     *
+     * 读失败不进 notice（与 [refreshCredentials] 同一决定）：进屏首帧就该有这张列表，
+     * 磁盘抖动时显示「还没配置」比弹一条提示更诚实。
+     */
+    fun refreshRelays() {
+        viewModelScope.launch {
+            val rows = runCatching { relayStore.snapshot() }.getOrDefault(emptyList())
+            _relays.value = rows
+            _defaultRelay.value = runCatching { relayStore.defaultProvider() }.getOrNull()
+                // 默认指针指着一条已经不存在的行（用户手删 models.json）：徽标不该亮着
+                ?.takeIf { default -> rows.any { it.providerId == default } }
+        }
+    }
+
+    /** 输入框/选择器变化：[transform] 自己说改哪个字段（五合一，免得 VM 里长出五个 `onXxxChange`）。 */
+    fun onRelayDraftChange(transform: (RelayDraft) -> RelayDraft) {
+        _relayDraft.value = transform(_relayDraft.value)
+    }
+
+    /**
+     * 写中转（§3.2）：成功 → 刷列表 + 清三个文本框（[RelayDraft.api] 保留）+ notice「已保存，新会话生效」；
+     * 失败 → notice 说原因，草稿原样留着让人原地重试。
+     *
+     * [apiKey] **空白一律当 null 传下去**：这正是 §3.2 第 2 条要的语义 ——
+     * 「留空 = 沿用磁盘上已有的 key」，而不是「把 key 抹掉」。把这件事在 VM 里定死，
+     * UI 就只需负责把输入框的原样交上来，假体侧则断言收到的确实是 null。
+     *
+     * 三道门（与凭据通路同构）：providerId 空白 → 拦；baseUrl 空白 → 拦；模型清单解析后为空 → 拦。
+     * 三条都**不碰 source**（一次调用都不发），core 侧的 `require` 是第四道，防的是脚本直调。
+     */
+    fun saveRelay(providerId: String, baseUrl: String, api: String, modelIds: List<String>, apiKey: String?) {
+        if (providerId.isBlank()) {
+            _notice.value = SettingsStrings.RELAY_BLANK_ID
+            return
+        }
+        if (baseUrl.isBlank()) {
+            _notice.value = SettingsStrings.RELAY_BLANK_URL
+            return
+        }
+        if (modelIds.isEmpty()) {
+            _notice.value = SettingsStrings.RELAY_BLANK_MODELS
+            return
+        }
+        val key = apiKey?.trim()?.takeIf { it.isNotEmpty() }
+        viewModelScope.launch {
+            val outcome = runCatching {
+                relayStore.save(providerId.trim(), baseUrl.trim(), api, modelIds, key)
+                relayStore.snapshot() to relayStore.defaultProvider()
+            }
+            outcome.fold(
+                onSuccess = { (rows, default) ->
+                    _relays.value = rows
+                    _defaultRelay.value = default?.takeIf { d -> rows.any { it.providerId == d } }
+                    _relayDraft.value = _relayDraft.value.copy(providerId = "", baseUrl = "", models = "", apiKey = "")
+                    _notice.value = SettingsStrings.RELAY_SAVED
+                },
+                onFailure = { throwable -> _notice.value = SettingsStrings.relayWriteFailed(reasonOf(throwable)) },
+            )
+        }
+    }
+
+    /**
+     * 钉选默认（§3.2）：成功后 notice「默认模型已钉选，新会话直接用它」，并重新读一次默认指针
+     * （指针是 settings.json 的内容，必须**读回来**才算数，不能拿参数直接写进 StateFlow）。
+     *
+     * 只有列表里真有这条中转、且它有至少一个模型时才允许钉 —— UI 侧用按钮禁用挡住第一层，
+     * 这里挡第二层（`modelId` 空白在 core 侧是 `require`，但那是异常通路，不适合当提示来源）。
+     */
+    fun setRelayDefault(providerId: String, modelId: String) {
+        if (providerId.isBlank() || modelId.isBlank()) {
+            _notice.value = SettingsStrings.RELAY_NO_MODEL
+            return
+        }
+        viewModelScope.launch {
+            val outcome = runCatching {
+                relayStore.setDefault(providerId, modelId)
+                relayStore.defaultProvider()
+            }
+            outcome.fold(
+                onSuccess = { default ->
+                    _defaultRelay.value = default
+                    _notice.value = SettingsStrings.RELAY_DEFAULT_SET
+                },
+                onFailure = { throwable -> _notice.value = SettingsStrings.relayWriteFailed(reasonOf(throwable)) },
+            )
+        }
+    }
+
+    /**
+     * 删一条中转（§3.2）：成功后刷列表；core 侧若清掉了悬空默认，这里跟着刷新的默认指针一起归位。
+     *
+     * 与凭据通路同一个措辞：说清「新会话生效」，不暗示热加载。
+     */
+    fun clearRelay(providerId: String) {
+        if (providerId.isBlank()) return
+        viewModelScope.launch {
+            val outcome = runCatching {
+                relayStore.clear(providerId)
+                relayStore.snapshot() to relayStore.defaultProvider()
+            }
+            outcome.fold(
+                onSuccess = { (rows, default) ->
+                    _relays.value = rows
+                    _defaultRelay.value = default?.takeIf { d -> rows.any { it.providerId == d } }
+                    _notice.value = SettingsStrings.relayCleared(providerId)
+                },
+                onFailure = { throwable -> _notice.value = SettingsStrings.relayWriteFailed(reasonOf(throwable)) },
             )
         }
     }

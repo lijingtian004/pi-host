@@ -51,6 +51,35 @@ object SettingsTags {
     /** 已配置一行的清除按钮。 */
     fun credentialClear(providerId: String): String = "screen-settings-credential-clear-$providerId"
 
+    // ── P2H §3.2 自定义中转（tag 前缀照 §3.2 原文：`SCREEN + "-relay"` 系列）─────────
+
+    const val RELAY_SECTION: String = "screen-settings-relay"
+    const val RELAY_ID_FIELD: String = "screen-settings-relay-id"
+    const val RELAY_URL_FIELD: String = "screen-settings-relay-url"
+    const val RELAY_MODELS_FIELD: String = "screen-settings-relay-models"
+    const val RELAY_KEY_FIELD: String = "screen-settings-relay-key"
+    const val RELAY_API_BUTTON: String = "screen-settings-relay-api"
+    const val RELAY_API_PICKER: String = "screen-settings-relay-api-picker"
+    const val RELAY_SAVE: String = "screen-settings-relay-save"
+    const val RELAY_REFRESH: String = "screen-settings-relay-refresh"
+    const val RELAY_EMPTY: String = "screen-settings-relay-empty"
+    const val RELAY_DEFAULT_BADGE: String = "screen-settings-relay-default-badge"
+
+    /** 下拉里的一项（tag 用 api 原值，改展示名不破测试）。 */
+    fun relayApiItem(api: String): String = "$RELAY_API_BUTTON-item-$api"
+
+    /** 已配置中转的一行。 */
+    fun relayRow(providerId: String): String = "$RELAY_SECTION-row-$providerId"
+
+    /** 行里的「设为默认」。 */
+    fun relaySetDefault(providerId: String): String = "$RELAY_SECTION-set-default-$providerId"
+
+    /** 行里的「清除」。 */
+    fun relayClear(providerId: String): String = "$RELAY_SECTION-clear-$providerId"
+
+    /** 行尾的密钥状态（§2：只有「已配置 / 无可用密钥」两种字，永无明文）。 */
+    fun relayRowKey(providerId: String): String = "$RELAY_SECTION-key-$providerId"
+
     init {
         // 与上面三个常量保持一致（Kotlin 侧只有一处真相：tag 名由枚举派生）
         check(MEM_TIER_LOW == tier(MemTier.LOW) && MEM_TIER_MID == tier(MemTier.MID) && MEM_TIER_HIGH == tier(MemTier.HIGH))
@@ -59,6 +88,20 @@ object SettingsTags {
         check(CREDENTIAL_PROVIDER_BUTTON == "$CREDENTIAL_SECTION-provider")
         check(CREDENTIAL_KEY_FIELD == "$CREDENTIAL_SECTION-key")
         check(CREDENTIAL_SAVE == "$CREDENTIAL_SECTION-save")
+        // P2H §3.2 点名的一致性：relay 系列的前缀必须是 `SCREEN + "-relay"`
+        check(RELAY_SECTION == "$SCREEN-relay")
+        check(RELAY_ID_FIELD == "$RELAY_SECTION-id")
+        check(RELAY_URL_FIELD == "$RELAY_SECTION-url")
+        check(RELAY_MODELS_FIELD == "$RELAY_SECTION-models")
+        check(RELAY_KEY_FIELD == "$RELAY_SECTION-key")
+        check(RELAY_API_BUTTON == "$RELAY_SECTION-api")
+        check(RELAY_SAVE == "$RELAY_SECTION-save")
+        check(RELAY_REFRESH == "$RELAY_SECTION-refresh")
+        check(RELAY_EMPTY == "$RELAY_SECTION-empty")
+        check(RELAY_DEFAULT_BADGE == "$RELAY_SECTION-default-badge")
+        // 三个按 id 派生的函数与固定段名不能撞车：撞了就会让「点这行的清除」打到别的节点
+        check(relayClear("x") != relaySetDefault("x") && relayRow("x") != relayClear("x"))
+        check(relayApiItem("x") != RELAY_API_BUTTON)
     }
 }
 
@@ -139,6 +182,61 @@ object SettingsStrings {
 
     /** 写盘/撤销失败：原因只来自 IOException 的 message（内容是路径，不含凭据，见 VM 的 reasonOf）。 */
     fun credentialWriteFailed(reason: String): String = "写入失败：$reason"
+
+    // ── P2H §3.2 自定义中转 ────────────────────────────────────────────────────────
+
+    const val SECTION_RELAY: String = "自定义中转（OpenAI 兼容）"
+
+    const val RELAY_HINT: String = "写进 pi 的 models.json：填地址与模型 id，新会话即可用（对话进行中的会话不受影响）。"
+
+    const val RELAY_ID_LABEL: String = "中转标识"
+    const val RELAY_ID_HINT: String = "自己起个名字，例：my-relay（写进 models.json 的 providers 键名）"
+    const val RELAY_URL_LABEL: String = "接口地址"
+
+    /**
+     * §3.4 要求报告点名那条提示的**落点**：它就在设置页 baseUrl 输入框的 supporting text 上，
+     * 由 [RelaySection] 用 `Text(..., style = bodySmall)` 渲染（不是 placeholder、不是 tooltip）。
+     * 为什么必须写这句：pi 把 `baseUrl` 当作**完整前缀**再拼 `/chat/completions`，
+     * 只填 `https://relay.example.com` 会打到根路径上（`provider-composer.ts:289` 那条链没有默认路径）。
+     */
+    const val RELAY_URL_HINT: String = "要带路径前缀，例：https://relay.example.com/v1（pi 只补 /chat/completions）"
+
+    const val RELAY_MODELS_LABEL: String = "模型 ID 列表"
+    const val RELAY_MODELS_HINT: String = "逗号分隔多个，例：deepseek-chat,gpt-4o"
+    const val RELAY_KEY_LABEL: String = "API 密钥"
+
+    /** §3.2 那条语义要在屏幕上说出来，否则用户会以为留空 = 清空。 */
+    const val RELAY_KEY_HINT: String = "留空 = 沿用已存密钥（只改地址或模型时不用重填）"
+
+    const val RELAY_API_LABEL: String = "接口协议"
+    const val RELAY_API_PICKER_TITLE: String = "选择接口协议"
+    const val RELAY_API_PICKER_CANCEL: String = "取消"
+
+    const val RELAY_SAVE: String = "保存中转"
+    const val RELAY_REFRESH: String = "重读列表"
+    const val RELAY_SET_DEFAULT: String = "设为默认"
+    const val RELAY_CLEAR: String = "清除"
+    const val RELAY_NONE: String = "还没配置任何中转站。"
+    const val RELAY_DEFAULT_BADGE: String = "默认"
+
+    /** 行尾那个模型数（§3.2 原文的行格式：`providerId · baseUrl · N 个模型`）。 */
+    const val RELAY_MODEL_COUNT: String = "%d 个模型"
+
+    /** §3.2 原文的两条 notice。 */
+    const val RELAY_SAVED: String = "已保存，新会话生效"
+    const val RELAY_DEFAULT_SET: String = "默认模型已钉选，新会话直接用它"
+
+    const val RELAY_BLANK_ID: String = "中转标识是空的，没有写入。"
+    const val RELAY_BLANK_URL: String = "接口地址是空的，没有写入：pi 收到没有 baseUrl 的 provider 会直接报错。"
+    const val RELAY_BLANK_MODELS: String = "模型列表是空的，没有写入：至少要填一个模型 id。"
+
+    /** 行里没有模型 id 时点不动「设为默认」，说清为什么。 */
+    const val RELAY_NO_MODEL: String = "这条中转没有模型 id，钉不了默认。"
+
+    fun relayCleared(providerId: String): String = "已清除 $providerId，新会话生效"
+
+    /** 中转写盘失败：措辞与凭据通路一致，原因同样只来自 IOException 的 message（只含路径）。 */
+    fun relayWriteFailed(reason: String): String = "写入失败：$reason"
 
     const val NOTICE_AUTO_DISMISS_HINT: String = "（稍后自动收起）"
 

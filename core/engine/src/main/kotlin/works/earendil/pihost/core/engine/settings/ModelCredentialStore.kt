@@ -1,7 +1,6 @@
 package works.earendil.pihost.core.engine.settings
 
 import java.io.File
-import java.io.IOException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -34,6 +33,10 @@ import kotlinx.serialization.json.contentOrNull
  * 3. **明文不出本类**：[ProviderEntry] 只带 `keyConfigured` 旗，[readConfigured] 不返回 key，
  *    日志/快照/提交里都不出现凭据（本类也不打日志）。
  *
+ * P2H §3.1 起，这三条里「读 / 原子写 / 建目录」三个动作的**工具实现**住在同包 [AgentConfigFiles]
+ * （与 [RelayEndpointStore] 共用一份，规格书明令不许复制粘贴两份）。本类的**公开 API 与行为一字未动**：
+ * `ModelCredentialStoreTest` 17 条原样全绿就是这次内部重构的验收（tmp 前缀、错误消息、键序全部沿用原值）。
+ *
  * 时机安全：pi 只在 spawn 时同步读一次（`readStoredCredential`），RPC 模式运行期不回写
  * （无 `/login` 通路 + `--no-extensions`），所以 app 任意时机写入都不会与子进程抢文件；
  * 代价是**已运行会话不吃新凭据，新会话生效**（§9），UI 侧的 notice 文案由此而来。
@@ -44,7 +47,7 @@ class ModelCredentialStore(private val homeDir: File) {
 
     /** `<homeDir>/.pi/agent/auth.json`（规格书 §4.1 原文形状；三段拼法与 pi 的 `join()` 逐段对齐）。 */
     val authFile: File
-        get() = File(File(File(homeDir, PI_DIR_NAME), AGENT_DIR_NAME), AUTH_FILE_NAME)
+        get() = AgentConfigFiles.agentFile(homeDir, AUTH_FILE_NAME)
 
     /**
      * 一个 provider 的**无密钥**视图（§4.1 原文：不持 key 明文）。
@@ -63,7 +66,7 @@ class ModelCredentialStore(private val homeDir: File) {
      * 顶层值不是 JSON 对象的垃圾条目（如 `"note":"xxx"`）不进列表，但写回时原样保留（见 [save]）。
      */
     fun readConfigured(): List<ProviderEntry> =
-        readObject(authFile).mapNotNull { (providerId, value) ->
+        AgentConfigFiles.readObject(authFile).mapNotNull { (providerId, value) ->
             (value as? JsonObject)?.let { ProviderEntry(providerId, it.isConfiguredApiKey()) }
         }
 
@@ -71,26 +74,26 @@ class ModelCredentialStore(private val homeDir: File) {
      * 写入/更新一个 provider 的 api_key（§4.1）。
      *
      * @throws IllegalArgumentException 任一入参空白（空 key 该走 [clear]，不是写一条空凭据）
-     * @throws IOException 目录建不成（例如 `.pi` 位置被一个普通文件挡着）或原子替换失败
+     * @throws java.io.IOException 目录建不成（例如 `.pi` 位置被一个普通文件挡着）或原子替换失败
      */
     fun save(providerId: String, apiKey: String) {
         require(providerId.isNotBlank()) { "providerId 不能为空" }
         require(apiKey.isNotBlank()) { "apiKey 不能为空：要撤销凭据请用 clear()" }
         val target = authFile
         val dir = requireNotNull(target.parentFile) { "authFile 没有父目录：${target.path}" }
-        ensureDirectory(dir)
+        AgentConfigFiles.ensureDirectory(dir)
         val merged = buildJsonObject {
-            readObject(target).forEach { (key, value) -> put(key, value) }
+            AgentConfigFiles.readObject(target).forEach { (key, value) -> put(key, value) }
             put(providerId, apiKeyCredential(apiKey))
         }
-        writeAtomic(dir, target, merged)
+        AgentConfigFiles.writeAtomic(dir, target, merged)
     }
 
     /**
      * 删掉一个 provider 条目，其余原样保留（§4.1 第 ④ 条）。
      *
      * 幂等：文件不存在、或本来就没有这个条目 → 什么都不做（不凭空建 `{}`，也不重写文件）。
-     * 唯一的例外是「文件是损坏 JSON」——此时 `readObject` 给空对象、`containsKey` 为 false，同样不动文件：
+     * 唯一的例外是「文件是损坏 JSON」——此时 `AgentConfigFiles.readObject` 给空对象、`containsKey` 为 false，同样不动文件：
      * 损坏内容由下一次 [save] 负责覆盖成合法对象（§4.1 第 ⑤ 条），clear 不该替它擦屁股。
      *
      * @throws IllegalArgumentException [providerId] 空白
@@ -99,71 +102,32 @@ class ModelCredentialStore(private val homeDir: File) {
         require(providerId.isNotBlank()) { "providerId 不能为空" }
         val target = authFile
         if (!target.isFile) return
-        val existing = readObject(target)
+        val existing = AgentConfigFiles.readObject(target)
         if (!containsKey(existing, providerId)) return
         val remaining = buildJsonObject {
             existing.forEach { (key, value) -> if (key != providerId) put(key, value) }
         }
-        writeAtomic(requireNotNull(target.parentFile), target, remaining)
+        AgentConfigFiles.writeAtomic(requireNotNull(target.parentFile), target, remaining)
     }
 
-    // ── 内部：读 / 写 / 判定 ───────────────────────────────────────────────────────
-
-    /** 目录不存在就建；建不成且不是目录 → 抛（宁可不写，也不让 key 落到错误位置）。 */
-    private fun ensureDirectory(dir: File) {
-        if (dir.isDirectory) return
-        if (!dir.mkdirs() && !dir.isDirectory) throw IOException("无法创建目录：${dir.path}")
-    }
-
-    /**
-     * 读成 [JsonObject]；文件缺失 / 空白 / 损坏 / 顶层不是对象 → 一律给空对象。
-     *
-     * 「损坏也当空读」是 [save] 的第 ⑤ 条语义（在坏文件上 save → 覆盖成合法对象）的基础。
-     * 读失败不抛：设置页进屏就要列一次，磁盘抖动时页面该显示「还没配置」而不是崩。
-     */
-    private fun readObject(file: File): JsonObject {
-        val text = runCatching { file.readText() }.getOrNull() ?: return EMPTY_OBJECT
-        if (text.isBlank()) return EMPTY_OBJECT
-        return runCatching { JSON.parseToJsonElement(text) }.getOrNull() as? JsonObject ?: EMPTY_OBJECT
-    }
-
-    /**
-     * 同目录 tmp + `renameTo` 原子替换（§2 红线）。
-     *
-     * `rename(2)` 在同一文件系统上覆盖目标且原子，所以正常路径一步到位；
-     * 少数失败（SELinux/跨目录）才退化成「删旧 → 再 rename」两步，两步之间 pi 若 spawn 会读到「无文件」，
-     * 那正是 pi 自己 `ensureFileExists` 创建 `{}` 的分支，不是崩溃路径。
-     * `finally` 里必清 tmp：[renameTo] 成功后 tmp 已不存在，`exists()` 判一下免得对已消失文件刷 false。
-     */
-    private fun writeAtomic(dir: File, target: File, content: JsonObject) {
-        val tmp = File(dir, TMP_PREFIX + System.nanoTime())
-        try {
-            tmp.outputStream().use { out -> out.write(content.toString().toByteArray(Charsets.UTF_8)) }
-            if (!tmp.renameTo(target)) {
-                if (target.exists() && !target.delete()) throw IOException("无法替换 ${target.path}：旧文件删不掉")
-                if (!tmp.renameTo(target)) throw IOException("无法原子替换 ${target.path}")
-            }
-        } finally {
-            if (tmp.exists()) runCatching { tmp.delete() }
-        }
-    }
+    // ── 内部：判定（读 / 原子写 / 建目录三条工具已挪进同包 [AgentConfigFiles]，P2H §3.1）──
 
     companion object {
-        const val PI_DIR_NAME: String = ".pi"
-        const val AGENT_DIR_NAME: String = "agent"
-        const val AUTH_FILE_NAME: String = "auth.json"
+        // 路径与 tmp 前缀的真相住在 [AgentConfigFiles]（P2H §3.1），这里保留同名公开常量：
+        // `ModelCredentialStoreTest` 一直按它们下断言，公开 API 一字不动。
+        const val PI_DIR_NAME: String = AgentConfigFiles.PI_DIR_NAME
+        const val AGENT_DIR_NAME: String = AgentConfigFiles.AGENT_DIR_NAME
+        const val AUTH_FILE_NAME: String = AgentConfigFiles.AUTH_FILE_NAME
 
         /** tmp 文件名前缀（与 auth.json 同目录）；单测按它断言「无残留」。 */
-        const val TMP_PREFIX: String = "auth.json.tmp"
+        const val TMP_PREFIX: String = AUTH_FILE_NAME + AgentConfigFiles.TMP_MARKER
 
         const val FIELD_TYPE: String = "type"
         const val FIELD_KEY: String = "key"
         const val TYPE_API_KEY: String = "api_key"
 
         /** 与 `AndroidRuntimeInfo.MANIFEST_JSON` 同一套宽松配置：未来 pi 加字段不破旧宿主。 */
-        val JSON: Json = Json { ignoreUnknownKeys = true }
-
-        private val EMPTY_OBJECT: JsonObject = buildJsonObject { }
+        val JSON: Json = AgentConfigFiles.JSON
 
         /**
          * v1 下拉清单（规格书 §3 定案的 10 项，顺序照原文；全是 `api_key` 型）。

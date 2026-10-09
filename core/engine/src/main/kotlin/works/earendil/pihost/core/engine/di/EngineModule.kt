@@ -20,6 +20,10 @@ import works.earendil.pihost.core.engine.RuntimeInstall
 import works.earendil.pihost.core.engine.RuntimeInstallImpl
 import works.earendil.pihost.core.engine.SessionSupervisor
 import works.earendil.pihost.core.engine.SpawnDiagnosticsSink
+import works.earendil.pihost.core.engine.audit.AuditPaths
+import works.earendil.pihost.core.engine.audit.AuditScope
+import works.earendil.pihost.core.engine.audit.AuditSink
+import works.earendil.pihost.core.engine.audit.FileAuditSink
 import works.earendil.pihost.core.engine.settings.DataStoreSettingsRepository
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore
@@ -135,6 +139,44 @@ object EngineModule {
 
     /** 唯一项目目录名（P2C 的 `EngineRuntime.DEFAULT_PROJECT` 随静态桥一起迁到这里）。 */
     const val DEFAULT_PROJECT: String = "default"
+
+    /**
+     * 审计写入侧的 scope（P3A §3.1）：`SupervisorJob + Dispatchers.IO`，与进程同寿。
+     *
+     * 与 [engineScope] 分成两条：那条跑 spawn/JSON 轮转（Default），这条只有追加写文件（IO）。
+     * `SupervisorJob` 让「一条写协程炸了」不牵连兄弟——虽然 [FileAuditSink] 内部已经全量吞异常，
+     * 装配面也不该留一条「一个子失败取消整个 scope」的路径。
+     */
+    @Provides
+    @Singleton
+    @AuditScope
+    fun auditScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * 审计落盘（P3A §3.1/§3.2）：目录 = [AuditPaths.auditDir]（`filesDir/audit`）。
+     *
+     * **为什么绑在 [EngineModule]**（与 [settingsRepository] / [modelCredentialStore] / [relayEndpointStore]
+     * 同一条理由，P2G §8 第 4 条的同一课）：`:app`/`:core:engine` 的 Hilt 测试一律靠一条
+     * `@UninstallModules(EngineModule::class)` 整体换假体，新增 binding 就得同步补进
+     * `AppTestEngineModule`——单开一个不卸载的模块会让测试图拿到**真**审计 sink，
+     * 往 Robolectric 沙箱里写文件，反而更难断言。
+     */
+    @Provides
+    @Singleton
+    fun fileAuditSink(
+        @ApplicationContext ctx: Context,
+        @AuditScope scope: CoroutineScope,
+    ): FileAuditSink = FileAuditSink(AuditPaths.auditDir(ctx), scope)
+
+    /**
+     * 接口 → 实现转发边（P3A §3.1）：注入点一律要 [AuditSink]，不是 [FileAuditSink]。
+     *
+     * 照 [relayEndpointStore] / [chatEngine] 的先例：调用方依赖抽象，测试才能拿假体顶掉它
+     * （`ChatViewModelTest` 的 FakeAuditSink 就是这么进来的）。
+     */
+    @Provides
+    @Singleton
+    fun auditSink(sink: FileAuditSink): AuditSink = sink
 
     /**
      * `nativeLibraryDir` 为 null 时**不再抛**（P2C 的 `initialize()` 用 `error()`，

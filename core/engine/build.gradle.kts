@@ -45,7 +45,10 @@ dependencies {
     // 升级 implementation → api：本模块公开 API 是 suspend 函数与 StateFlow/SharedFlow，
     // 下游（app）不显式声明协程依赖也要能编译。
     api(libs.kotlinx.coroutines.core)
-    implementation(libs.kotlinx.serialization.json)
+    // P3A §3.1：升 implementation → api。[AuditEntry] 是本模块的**公开 API 类型**且带 @Serializable，
+    // 它的伴生 `serializer(): KSerializer<AuditEntry>` 出现在成员签名里——下游（:feature:chat 拿 AuditEntry
+    // 构造审计条目）不显式声明序列化依赖也要能编译，与 core/rpc 把 serialization 记成 api 同一处置。
+    api(libs.kotlinx.serialization.json)
     // P2E 规格书 §3.4：SettingsRepository 落本模块（EngineModule 的 envFor lambda 要同步读
     // memTier，见 §2 红线「EnvFactory 冻结、envFor 动态取」——repository 必须在 core 侧，
     // 否则 core/engine → feature 反向依赖）。

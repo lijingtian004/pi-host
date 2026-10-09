@@ -1,7 +1,8 @@
 # REPORT-P3C — 新建项目 + git 可用 + 顶栏分支（versionCode 8 / 0.1.7）
 
 > 日期：2026-10-09 起、2026-10-10 真机验证收尾 ｜ 基线：`80f5e13`（P3B-FIX1）
-> 交付：`dist/pi-host-full-debug-0.1.7-p3c.apk`（63,976,877 B，`86cd5e17…c4a7ac`，已装机）
+> 交付：`dist/pi-host-full-debug-0.1.7-p3c.apk`（64,083,363 B，`765bd175…010b8`，含 §8.9b 修复、**未装机**；
+> 手机上现在跑的是修复前那次 `86cd5e17…c4a7ac`，§9 的真机证据来自它，详见 §5）
 > 任务来源：用户指令「添加 git，允许在应用私有目录新建文件夹」，经 P3C 计划批准（9 个小节 + 红线重划）。
 >
 > **目标变更**：终点从「消费者上架」改为「这台 rooted 自有设备自用闭环」，
@@ -148,14 +149,14 @@ feature/sessions/.../ProjectsSource.kt                 UI 侧接缝（接口 + F
 | `core/process` | 3 | 3 | — | 冻结区 ✓ |
 | `core/rpc` | 34 (skip 1) | 34 (skip 1) | — | 冻结区 ✓ |
 | `core/environment` | 5 | 5 | — | 冻结区 ✓ |
-| `core/engine` | 147 (skip 2) | **240** (skip 2) | **+93** | ProjectNames 23、ProjectStore 17、**git 三面 46**（ShortProcessRunner 14 + ProcessGitProbe 22 + GitIdentity 10）、Supervisor 3、SettingsRepo 4 |
+| `core/engine` | 147 (skip 2) | **247** (skip 2) | **+100** | ProjectNames 30（含 §8.9b 那组 7 条）、ProjectStore 17、**git 三面 46**（ShortProcessRunner 14 + ProcessGitProbe 22 + GitIdentity 10）、Supervisor 3、SettingsRepo 4 |
 | `feature/chat` | 147 | **167** | **+20** | `case73`–`case86`（VM 14）+ `ChatScreenUiTest` 顶栏 6 条 |
 | `feature/sessions` | 25 | **38** | **+13** | `v13`–`v20`（8）+ `u04`–`u08`（5） |
 | `feature/settings` | 77 | 77 | — | **主源码零 diff** ✓（测试假体见 §8.4） |
 | `app` | 24 | **28** | **+4** | chip 缺席冒烟 1、`ProjectStoreWiringTest` 3 |
-| **合计** | **462** | **592** | **+130** | `failures=0 errors=0 skip=3`（skip 三条与基线同） |
+| **合计** | **462** | **599** | **+137** | `failures=0 errors=0 skip=3`（skip 三条与基线同） |
 
-计数用 `.tools/p3a-count-tests.sh`（只读 `testDebugUnitTest`，纯 JVM 模块读 `test`）。
+计数用 `.tools/p3a-count-tests.sh`（经 `p3c-build.sh count` 调用）（只读 `testDebugUnitTest`，纯 JVM 模块读 `test`）。
 **口径教训**：本轮第一版计数脚本把 `testReleaseUnitTest` 的 XML 一起加了，Android 模块整整翻倍
 （`core/engine` 报 294 而非 147）——与 REPORT-P3B §8.12「矩阵表少算一模块」同一类口径坑，
 已改回复用他们的脚本，不再自建第二套计数。
@@ -168,13 +169,26 @@ feature/sessions/.../ProjectsSource.kt                 UI 侧接缝（接口 + F
 |---|---|
 | 产物（编译机） | `/root/android-host/app/build/outputs/apk/debug/app-debug.apk` |
 | 本机 | `dist/pi-host-full-debug-0.1.7-p3c.apk` |
-| 大小 | **63,976,877 B**（0.1.6 为 63,928,829 B，**+48,048 B**） |
-| sha256 | `86cd5e1799cea4cd3646940e8f58a04df22ffc0ba4951fcd2b0638bb59c4a7ac`（**双端逐字节一致**） |
+| 大小 | **64,083,363 B**（含 §8.9b 修复；修复前那次是 63,976,877 B，比 0.1.6 大 48,048 B） |
+| sha256 | `765bd175d9ac1361f4f8c7639c5824311b033b259c27150800380afa06e010b8`（**双端逐字节一致**） |
 | 清单 | `package=works.earendil.pihost` `versionCode=8` `versionName=0.1.7` `minSdk=26` `targetSdk=35`（`.tools/p3b-axml.py` 解析二进制 AXML） |
 
-装机后旧的 `dist/pi-host-full-debug.apk`（0.1.6，sha256 `7e5de17a…`，曾与机上 `base.apk` 逐字节一致）**保留不动**，
-它是「P3B-FIX1 已装机」的证据。本期 0.1.7 已实际装到设备（见 §8.1），
-所以机上 `base.apk` 现在对应的是新产物；旧文件留着只为对照，别当现状读。
+**设备上装的与 `dist/` 里现在这份不是同一个字节串**，这点必须写清：
+
+| | sha256 | 状态 |
+|---|---|---|
+| 手机上现在跑的（§9 那 ①–⑤ 全通过的证据来自它） | `86cd5e17…c4a7ac` | 已装机，**不含 §8.9b 修复** |
+| `dist/` 里现在这份 | `765bd175…010b8` | 含修复，**未装机** |
+
+（`dist/` 的文件名沿用同一个，所以上一节那个 `86cd5e17` 已经被覆盖掉了——
+它就是 §9 全部真机证据对应的那次构建，指纹记在这里，别再拿 `dist/` 当它的对照。）
+
+**要装这份新包时注意**：`pm install -r` 会**再次触发 §8.9**（农场整体悬空），
+所以装机后必须紧接着做一次 §8.9 末尾的恢复（删 `.installed.json` 让它重链），
+或者等 P3D §3.1 的自愈逻辑落地。这也顺带给了 §8.9 一个现成的复验机会。
+
+旧产物 `dist/pi-host-full-debug.apk`（0.1.6，sha256 `7e5de17a…`，曾与当时机上 `base.apk`
+逐字节一致）**保留不动**，它是「P3B-FIX1 已装机」的证据。
 
 ---
 
@@ -491,7 +505,40 @@ runtime/libexec  共 172 条链接，悬空 150
 su -c "cd /data/data/works.earendil.pihost/files/runtime/bin && n=0;for l in *;do [ -e \"\$l\" ]||n=\$((n+1));done;echo 悬空\$n"   # 期望 0
 ```
 
+### 8.9b 【本期已修】跨项目告知在真机上永不触发：data 目录的两张脸
+
+§8.9 那条是环境缺陷，这条是**本期新代码里的真 bug**，由"还有啥要测的"这一问挖出来。
+
+**取证**（同一目录，两种拼法，`readlink -f` 各自解析成自己）：
+
+```
+pi 会话头记的 cwd   : /data/data/works.earendil.pihost/files/projects/3
+宿主审计记的 cwd    : /data/user/0/works.earendil.pihost/files/projects/3
+两条的 st_dev:st_ino : 65097:1388717 = 65097:1388717      ← 同一个目录
+readlink -f 两条     : 各自原样返回（不是符号链接，是 bind）
+```
+
+于是 `FileProjectsSource.projectOf()` 拿宿主的根（`/data/user/0/…`）去前缀匹配 pi 记的
+cwd（`/data/data/…`）**永远不相等** → `projectNameOfCwd` 对每一条真实会话返回 null →
+P3C §3.7 那条「这条会话属于项目 X，当前活动项目是 Y」的告知**在真机上永不出现**。
+而 `v19` 单测里两侧都用同一串字面量，所以 592 条全绿也照不出来。
+
+**为什么不是「加个 canonical 化」能解决的**：`File.canonicalPath` 底层是 `realpath(3)`，
+只解符号链接；bind 挂载对它不可见。所以修法只能是**显式承认这两张脸是同一个键**：
+`ProjectNames.foldDataAlias()` 把 `/data/user/<n>/` 折成 `/data/data/`，
+`projectNameOfCwd` 两侧都先折叠再比较。选 `/data/data` 作统一目标，因为它是 pi 侧那张、
+也是人读日志时更眼熟的一张。
+
+**这条修法的唯一真实风险**是「折叠顺手放宽了归属判断」，所以 `29` 专门钉住：
+`com.other` 的同形路径、以及同包 `files2/` 这种多一层别名的路径，都必须返回 null。
+
+新增用例 `24`–`30`（7 条），`:core:engine` 240 → **247**，全模块 **599**。
+
+**它同时解释了 §8.2 第 5 条**：那条我列成「canonical 在真机挂载形态下未证」，
+现在证了——而且证出来的结论是「canonical 在这里根本不起作用，别指望它」。
+
 ### 8.10 上游慢的时候，界面没有任何时间感
+
 
 §8.1b 量出来的那次 229 秒停顿里，界面只有一个静态的「插一句，或排队追问」占位。
 宿主侧该有而没有的三样东西：
@@ -506,6 +553,37 @@ su -c "cd /data/data/works.earendil.pihost/files/runtime/bin && n=0;for l in *;d
 
 这三条合起来是一个可用性问题，不是正确性 bug；但对「手机上用编码 agent」这个场景，
 它是决定「用户会不会以为坏了然后强杀」的那一项。建议与 §8.9 同批进 P3D。
+
+#### 8.10b 超时这件事的完整现状（两条实测问题问出来的）
+
+**「API 连接超时为什么没提示」——因为两层各有一个洞，叠在一起：**
+
+| 层 | 有没有超时 | 值 | 那次 229 秒为什么没触发 |
+|---|---|---|---|
+| pi 的 HTTP | **有** | `httpIdleTimeoutMs` 默认 **300000（5 分钟）**（`docs/settings.md:123`）；`retry.provider.timeoutMs` 默认继承它（`:129`） | 229s < 300s，**压根没到线**；最后是底层连接自己抛 `Connection error.` 才结束 |
+| pi 的 WS 连接 | 有 | `websocketConnectTimeoutMs` 默认 15000（`:124`） | 不走这条路 |
+| 宿主的整轮 | **没有** | 全仓 grep `watchdog\|elapsed\|deadline` 于 `feature/chat/src/main` → **0 命中** | 宿主对「模型在不在回话」既无时限也无计时显示 |
+
+所以「没提示」不是提示逻辑写错了，是**宿主这一层根本没有这个概念**：
+它现有的超时只有 spawn 握手 15s（`SessionSupervisor.kt:425`）、优雅关 5s
+（`PiSession.kt:190`）、git 探针 3s（本期新增）、权限框倒计时（pi 给的 timeout）。
+**结论：不能指望 pi 那条 5 分钟的线，宿主必须自己有「本轮已等待 Ns + 首字节超阈值提示」。**
+
+**「工具有超时限制吗」——默认没有：**
+
+- `bash` 工具的 `timeout` 是**可选参数**，schema 描述原文
+  *"Timeout in seconds (optional, **no default timeout**)"*（`core/tools/bash.ts:42`）；
+  上限 `MAX_TIMEOUT_MS = 2_147_483_647` ≈ **24.8 天**（`:22`），等于没有上限。
+- `write` / `edit`：grep `timeout` → **0 命中**，纯文件操作无超时。
+- 也就是说 **pi 跑一个死循环命令，唯一的出口是用户点「中止」**（`abort` 已接、`abort_bash` 未接，见 §1 那张表）。
+- 本期宿主自己的 git 探针是**唯一有硬超时的那一处**（3s + 超时 `destroy()`），
+  而且它超时后按设计**什么都不显示**（`Unavailable` 不渲染节点），所以不会添乱。
+
+**给 P3D 的三条直接结论**（比 §8.10 原文更具体）：
+1. 宿主加「本轮已等待 Ns」计时 + 首字节阈值提示（阈值应显著小于 pi 的 300s，建议 30–60s 起报）；
+2. 接上 `abort_bash`——现在 bash 无默认超时，而宿主只能中止**整轮**，不能只中止那条命令；
+3. 若要让长命令有兜底，走 `set_auto_retry` / 或在宿主侧对 `bash_execution_update` 静默超时给提示，
+   别去改 pi 的参数默认值（红线 1：pi 源码零写入）。
 
 ---
 
@@ -523,6 +601,15 @@ su -c "cd /data/data/works.earendil.pihost/files/runtime/bin && n=0;for l in *;d
 再装一次（任何一次 `pm install -r`）之后，②③④ 仍然会过（builtin 不受影响），
 而 `git clone` / `pull` / `push` 与 `gc` 会静默失效。这条写在这里，是为了让以后有人
 照着这张表复验时不会以为「五条全绿 = 没事」。
+
+### 9.0 §8.9b 的复验（修完之后要能看到变化）
+
+会话页把活动项目切成 `default`，然后点一条属于 `3` 的会话：
+
+- **修前**：无任何提示（`projectOf` 恒返回 null）
+- **修后**：出现「这条会话属于项目 3，当前活动项目是 default：继续可用，但新建会话会落在 default」
+
+这条**只能真机验**：单测里两侧字面量一致，永远照不出两张脸的问题（这正是它活到 §8.9b 才被发现的原因）。
 
 ### 9.1 复现这张表所需的东西（都已就位）
 

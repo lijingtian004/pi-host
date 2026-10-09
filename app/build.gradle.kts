@@ -16,8 +16,8 @@ android {
         applicationId = "works.earendil.pihost"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.1.5"
+        versionCode = 7
+        versionName = "0.1.6"
         // 方案 §2.3 / §8：只发 arm64-v8a（Termux 运行时仅有 aarch64）
         ndk { abiFilters += "arm64-v8a" }
     }

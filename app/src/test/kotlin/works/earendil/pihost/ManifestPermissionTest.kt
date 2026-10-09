@@ -38,8 +38,8 @@ import org.xmlpull.v1.XmlPullParser
  *
  * **P3B §3.5 起还管「权限清单一字不改」**（⑥）：①② 是「不能丢」的下界，⑥ 补上「不能多」的上界——
  * P3B 的三张脸（模型切换 / 统计条 / 压缩）都走既有 RPC 通道，没有任何一条需要新的系统能力，
- * 所以合并清单必须还是那四条。同一条里 ③ 把 versionCode/versionName 升到 6 / 0.1.5
- * （本轮唯一允许的 `app/build.gradle.kts` 改动，其余字段一字未动）。
+ * 所以合并清单必须还是那四条。同一条里 ③ 把 versionCode/versionName 升到 7 / 0.1.6
+ * （P3B-FIX1 §3.3：本轮唯一允许的 `app/build.gradle.kts` 改动，其余字段一字未动）。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], application = Application::class)
@@ -82,19 +82,21 @@ class ManifestPermissionTest {
             declared.contains(Manifest.permission.POST_NOTIFICATIONS))
     }
 
-    // ── ③ 版本必须升到 versionCode=6 / versionName=0.1.5（§2 红线「版本必须升」） ────
+    // ── ③ 版本必须升到 versionCode=7 / versionName=0.1.6（§2 红线「版本必须升」） ────
 
     @Test
-    fun `03 the apk identity is bumped to versionCode 6 and versionName 0 point 1 point 5`() {
+    fun `03 the apk identity is bumped to versionCode 7 and versionName 0 point 1 point 6`() {
         val info = app.packageManager.getPackageInfo(app.packageName, 0)
-        // 用 6L：longVersionCode 是 Long，写字面量 6 会落到 assertEquals(String, Object, Object)
-        // 那条重载上，Integer(6) != Long(6) 会假红——这是 JUnit 装箱陷阱，不是版本没升。
-        assertEquals("versionCode 不升，真机会装成同版本、覆盖不掉带 bug 的旧包", 6L, info.longVersionCode)
-        assertEquals("0.1.5", info.versionName)
+        // 用 7L：longVersionCode 是 Long，写字面量 7 会落到 assertEquals(String, Object, Object)
+        // 那条重载上，Integer(7) != Long(7) 会假红——这是 JUnit 装箱陷阱，不是版本没升。
+        // 7 是 P3B-FIX1 的修复包：真机若还装着 6，覆盖安装才有门。
+        assertEquals("versionCode 不升，真机会装成同版本、覆盖不掉带 bug 的旧包", 7L, info.longVersionCode)
+        assertEquals("0.1.6", info.versionName)
         assertEquals("works.earendil.pihost", info.packageName)
-        // 单调性单列一条：P2F 发的是 2、P2G 是 3、P2H 是 4、P3A 是 5、P3B 是 6。写死 6L 已经隐含这件事，
+        // 单调性单列一条：P2F 发的是 2、P2G 是 3、P2H 是 4、P3A 是 5、P3B 是 6、P3B-FIX1 是 7。
+        // 写死 7L 已经隐含这件事，
         // 但这条的失败信息会直接说出「必须严格大于上一版」，排查 adb install -r 拒装时少绕一步。
-        assertTrue("必须严格高于 P3A 的 5，否则覆盖安装被拒", info.longVersionCode > 5L)
+        assertTrue("必须严格高于 P3B 的 6，否则带 bug 的旧包覆盖不掉", info.longVersionCode > 6L)
     }
 
     // ── ④ 备份排除清单（P3A §3.4）：API ≤ 30 的那份 ────────────────────────────

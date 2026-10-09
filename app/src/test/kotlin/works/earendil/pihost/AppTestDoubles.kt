@@ -140,7 +140,7 @@ object AppTestEngineModule {
      *
      * 同样是**真类 + 假目录**：Robolectric 沙箱 Application 的 `filesDir` 每沙箱唯一，
      * 落盘的是临时 `home/.pi/agent/models.json` + `settings.json`，不碰设备路径；
-     * 中转读写的完整覆盖在 `:core:engine` 的 `RelayEndpointStoreTest`（31 条）与
+     * 中转读写的完整覆盖在 `:core:engine` 的 `RelayEndpointStoreTest`（P3B-FIX1 后 37 条）与
      * `:feature:settings` 的两张测试表（57 条），`:app` 只要这条边能让图建起来 + 列表是空的。
      */
     @Provides
@@ -162,7 +162,7 @@ object AppTestEngineModule {
      * - [CrashReporter]：绑定住在 `:app` **主源集**的 `CrashReportModule`，本文件只卸载
      *   `EngineModule`，所以它没被卸掉；再给一条就是 `DuplicateBindings`（KSP 期直接失败）。
      *   真图里它由 Robolectric 沙箱 Application 的 `filesDir/crash` 落地，`appVersion` 取
-     *   `BuildConfig.VERSION_NAME`——版本一升（P3B §3.5 的 6 / 0.1.5）崩溃报告首行跟着变，
+     *   `BuildConfig.VERSION_NAME`——版本一升（P3B-FIX1 §3.3 的 7 / 0.1.6）崩溃报告首行跟着变，
      *   不需要在这里再写一份真相。
      * - [works.earendil.pihost.feature.settings.DiagnosticsSource]：接口→实现那条转发边住在
      *   **没有被卸载**的 `SettingsModule` 里，与 P2H 的 `RelayEndpointSource` 完全同一课

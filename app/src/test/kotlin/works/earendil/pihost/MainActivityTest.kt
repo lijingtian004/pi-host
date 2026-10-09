@@ -204,6 +204,28 @@ class MainActivityTest {
         composeRule.onNodeWithTag(ChatTags.INPUT).assertIsEnabled()
     }
 
+    // ── ②b git chip：装配里是空探针，顶栏就绝不该出现一颗 chip ────────────────────
+
+    /**
+     * P3C §3.8 的装配冒烟。
+     *
+     * 断的是**装配**而不是渲染：`:app` 的测试图给的是 [NoopGitProbe]（永远 `Unavailable`），
+     * 所以走到 Ready 之后 chip 必须缺席；一旦哪天有人把真探针错绑进测试图，
+     * 这条会红——那正是我们不想在 Robolectric 里起真子进程的理由（构建机是 root，
+     * 真 `git` 会成功，于是「设备上的 exec 约束」被一次假绿替代）。
+     *
+     * 同时钉住既有断言不受影响：顶栏短码仍在原处，`ENGINE_STATUS` 的文本一字未变。
+     */
+    @Test
+    fun `the git chip stays absent while the app graph ships the noop probe`() {
+        enterReady()
+
+        composeRule.onNodeWithTag(ChatTags.GIT_CHIP).assertDoesNotExist()
+        composeRule.onNodeWithTag(ChatTags.ENGINE_STATUS)
+            .assertTextEquals("就绪 ${RecordingChatEngine.SESSION.take(8)}")
+        assertEquals("空探针不该被当成一次真读", 0, NoopGitInitializer.dirs.size)
+    }
+
     // ── ③ 安装失败：独立文案 + 真原因 + 可重试，且绝不起引擎 ──────────────────────
 
     @Test

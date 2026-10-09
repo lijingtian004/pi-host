@@ -25,6 +25,12 @@ import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.audit.AuditEntry
 import works.earendil.pihost.core.engine.audit.AuditSink
 import works.earendil.pihost.core.engine.di.EngineModule
+import works.earendil.pihost.core.engine.git.GitInitOutcome
+import works.earendil.pihost.core.engine.git.GitInitializer
+import works.earendil.pihost.core.engine.git.GitProbe
+import works.earendil.pihost.core.engine.git.NoopGitProbe
+import works.earendil.pihost.core.engine.projects.ProjectNames
+import works.earendil.pihost.core.engine.projects.ProjectStore
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore
@@ -79,6 +85,7 @@ object AppTestHolder {
         installer = ScriptedRuntimeInstall()
         settings = ScriptedSettingsRepository()
         audit = RecordingAuditSink()
+        NoopGitInitializer.reset()
     }
 }
 
@@ -157,6 +164,31 @@ object AppTestEngineModule {
     fun auditSink(): AuditSink = AppTestHolder.audit
 
     /**
+     * git 探针（P3C §3.6）：给 [NoopGitProbe]，永远 `Unavailable` → 顶栏那颗 chip 在 app 侧
+     * 用例里**永远不出现**。
+     *
+     * 为什么不是真探针也不是「可编排假体」：`ProcessGitProbe` 要起一个真子进程，
+     * 而 `:app` 的用例关心的是装配与导航，不是 git；把 shell-out 引进来只会让
+     * Robolectric 的每个用例多等一次 3s 超时。git 的形状覆盖在 `:core:engine`（46 条）与
+     * `:feature:chat`（case73–86 + 6 条 UI）两侧，这里只补图。
+     */
+    @Provides
+    fun gitProbe(): GitProbe = NoopGitProbe
+
+    /**
+     * 项目账本（P3C §3.3/§3.7）：**真类 + 假目录**（与 [modelCredentialStore] / [relayEndpointStore]
+     * 完全同一课）——`SessionsModule` 没被卸载，`FileProjectsSource` 会真造它，
+     * 所以这条边必须有；Robolectric 沙箱的 `filesDir` 每实例唯一，落盘都进临时目录。
+     *
+     * git 那一面给 [NoopGitInitializer]：app 侧没有任何用例该在 Robolectric 里真跑 `git init`
+     * （构建机是 root，会**真建成仓库**——那正是 P3C §7.1 点名的假绿形态）。
+     */
+    @Provides
+    @Singleton
+    fun projectStore(@ApplicationContext ctx: Context): ProjectStore =
+        ProjectStore(PathLayout.projectsDir(ctx), PathLayout.homeDir(ctx), NoopGitInitializer)
+
+    /**
      * §3.6 注入边清点（P3A 新增的两条依赖，**这里一条都不补**，写下来是为了让下一个人不必再试）：
      *
      * - [CrashReporter]：绑定住在 `:app` **主源集**的 `CrashReportModule`，本文件只卸载
@@ -222,6 +254,12 @@ class ScriptedSettingsRepository(initial: AppSettings = AppSettings()) : Setting
     override suspend fun setDefaultModel(model: String?) {
         writes.add("default_model=$model")
         _settings.update { it.copy(defaultModel = model) }
+    }
+
+    /** P3C §3.2 接口扩员补的一条：app 侧用例不调它，只为 `@UninstallModules` 之后仍能建图。 */
+    override suspend fun setActiveProject(name: String?) {
+        writes.add("active_project=$name")
+        _settings.update { it.copy(activeProject = ProjectNames.sanitizeOrFallback(name)) }
     }
 }
 
@@ -334,4 +372,23 @@ class ScriptedRuntimeInstall(
             }
         }
     }
+}
+
+/**
+ * git 写面的空假体（P3C §3.8）：只记目录，绝不 spawn。
+ *
+ * 为什么必须空：`:app` 的 Robolectric 跑在构建机上，那台机器是 **root**，
+ * 真 `git init` 会成功并把沙盒目录变成真仓库——用例绿了，但它证明的是
+ * 「编译机能跑 git」，与设备上「app 的 uid + SELinux 能跑 git」是两件事
+ * （P3C 把这条列为只有真机可验第 1 条）。
+ */
+object NoopGitInitializer : GitInitializer {
+    val dirs = java.util.concurrent.CopyOnWriteArrayList<String>()
+
+    override fun init(dir: java.io.File): GitInitOutcome {
+        dirs += dir.absolutePath
+        return GitInitOutcome.Skipped
+    }
+
+    fun reset() = dirs.clear()
 }

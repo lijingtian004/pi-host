@@ -38,6 +38,7 @@ import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
+import works.earendil.pihost.core.engine.settings.RelayModel
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.feature.settings.ui.SettingsStrings
 import works.earendil.pihost.feature.settings.CrashReportSummary
@@ -557,7 +558,7 @@ class SettingsScreenTest {
         composeRule.onNodeWithTag(SettingsTags.credentialClear("anthropic")).assertIsDisplayed()
     }
 
-    // ── P2H §3.2 自定义中转（h01–h12：规格书点名的八条 + 四条顺手补的红线）──────────
+    // ── P2H §3.2 自定义中转（h01–h13：规格书点名的八条 + 五条顺手补的红线）──────────
 
     /** 填前三项必填（providerId / baseUrl / 模型列表），密钥留空。 */
     private fun typeRelayForm(
@@ -578,9 +579,9 @@ class SettingsScreenTest {
         providerId: String = "my-relay",
         baseUrl: String = "https://relay.example.com/v1",
         api: String = "openai-completions",
-        modelIds: List<String> = listOf("deepseek-chat"),
+        models: List<RelayModel> = listOf(RelayModel("deepseek-chat")),
         keyConfigured: Boolean = true,
-    ) = RelayEntry(providerId, baseUrl, api, modelIds, keyConfigured)
+    ) = RelayEntry(providerId, baseUrl, api, models, keyConfigured)
 
     // ── h01 整个 Section 在树上，且位置在「模型接入」之后（§3.2 第一条）──────────────
 
@@ -622,7 +623,7 @@ class SettingsScreenTest {
 
         assertEquals(
             "五个入参原样进 source（key 非空 → 覆盖语义）",
-            listOf(FakeRelayEndpointSource.Save("my-relay", "https://relay.example.com/v1", "openai-completions", listOf("deepseek-chat"), "sk-relay-live")),
+            listOf(FakeRelayEndpointSource.Save("my-relay", "https://relay.example.com/v1", "openai-completions", listOf(RelayModel("deepseek-chat")), "sk-relay-live")),
             rig.relays.saves,
         )
         composeRule.onNodeWithTag(SettingsTags.relayRow("my-relay")).assertIsDisplayed()
@@ -683,7 +684,7 @@ class SettingsScreenTest {
     @Test
     fun `h05 setting the default pins it and lights up the badge`() {
         val rig = rig(relays = FakeRelayEndpointSource(initial = listOf(
-            relayRow(providerId = "relay-a", modelIds = listOf("m-first", "m-second")),
+            relayRow(providerId = "relay-a", models = listOf(RelayModel("m-first"), RelayModel("m-second"))),
             relayRow(providerId = "relay-b"),
         )))
 
@@ -742,7 +743,7 @@ class SettingsScreenTest {
         composeRule.onNodeWithTag(SettingsTags.RELAY_SAVE).assertIsNotEnabled()
 
         // 绕过 UI 直调：第二道门同样拦得住，而且一次 source 调用都不发
-        rig.vm.saveRelay("  ", "https://relay.example.com/v1", "openai-completions", listOf("m1"), "sk-x")
+        rig.vm.saveRelay("  ", "https://relay.example.com/v1", "openai-completions", listOf(RelayModel("m1")), "sk-x")
         pump()
 
         assertEquals(emptyList<FakeRelayEndpointSource.Save>(), rig.relays.saves)
@@ -777,8 +778,8 @@ class SettingsScreenTest {
 
         assertEquals(
             "trim + 去空 + 去重，且全角逗号同样算分隔符",
-            listOf("deepseek-chat", "gpt-4o"),
-            rig.relays.saves.single().modelIds,
+            listOf(RelayModel("deepseek-chat"), RelayModel("gpt-4o")),
+            rig.relays.saves.single().models,
         )
         composeRule.onNodeWithText("2 个模型", substring = true).assertIsDisplayed()
     }
@@ -826,7 +827,7 @@ class SettingsScreenTest {
         val longUrl = "https://very-long-relay-provider-name.example.com/api/openai/v1"
         rig(
             relays = FakeRelayEndpointSource(
-                initial = listOf(relayRow(providerId = "my-relay", baseUrl = longUrl, modelIds = listOf("a", "b", "c"))),
+                initial = listOf(relayRow(providerId = "my-relay", baseUrl = longUrl, models = listOf(RelayModel("a"), RelayModel("b"), RelayModel("c")))),
             ),
         )
 
@@ -846,7 +847,7 @@ class SettingsScreenTest {
 
     @Test
     fun `h12 a row without model ids cannot be pinned as default`() {
-        val rig = rig(relays = FakeRelayEndpointSource(initial = listOf(relayRow(modelIds = emptyList()))))
+        val rig = rig(relays = FakeRelayEndpointSource(initial = listOf(relayRow(models = emptyList()))))
 
         composeRule.onNodeWithTag(SettingsTags.relaySetDefault("my-relay")).assertIsNotEnabled()
         rig.vm.setRelayDefault("my-relay", "")
@@ -871,6 +872,77 @@ class SettingsScreenTest {
         assertRelayKeyValue("sk-relay-live")
         assertKeyNotEchoed("sk-relay-live")
         composeRule.onNodeWithTag(SettingsTags.RELAY_EMPTY).assertIsDisplayed()
+    }
+
+
+    // ══ P3B-FIX1 §3.2：`*` 语法与编辑回填（h14–h15）════════════════════════════════
+    //
+    // 这两支是本轮的**用户可见面**：h14 演「带 `*` 存的、点开还带 `*`、再存旗还在」这条闭环，
+    // h15 演「语法写在屏幕上」（用户不会去读代码，`*` 只有写在 supportingText 上才可能被发现）。
+
+    // ── h14 编辑回填：磁盘上的思考旗回到输入框，再保存出去还在 ──────────────────────
+
+    @Test
+    fun `h14 editing a row brings the star back and saving keeps the reasoning flag`() {
+        val stored = listOf(RelayModel("deepseek-chat"), RelayModel("deepseek-reasoner", true))
+        val rig = rig(relays = FakeRelayEndpointSource(initial = listOf(relayRow(models = stored))))
+
+        composeRule.onNodeWithTag(SettingsTags.relayEdit("my-relay")).assertIsDisplayed()
+        composeRule.onNodeWithTag(SettingsTags.relayEdit("my-relay")).performClick()
+        pump()
+
+        assertEquals(
+            "四个框的此刻值：模型框里必须还看得见那个星号，密钥框仍是空的（§2 红线）",
+            listOf("my-relay", "https://relay.example.com/v1", "deepseek-chat,deepseek-reasoner*", ""),
+            relayFormValues(),
+        )
+        assertEquals("api 选择器也跟着这一行走", "openai-completions", rig.vm.relayDraft.value.api)
+
+        composeRule.onNodeWithTag(SettingsTags.RELAY_SAVE).performClick()
+        pump()
+
+        assertEquals(
+            "回填 → 保存 的闭环：source 收到的还是那两条、旗还在；留空的密钥换算成 null",
+            listOf(FakeRelayEndpointSource.Save("my-relay", "https://relay.example.com/v1", "openai-completions", stored, null)),
+            rig.relays.saves,
+        )
+        assertEquals("列表行仍是那一条（编辑不是新增第二行）", listOf("my-relay"), rig.vm.relays.value.map { it.providerId })
+        assertEquals("保存后行上的旗仍在", stored, rig.vm.relays.value.single().models)
+    }
+
+    // ── h15 语法入口上屏：`*` 的用法写在模型框的 supportingText 上 ──────────────────
+
+    @Test
+    fun `h15 the models field spells the star syntax out on screen`() {
+        rig()
+
+        assertTrue("文案必须把星号语法说出来：${SettingsStrings.RELAY_MODELS_HINT}",
+            SettingsStrings.RELAY_MODELS_HINT.contains('*'))
+        assertTrue("并且给一个能照抄的例子", SettingsStrings.RELAY_MODELS_HINT.contains("deepseek-reasoner*"))
+        composeRule.onNodeWithText(SettingsStrings.RELAY_MODELS_HINT, substring = true).assertIsDisplayed()
+        // 例子必须**在屏幕上看得见**，不能只活在文档里。这里扫的是全树可见文本（`Text` 语义），
+        // 命中的是 supportingText 那一条——placeholder 是否进语义与本用例无关（下面 h15b 单独问）。
+        assertTrue(
+            "空表单时这串例子就该出现在可见文本里",
+            displayTexts().any { it.contains("deepseek-reasoner*") },
+        )
+    }
+
+    // ── h15b 占位符与说明共用同一串例子（改一处漏一处的防线）──────────────────────
+
+    @Test
+    fun `h15b the placeholder and the hint carry the very same example`() {
+        // placeholder 是 Text 字面量、这版 Compose 没把它挂进语义树（javap 实证：SemanticsProperties 无 Placeholder 键），
+        // 所以不去屏幕上找它，而是钉**真相只有一个**：placeholder 与 supportingText 都由
+        // SettingsStrings.RELAY_MODELS_EXAMPLE 供给，屏幕上看见的说明必然含那串例子。
+        assertTrue("例子本身就带星号", SettingsStrings.RELAY_MODELS_EXAMPLE.contains('*'))
+        assertTrue("说明里必须原文出现这串例子：${SettingsStrings.RELAY_MODELS_HINT}",
+            SettingsStrings.RELAY_MODELS_HINT.contains(SettingsStrings.RELAY_MODELS_EXAMPLE))
+
+        rig()
+        // 屏幕上真正渲染出来的那条 supportingText 就是这条说明（例子随它一起上屏）
+        composeRule.onNodeWithText(SettingsStrings.RELAY_MODELS_HINT, substring = true).assertIsDisplayed()
+        composeRule.onNodeWithTag(SettingsTags.RELAY_MODELS_FIELD).assertIsDisplayed()
     }
 
     // ══ P3A §3.5 诊断 section ════════════════════════════════════════════════════

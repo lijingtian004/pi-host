@@ -17,6 +17,7 @@ import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
+import works.earendil.pihost.core.engine.settings.RelayModel
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.PiEvent
@@ -305,6 +306,30 @@ class SettingsViewModel @Inject constructor(
     }
 
     /**
+     * 把一条已存中转**播种**回表单（P3B-FIX1 §3.2 第 2 条「编辑回填」）。
+     *
+     * 为什么必须有这一个口：中转的模型清单是可以手改文件的（§3.1 那条「app 不比 pi 严」），
+     * 而思考旗只有一个字的差别（`a` 与 `a*`）。如果编辑时不回填、或回填时丢掉尾缀，
+     * 用户在屏幕上看到「一切照旧」，点一次保存却把 `reasoning` 写没了——
+     * 那就是把本轮修的那个 bug 从「读盘侧缺省 false」搬到「编辑侧丢字段」。
+     * 往返无损由 [relayModelsToText] 与 [parseRelayModels] 互为逆函数保证（用例 `t35` 钉逆函数、`h14` 钉整条屏幕闭环）。
+     *
+     * 两个字段故意**不**回填：
+     * - [RelayDraft.apiKey]：§2 红线「永不回显密钥」，留空 = 沿用磁盘上已有的 key（core 侧语义）；
+     * - 行不存在的 providerId：静默不播种，比弹一条「找不到」更诚实——列表就是真相，按钮就在行上。
+     */
+    fun editRelay(providerId: String) {
+        val entry = _relays.value.firstOrNull { it.providerId == providerId } ?: return
+        _relayDraft.value = RelayDraft(
+            providerId = entry.providerId,
+            baseUrl = entry.baseUrl,
+            models = relayModelsToText(entry.models),
+            apiKey = "",
+            api = entry.api,
+        )
+    }
+
+    /**
      * 写中转（§3.2）：成功 → 刷列表 + 清三个文本框（[RelayDraft.api] 保留）+ notice「已保存，新会话生效」；
      * 失败 → notice 说原因，草稿原样留着让人原地重试。
      *
@@ -315,7 +340,7 @@ class SettingsViewModel @Inject constructor(
      * 三道门（与凭据通路同构）：providerId 空白 → 拦；baseUrl 空白 → 拦；模型清单解析后为空 → 拦。
      * 三条都**不碰 source**（一次调用都不发），core 侧的 `require` 是第四道，防的是脚本直调。
      */
-    fun saveRelay(providerId: String, baseUrl: String, api: String, modelIds: List<String>, apiKey: String?) {
+    fun saveRelay(providerId: String, baseUrl: String, api: String, models: List<RelayModel>, apiKey: String?) {
         if (providerId.isBlank()) {
             _notice.value = SettingsStrings.RELAY_BLANK_ID
             return
@@ -324,14 +349,14 @@ class SettingsViewModel @Inject constructor(
             _notice.value = SettingsStrings.RELAY_BLANK_URL
             return
         }
-        if (modelIds.isEmpty()) {
+        if (models.isEmpty()) {
             _notice.value = SettingsStrings.RELAY_BLANK_MODELS
             return
         }
         val key = apiKey?.trim()?.takeIf { it.isNotEmpty() }
         viewModelScope.launch {
             val outcome = runCatching {
-                relayStore.save(providerId.trim(), baseUrl.trim(), api, modelIds, key)
+                relayStore.save(providerId.trim(), baseUrl.trim(), api, models, key)
                 relayStore.snapshot() to relayStore.defaultProvider()
             }
             outcome.fold(

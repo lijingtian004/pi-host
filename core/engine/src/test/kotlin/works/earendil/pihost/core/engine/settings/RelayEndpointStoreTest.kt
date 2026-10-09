@@ -22,11 +22,17 @@ import works.earendil.pihost.core.engine.settings.RelayEndpointStore.Companion.R
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.Companion.SETTINGS_FILE_NAME
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.Companion.SETTINGS_TMP_PREFIX
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
+import works.earendil.pihost.core.engine.settings.RelayModel
 
 /**
  * `RelayEndpointStore`：规格书 §3.1 点名的 ①–⑫ 逐条覆盖（①→01、②→03、③→04、④→05/06、⑤→07、⑥→10、
  * ⑦→12/13/31、⑧→14、⑨→15/16、⑩→18/19、⑪→20/26、⑫→21/22），另加 02/08/09/11/17/23/24/25/27/28/29/30
  * 把两条失败路径、`$ENV_NAME` 原样落盘、默认钉选读口与五项 api 清单钉住（门槛 ≥12）。
+ *
+ * **P3B-FIX1 §3.1 第 6 条新增 32–37**（思考旗那一面，六条）：32 落盘形状（true 写、false 省略）、
+ * 33 write→read 往返 + 手写 `reasoning:true` 读回、34 只认真 `true`（false/字符串/数字/null/对象全 false）、
+ * 35 清洗的同 id **取或**、36 全空白 id 清洗后抛且不动文件、37 clear/setDefault 与新字段互不影响。
+ * 30 与 ⑥ 两支旧用例按新签名适配后**语义未变**（trim/去空/去重、空清单非法）。
  *
  * 纯 JVM：所有读写都落在 [TemporaryFolder] 派生目录里，**绝不碰设备路径常量**（P2F §7.1 的同一课）。
  * 断言一律对**文件原文**或**解析后的结构**下手，不用 store 自己的读函数当唯一真相
@@ -75,9 +81,9 @@ class RelayEndpointStoreTest {
         providerId: String = "my-relay",
         baseUrl: String = "http://127.0.0.1:18080/v1",
         api: String = "openai-completions",
-        modelIds: List<String> = listOf("test-relay-model"),
+        models: List<RelayModel> = listOf(RelayModel("test-relay-model")),
         apiKey: String? = "sk-relay-test-123",
-    ) = store.save(providerId, baseUrl, api, modelIds, apiKey)
+    ) = store.save(providerId, baseUrl, api, models, apiKey)
 
     /** agent 目录里的文件名（排序后），用来断言「没有 tmp 残骸」「只写了该写的那张表」。 */
     private fun agentFileNames(): List<String> = agentDir().listFiles()!!.map { it.name }.sorted()
@@ -119,20 +125,20 @@ class RelayEndpointStoreTest {
     fun `03 two relays coexist after two saves`() {
         newStore()
 
-        saveRelay(providerId = "relay-a", baseUrl = "https://a.example.com/v1", modelIds = listOf("m-a"))
+        saveRelay(providerId = "relay-a", baseUrl = "https://a.example.com/v1", models = listOf(RelayModel("m-a")))
         saveRelay(
             providerId = "relay-b",
             baseUrl = "https://b.example.com/v1",
             api = "anthropic-messages",
-            modelIds = listOf("m-b1", "m-b2"),
+            models = listOf(RelayModel("m-b1"), RelayModel("m-b2")),
         )
 
         assertEquals(setOf("relay-a", "relay-b"), providersTree().keys)
         assertEquals(
             "读表顺序 = 文件里的插入序（UI 列表要稳定）",
             listOf(
-                RelayEntry("relay-a", "https://a.example.com/v1", "openai-completions", listOf("m-a"), true),
-                RelayEntry("relay-b", "https://b.example.com/v1", "anthropic-messages", listOf("m-b1", "m-b2"), true),
+                RelayEntry("relay-a", "https://a.example.com/v1", "openai-completions", listOf(RelayModel("m-a")), true),
+                RelayEntry("relay-b", "https://b.example.com/v1", "anthropic-messages", listOf(RelayModel("m-b1"), RelayModel("m-b2")), true),
             ),
             store.readRelays(),
         )
@@ -143,9 +149,9 @@ class RelayEndpointStoreTest {
     @Test
     fun `04 re-saving the same id updates the entry and adds no second one`() {
         newStore()
-        saveRelay(baseUrl = "https://old.example.com/v1", modelIds = listOf("old-model"))
+        saveRelay(baseUrl = "https://old.example.com/v1", models = listOf(RelayModel("old-model")))
 
-        saveRelay(baseUrl = "https://new.example.com/v1", modelIds = listOf("new-model", "second"))
+        saveRelay(baseUrl = "https://new.example.com/v1", models = listOf(RelayModel("new-model"), RelayModel("second")))
 
         assertEquals(setOf("my-relay"), providersTree().keys)
         assertEquals(1, store.readRelays().size)
@@ -163,11 +169,11 @@ class RelayEndpointStoreTest {
         newStore()
         saveRelay(apiKey = "sk-keep-me")
 
-        saveRelay(baseUrl = "https://moved.example.com/v1", modelIds = listOf("other-model"), apiKey = null)
+        saveRelay(baseUrl = "https://moved.example.com/v1", models = listOf(RelayModel("other-model")), apiKey = null)
 
         assertEquals("sk-keep-me", entryTree("my-relay").getValue("apiKey").jsonPrimitive.content)
         assertEquals(
-            listOf(RelayEntry("my-relay", "https://moved.example.com/v1", DEFAULT_API, listOf("other-model"), keyConfigured = true)),
+            listOf(RelayEntry("my-relay", "https://moved.example.com/v1", DEFAULT_API, listOf(RelayModel("other-model")), keyConfigured = true)),
             store.readRelays(),
         )
     }
@@ -222,19 +228,19 @@ class RelayEndpointStoreTest {
         assertEquals("\$RELAY_TOKEN", entryTree("my-relay").getValue("apiKey").jsonPrimitive.content)
         // 读口只报状态：引用串本身也不作为返回值的一部分
         assertEquals(
-            listOf(RelayEntry("my-relay", "http://127.0.0.1:18080/v1", DEFAULT_API, listOf("test-relay-model"), true)),
+            listOf(RelayEntry("my-relay", "http://127.0.0.1:18080/v1", DEFAULT_API, listOf(RelayModel("test-relay-model")), true)),
             store.readRelays(),
         )
     }
 
-    // ── ⑥ modelIds 空列表非法 ─────────────────────────────────────────────────────
+    // ── ⑥ models 空列表非法 ───────────────────────────────────────────────────────
 
     @Test
     fun `10 empty model list is rejected without touching the file`() {
         newStore()
 
         assertIsIAE("空列表") { store.save("my-relay", "https://x.example.com/v1", DEFAULT_API, emptyList(), "sk-x") }
-        assertIsIAE("全是空白项") { store.save("my-relay", "https://x.example.com/v1", DEFAULT_API, listOf("", "  "), "sk-x") }
+        assertIsIAE("全是空白项") { store.save("my-relay", "https://x.example.com/v1", DEFAULT_API, listOf(RelayModel(""), RelayModel("  ")), "sk-x") }
         assertFalse("任何一次拒绝都不该留下 models.json", store.modelsFile.exists())
     }
 
@@ -244,12 +250,12 @@ class RelayEndpointStoreTest {
         newStore()
 
         for (id in listOf("", "  ")) {
-            assertIsIAE("blank providerId（<$id>）") { store.save(id, "https://x/v1", DEFAULT_API, listOf("m"), "sk-x") }
+            assertIsIAE("blank providerId（<$id>）") { store.save(id, "https://x/v1", DEFAULT_API, listOf(RelayModel("m")), "sk-x") }
             assertIsIAE("blank providerId（<$id>）的 clear") { store.clear(id) }
             assertIsIAE("blank providerId（<$id>）的 setDefault") { store.setDefault(id, "m") }
         }
-        assertIsIAE("blank baseUrl") { store.save("my-relay", " ", DEFAULT_API, listOf("m"), "sk-x") }
-        assertIsIAE("blank api") { store.save("my-relay", "https://x/v1", "", listOf("m"), "sk-x") }
+        assertIsIAE("blank baseUrl") { store.save("my-relay", " ", DEFAULT_API, listOf(RelayModel("m")), "sk-x") }
+        assertIsIAE("blank api") { store.save("my-relay", "https://x/v1", "", listOf(RelayModel("m")), "sk-x") }
         assertIsIAE("blank modelId 的 setDefault") { store.setDefault("my-relay", " ") }
         assertFalse(store.modelsFile.exists())
         assertFalse(store.settingsFile.exists())
@@ -303,9 +309,9 @@ class RelayEndpointStoreTest {
         assertEquals(
             "对象条目按文件顺序进表；缺 api 补默认、缺 key 与空白 key 都算未配置；非对象值不进表",
             listOf(
-                RelayEntry("good", "https://g.example.com/v1", "openai-completions", listOf("g1", "g2"), true),
-                RelayEntry("nokey", "https://n.example.com/v1", DEFAULT_API, listOf("n1"), false),
-                RelayEntry("blankkey", "https://b.example.com/v1", DEFAULT_API, listOf("b1"), false),
+                RelayEntry("good", "https://g.example.com/v1", "openai-completions", listOf(RelayModel("g1"), RelayModel("g2")), true),
+                RelayEntry("nokey", "https://n.example.com/v1", DEFAULT_API, listOf(RelayModel("n1")), false),
+                RelayEntry("blankkey", "https://b.example.com/v1", DEFAULT_API, listOf(RelayModel("b1")), false),
             ),
             rows,
         )
@@ -438,7 +444,7 @@ class RelayEndpointStoreTest {
             """{"providers":{"my-relay":{"headers":{"X-Via":"relay"},"apiKey":"sk-old","baseUrl":"https://old.example.com/v1","api":"openai-completions","models":[{"id":"old"}]}}}""",
         )
 
-        saveRelay(baseUrl = "https://new.example.com/v1", modelIds = listOf("new"), apiKey = null)
+        saveRelay(baseUrl = "https://new.example.com/v1", models = listOf(RelayModel("new")), apiKey = null)
 
         val entry = entryTree("my-relay")
         assertEquals("unmanaged 字段留住，managed 四项被重写", setOf("headers", "baseUrl", "api", "apiKey", "models"), entry.keys)
@@ -455,7 +461,7 @@ class RelayEndpointStoreTest {
         assertFalse(home.exists())
 
         val s = RelayEndpointStore(home)
-        s.save("my-relay", "https://r.example.com/v1", DEFAULT_API, listOf("m"), "sk-x")
+        s.save("my-relay", "https://r.example.com/v1", DEFAULT_API, listOf(RelayModel("m")), "sk-x")
         s.setDefault("my-relay", "m")
 
         assertTrue(home.isDirectory)
@@ -476,7 +482,7 @@ class RelayEndpointStoreTest {
         File(blockedHome, ".pi").writeText("我不是目录")
 
         val s = RelayEndpointStore(blockedHome)
-        val boom = runCatching { s.save("my-relay", "https://r.example.com/v1", DEFAULT_API, listOf("m"), "sk-x") }.exceptionOrNull()
+        val boom = runCatching { s.save("my-relay", "https://r.example.com/v1", DEFAULT_API, listOf(RelayModel("m")), "sk-x") }.exceptionOrNull()
         assertTrue("期望 IOException，实际 $boom", boom is IOException)
         assertTrue("消息要点出建不成的目录", requireNotNull(boom).message!!.contains(File(blockedHome, ".pi").path))
         assertFalse(s.modelsFile.exists())
@@ -564,14 +570,23 @@ class RelayEndpointStoreTest {
     fun `30 model ids are trimmed, blanks dropped and duplicates collapsed`() {
         newStore()
 
-        saveRelay(modelIds = listOf(" gpt-4o ", "", "  ", "deepseek-chat", "gpt-4o"))
+        saveRelay(
+            models = listOf(
+                RelayModel(" gpt-4o "),
+                RelayModel(""),
+                RelayModel("  "),
+                RelayModel("deepseek-chat"),
+                RelayModel("gpt-4o"),
+            ),
+        )
 
         val written = entryTree("my-relay").getValue("models") as JsonArray
         assertEquals(
             listOf("gpt-4o", "deepseek-chat"),
             written.map { it.jsonObject.getValue("id").jsonPrimitive.content },
         )
-        assertEquals(listOf("gpt-4o", "deepseek-chat"), store.readRelays().single().modelIds)
+        assertEquals("没标思考的项一个 reasoning 字段都不写", listOf(false, false), written.map { (it.jsonObject).containsKey("reasoning") })
+        assertEquals(listOf(RelayModel("gpt-4o"), RelayModel("deepseek-chat")), store.readRelays().single().models)
     }
 
     /** 空文件 / 顶层是数组的 settings.json：setDefault 覆盖成合法对象（⑦ 对两张表都成立）。 */
@@ -585,5 +600,166 @@ class RelayEndpointStoreTest {
         seedSettings("[1,2,3]")
         store.setDefault("relay-b", "m2")
         assertEquals("""{"defaultProvider":"relay-b","defaultModel":"m2"}""", store.settingsFile.readText())
+    }
+
+    // ── P3B-FIX1 §3.1 第 6 条：reasoning 面（本轮的唯一新增语义）────────────────────
+
+    /**
+     * 落盘形状：true 的项写 `"reasoning":true`，false 的项**一个字节都不多**。
+     *
+     * 这是本轮的**主用例**：用户报的「思考无法调整」就是这里少写那个字段造成的
+     * （pi `provider-composer.ts:231` 的 `?? false` → `getSupportedThinkingLevels` 只剩 `["off"]`）。
+     * 逐字比原文，不比解析结果——「字段有没有写出去」这件事只有磁盘上的字节能作证。
+     */
+    @Test
+    fun `32 save writes reasoning true only on the flagged models`() {
+        newStore()
+
+        saveRelay(
+            models = listOf(
+                RelayModel("deepseek-chat", false),
+                RelayModel("deepseek-reasoner", true),
+                RelayModel("gpt-4o"),
+            ),
+        )
+
+        assertEquals(
+            "§3.1 形状：true 项带字段、false 项省略（顺序按传入顺序）",
+            """{"providers":{"my-relay":{"baseUrl":"http://127.0.0.1:18080/v1","api":"openai-completions","apiKey":"sk-relay-test-123","models":[{"id":"deepseek-chat"},{"id":"deepseek-reasoner","reasoning":true},{"id":"gpt-4o"}]}}}""",
+            store.modelsFile.readText(),
+        )
+        val written = entryTree("my-relay").getValue("models") as JsonArray
+        assertEquals(
+            "只有第二项有 reasoning 这个键",
+            listOf(false, true, false),
+            written.map { (it as JsonObject).containsKey("reasoning") },
+        )
+    }
+
+    /**
+     * write → read 往返：app 自己写的读得回来（含 true），**手写的** `reasoning:true` 同样读得回来。
+     *
+     * 后半段才是重点：用户可以直接编辑 models.json（§3.1「app 不比 pi 严」那条纪律），
+     * 读口认不出手写的 true，就等于「文件里明明有、UI 里调不动」——同一个 bug 换一层皮。
+     */
+    @Test
+    fun `33 reasoning round-trips through save and reads a hand written true`() {
+        newStore()
+        saveRelay(models = listOf(RelayModel("plain"), RelayModel("thinker", true)))
+
+        assertEquals(
+            "写出去的思考旗原样读回",
+            listOf(RelayModel("plain", false), RelayModel("thinker", true)),
+            store.readRelays().single().models,
+        )
+
+        newStore(File(tmpFolder.root, "home-handwritten"))
+        seedModels(
+            """{"providers":{"hand":{"baseUrl":"https://h.example.com/v1","api":"openai-completions","models":[{"id":"a"},{"id":"b","reasoning":true}]}}}""",
+        )
+
+        assertEquals(
+            "手写的 reasoning:true 也认（读口不比 pi 严，也不许丢字段）",
+            listOf(RelayModel("a", false), RelayModel("b", true)),
+            store.readRelays().single().models,
+        )
+    }
+
+    /**
+     * **只认真 `true`**：缺字段、写 false、写 `"true"` 字符串、写 1、写 null、写对象 → 一律 false。
+     *
+     * 从严的理由见 `modelEntries` 的 KDoc：true 是「往上游请求里加 reasoning 参数」那一侧，
+     * 把非布尔值猜成 true 会让 app 发出 pi 自己都不会发的请求。
+     */
+    @Test
+    fun `34 only a real json true counts as reasoning`() {
+        newStore()
+        seedModels(
+            """{"providers":{"odd":{"baseUrl":"https://o.example.com/v1","models":["bare",""" +
+                """{"id":"f","reasoning":false},{"id":"s","reasoning":"true"},{"id":"n","reasoning":1},""" +
+                """{"id":"z","reasoning":null},{"id":"j","reasoning":{"deep":true}},{"id":"t","reasoning":true}]}}}""",
+        )
+
+        assertEquals(
+            listOf(
+                RelayModel("bare", false),
+                RelayModel("f", false),
+                RelayModel("s", false),
+                RelayModel("n", false),
+                RelayModel("z", false),
+                RelayModel("j", false),
+                RelayModel("t", true),
+            ),
+            store.readRelays().single().models,
+        )
+    }
+
+    /** 清洗的第二道门（§3.1 第 5 条）：同 id 混 reasoning → **取或**；trim、去空、按 id 去重照旧。 */
+    @Test
+    fun `35 cleaning merges the same id with OR and keeps first-seen order`() {
+        newStore()
+
+        saveRelay(
+            models = listOf(
+                RelayModel(" gpt-4o ", false),
+                RelayModel("deepseek-chat", false),
+                RelayModel("gpt-4o", true),
+                RelayModel("  ", false),
+                RelayModel("deepseek-chat", false),
+            ),
+        )
+
+        val written = entryTree("my-relay").getValue("models") as JsonArray
+        assertEquals(
+            "gpt-4o 因任一条 true 而 true、deepseek-chat 两条都 false 保持 false、空白项没了（顺序 = 首次出现）",
+            listOf("gpt-4o", "deepseek-chat"),
+            written.map { it.jsonObject.getValue("id").jsonPrimitive.content },
+        )
+        assertEquals(
+            "只有该写的才写得出这个键",
+            listOf(true, false),
+            written.map { it.jsonObject.containsKey("reasoning") },
+        )
+        assertEquals(
+            "写出去的值是真布尔 true（不是字符串、不是 1）",
+            listOf("true"),
+            written.mapNotNull { it.jsonObject["reasoning"]?.jsonPrimitive?.content },
+        )
+        assertEquals(
+            listOf(RelayModel("gpt-4o", true), RelayModel("deepseek-chat", false)),
+            store.readRelays().single().models,
+        )
+    }
+
+    /**
+     * 空白 id 清洗后为空 → 抛（这条从 ⑥ 迁到带旗的形状上）：**先判空表再清洗**的顺序不变，
+     * 而且抛之前一个字节都不写。
+     */
+    @Test
+    fun `36 a list of blank ids is rejected after cleaning without touching the file`() {
+        newStore()
+
+        assertIsIAE("全空白 id") {
+            store.save("my-relay", "https://x.example.com/v1", DEFAULT_API, listOf(RelayModel("   "), RelayModel("")), "sk-x")
+        }
+        assertFalse(store.modelsFile.exists())
+    }
+
+    /** delete/setDefault 不受本轮签名变更影响（§3.1 第 6 条要求「旧用例原样绿」，这里再钉一次形状）。 */
+    @Test
+    fun `37 clear and setDefault are untouched by the reasoning field`() {
+        newStore()
+        saveRelay(models = listOf(RelayModel("thinker", true), RelayModel("plain")))
+        store.setDefault("my-relay", "thinker")
+        assertEquals(
+            """{"defaultProvider":"my-relay","defaultModel":"thinker"}""",
+            store.settingsFile.readText(),
+        )
+
+        store.clear("my-relay")
+
+        assertEquals("""{"providers":{}}""", store.modelsFile.readText())
+        assertNull("默认指针跟着清掉（⑩ 条语义与 reasoning 无关）", store.readDefaultProvider())
+        assertEquals("""{}""", store.settingsFile.readText())
     }
 }

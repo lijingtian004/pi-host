@@ -21,6 +21,7 @@ import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
+import works.earendil.pihost.core.engine.settings.RelayModel
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.RpcCommand
@@ -463,8 +464,8 @@ class SettingsViewModelTest {
 
     // ── t18…t25 自定义中转（P2H §3.2 的 VM 面）─────────────────────────────────────
 
-    private fun relay(providerId: String = "my-relay", modelIds: List<String> = listOf("deepseek-chat")) =
-        RelayEntry(providerId, "https://relay.example.com/v1", "openai-completions", modelIds, true)
+    private fun relay(providerId: String = "my-relay", models: List<RelayModel> = listOf(RelayModel("deepseek-chat"))) =
+        RelayEntry(providerId, "https://relay.example.com/v1", "openai-completions", models, true)
 
     @Test
     fun `t18 entering the screen reads both the relay rows and the default pointer`() = runTest {
@@ -484,7 +485,7 @@ class SettingsViewModelTest {
             it.copy(providerId = "my-relay", baseUrl = "https://relay.example.com/v1", models = "deepseek-chat", apiKey = "sk-x", api = "pi-messages")
         }
 
-        rig.vm.saveRelay("my-relay", "https://relay.example.com/v1", "pi-messages", listOf("deepseek-chat"), "sk-x")
+        rig.vm.saveRelay("my-relay", "https://relay.example.com/v1", "pi-messages", listOf(RelayModel("deepseek-chat")), "sk-x")
         runCurrent()
 
         assertEquals(listOf("my-relay"), rig.vm.relays.value.map { it.providerId })
@@ -500,7 +501,7 @@ class SettingsViewModelTest {
         val rig = rig(relays = relays)
 
         for (blank in listOf(null, "", "   ", "\t")) {
-            rig.vm.saveRelay("my-relay", "https://new.example.com/v1", "openai-completions", listOf("gpt-4o"), blank)
+            rig.vm.saveRelay("my-relay", "https://new.example.com/v1", "openai-completions", listOf(RelayModel("gpt-4o")), blank)
             runCurrent()
         }
 
@@ -515,11 +516,11 @@ class SettingsViewModelTest {
         val relays = FakeRelayEndpointSource()
         val rig = rig(relays = relays)
 
-        rig.vm.saveRelay("", "https://r.example.com/v1", "openai-completions", listOf("m1"), "sk-x")
+        rig.vm.saveRelay("", "https://r.example.com/v1", "openai-completions", listOf(RelayModel("m1")), "sk-x")
         runCurrent()
         assertEquals(SettingsStrings.RELAY_BLANK_ID, rig.vm.notice.value)
 
-        rig.vm.saveRelay("my-relay", "   ", "openai-completions", listOf("m1"), "sk-x")
+        rig.vm.saveRelay("my-relay", "   ", "openai-completions", listOf(RelayModel("m1")), "sk-x")
         runCurrent()
         assertEquals(SettingsStrings.RELAY_BLANK_URL, rig.vm.notice.value)
 
@@ -577,7 +578,7 @@ class SettingsViewModelTest {
         val dirty = object : RelayEndpointSource {
             override suspend fun snapshot(): List<RelayEntry> = listOf(relay("still-here"))
             override suspend fun defaultProvider(): String? = "ghost-relay"
-            override suspend fun save(providerId: String, baseUrl: String, api: String, modelIds: List<String>, apiKey: String?) = Unit
+            override suspend fun save(providerId: String, baseUrl: String, api: String, models: List<RelayModel>, apiKey: String?) = Unit
             override suspend fun clear(providerId: String) = Unit
             override suspend fun setDefault(providerId: String, modelId: String) = Unit
         }
@@ -595,7 +596,7 @@ class SettingsViewModelTest {
         val rig = rig(relays = relays)
         rig.vm.onRelayDraftChange { it.copy(providerId = "my-relay", baseUrl = "https://r.example.com/v1", models = "m1", apiKey = "sk-x") }
 
-        rig.vm.saveRelay("my-relay", "https://r.example.com/v1", "openai-completions", listOf("m1"), "sk-x")
+        rig.vm.saveRelay("my-relay", "https://r.example.com/v1", "openai-completions", listOf(RelayModel("m1")), "sk-x")
         runCurrent()
 
         val notice = rig.vm.notice.value!!
@@ -612,14 +613,116 @@ class SettingsViewModelTest {
         assertTrue(rig.vm.notice.value!!.contains("磁盘满"))
     }
 
+    /** 旧那支 `parseModelIds` 的六条断言**一字不改**搬到新签名上（P2H 的逗号语义是回归面，不是新增面）。 */
     @Test
-    fun `t26 parseModelIds folds commas spaces blanks and duplicates`() {
-        assertEquals(listOf("a", "b"), parseModelIds("a, b"))
-        assertEquals(listOf("a", "b"), parseModelIds("a，b"))
-        assertEquals(listOf("a"), parseModelIds("  a ,,  ，a "))
-        assertEquals(emptyList<String>(), parseModelIds(""))
-        assertEquals(emptyList<String>(), parseModelIds(" , ， "))
-        assertEquals(listOf("deepseek-chat"), parseModelIds("deepseek-chat"))
+    fun `t26 parseRelayModels folds commas spaces blanks and duplicates`() {
+        assertEquals(listOf(RelayModel("a"), RelayModel("b")), parseRelayModels("a, b"))
+        assertEquals(listOf(RelayModel("a"), RelayModel("b")), parseRelayModels("a，b"))
+        assertEquals(listOf(RelayModel("a")), parseRelayModels("  a ,,  ，a "))
+        assertEquals(emptyList<RelayModel>(), parseRelayModels(""))
+        assertEquals(emptyList<RelayModel>(), parseRelayModels(" , ， "))
+        assertEquals(listOf(RelayModel("deepseek-chat")), parseRelayModels("deepseek-chat"))
+    }
+
+    // ── t33…t36 P3B-FIX1 §3.2：`*` 语法、逆函数、编辑回填 ─────────────────────────
+
+    /** §3.2 第 1 条的语法面：尾缀 `*` = 思考模型；`a**` 合法；只认半角 `*`；后缀在 trim 之后判定。 */
+    @Test
+    fun `t33 the star suffix marks a reasoning model and tolerates repeats and padding`() {
+        assertEquals(
+            "规格书原文那一串：三个模型、后两个带思考档",
+            listOf(RelayModel("deepseek-chat", false), RelayModel("deepseek-reasoner", true), RelayModel("gpt-5", true)),
+            parseRelayModels("deepseek-chat,deepseek-reasoner*,gpt-5*"),
+        )
+        assertEquals("a** 合法，等价于 a*", listOf(RelayModel("a", true)), parseRelayModels("a**"))
+        assertEquals("空格在后缀外面也要认", listOf(RelayModel("a", true)), parseRelayModels(" a* "))
+        assertEquals("全角逗号 + 全角星号：星号不是语法，id 原样留着", listOf(RelayModel("a＊")), parseRelayModels("a＊"))
+        assertEquals("星号在中间不算后缀", listOf(RelayModel("a*b")), parseRelayModels("a*b"))
+        assertEquals("光一个星号没有 id → 丢掉", emptyList<RelayModel>(), parseRelayModels("*"))
+        assertEquals("裸星号与空白混在一起也只剩无效项", emptyList<RelayModel>(), parseRelayModels("*, ,* *"))
+    }
+
+    /** §3.2 第 1 条的第二道门语义：同 id 混后缀 → reasoning **取或**（顺序 = 首次出现）。 */
+    @Test
+    fun `t34 duplicate ids merge with OR instead of letting false swallow true`() {
+        assertEquals(
+            "先 false 后 true 也要是 true",
+            listOf(RelayModel("a", true), RelayModel("b", false)),
+            parseRelayModels("a,b,a*"),
+        )
+        assertEquals(
+            "先 true 后 false 同样要是 true",
+            listOf(RelayModel("a", true)),
+            parseRelayModels("a*,a"),
+        )
+        assertEquals("两条都 false 保持 false", listOf(RelayModel("a", false)), parseRelayModels("a,a"))
+    }
+
+    /** §3.2 第 2 条「往返无损」的函数级证据：`parse(relay(x)) == x`，且反向文本里不带空格。 */
+    @Test
+    fun `t35 the draft text and the parse are exact inverses`() {
+        val stored = listOf(RelayModel("deepseek-chat"), RelayModel("deepseek-reasoner", true), RelayModel("gpt-5", true))
+        val text = relayModelsToText(stored)
+
+        assertEquals("回填文本的写法也是定的（半角逗号、无空格）", "deepseek-chat,deepseek-reasoner*,gpt-5*", text)
+        assertEquals("解析回去必须与存进去的一字不差", stored, parseRelayModels(text))
+        assertEquals(emptyList<RelayModel>(), parseRelayModels(relayModelsToText(emptyList())))
+        assertEquals("空清单渲染成空串，不是 null 也不是空格", "", relayModelsToText(emptyList()))
+        assertEquals("单项不带思考档时不写后缀", "solo", relayModelsToText(listOf(RelayModel("solo"))))
+    }
+
+    /** §3.2 第 2 条的 VM 面：点「编辑」播种草稿——`*` 跟着回来、密钥**不**回来。 */
+    @Test
+    fun `t36 editing a relay seeds the draft with the star and never the key`() = runTest {
+        val relays = FakeRelayEndpointSource(
+            initial = listOf(
+                RelayEntry(
+                    "my-relay",
+                    "https://relay.example.com/v1",
+                    "anthropic-messages",
+                    listOf(RelayModel("deepseek-chat"), RelayModel("deepseek-reasoner", true)),
+                    keyConfigured = true,
+                ),
+            ),
+        )
+        val rig = rig(relays = relays)
+        rig.vm.onRelayDraftChange { it.copy(providerId = "别家的草稿", models = "别家的模型") }
+
+        rig.vm.editRelay("my-relay")
+
+        val draft = rig.vm.relayDraft.value
+        assertEquals("四个字段都播种回来（api 也跟上这一行的协议）", "my-relay", draft.providerId)
+        assertEquals("https://relay.example.com/v1", draft.baseUrl)
+        assertEquals(
+            "思考尾缀必须原样回填——否则下一次保存把 reasoning 写没了",
+            "deepseek-chat,deepseek-reasoner*",
+            draft.models,
+        )
+        assertEquals("anthropic-messages", draft.api)
+        assertEquals("§2 红线：密钥永不回显，草稿里是空串", "", draft.apiKey)
+        assertEquals("播种不发任何写入", emptyList<FakeRelayEndpointSource.Save>(), relays.saves)
+
+        // 播种的那份文本再解析，必须与磁盘上的那份清单相等（往返闭环，用例 t35 是它的函数级证明）
+        assertEquals(
+            "回填 → 解析 == 磁盘",
+            listOf(RelayModel("deepseek-chat"), RelayModel("deepseek-reasoner", true)),
+            parseRelayModels(draft.models),
+        )
+    }
+
+    /** 编辑一条已经不存在的行（列表刚被别处清掉）：静默不动草稿，也不发写入。 */
+    @Test
+    fun `t37 editing a vanished row leaves the draft alone`() = runTest {
+        val relays = FakeRelayEndpointSource(initial = listOf(relay()))
+        val rig = rig(relays = relays)
+        rig.vm.onRelayDraftChange { it.copy(providerId = "手填的", models = "m*") }
+
+        rig.vm.editRelay("ghost-relay")
+
+        val draft = rig.vm.relayDraft.value
+        assertEquals("列表里没有这一行 → 草稿一个字段都不许改", "手填的", draft.providerId)
+        assertEquals("m*", draft.models)
+        assertEquals(emptyList<FakeRelayEndpointSource.Save>(), relays.saves)
     }
 
     // ── P3A §3.5 诊断面（崩溃报告列表 / 清空 / 复制） ───────────────────────────

@@ -15,6 +15,7 @@ import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
+import works.earendil.pihost.core.engine.settings.RelayModel
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
@@ -237,12 +238,12 @@ class FakeRelayEndpointSource(
     initialDefault: String? = null,
 ) : RelayEndpointSource {
 
-    /** 一次写入调用（五个入参原样记下来，apiKey 可能是 null）。 */
+    /** 一次写入调用（五个入参原样记下来，apiKey 可能是 null；[models] 带思考旗，P3B-FIX1 §3.2 第 5 条）。 */
     data class Save(
         val providerId: String,
         val baseUrl: String,
         val api: String,
-        val modelIds: List<String>,
+        val models: List<RelayModel>,
         val apiKey: String?,
     )
 
@@ -272,8 +273,8 @@ class FakeRelayEndpointSource(
         return default
     }
 
-    override suspend fun save(providerId: String, baseUrl: String, api: String, modelIds: List<String>, apiKey: String?) {
-        saves.add(Save(providerId, baseUrl, api, modelIds, apiKey))
+    override suspend fun save(providerId: String, baseUrl: String, api: String, models: List<RelayModel>, apiKey: String?) {
+        saves.add(Save(providerId, baseUrl, api, models, apiKey))
         boom?.let { throw it }
         // 空白 key = 沿用已存（core 侧语义），假体同样按这个规则落 `keyConfigured`
         val keepsExistingKey = apiKey.isNullOrBlank() &&
@@ -284,7 +285,7 @@ class FakeRelayEndpointSource(
                 providerId = providerId,
                 baseUrl = baseUrl,
                 api = api,
-                modelIds = modelIds,
+                models = models,
                 keyConfigured = keepsExistingKey || !apiKey.isNullOrBlank(),
             ),
         )

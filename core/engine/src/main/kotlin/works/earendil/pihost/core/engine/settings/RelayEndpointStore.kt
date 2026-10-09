@@ -28,7 +28,14 @@ import kotlinx.serialization.json.contentOrNull
  * 于是「配了中转就默认用中转」必须落到 [setDefault] —— 否则同时有内置凭据时 pi 会选回内置默认。
  *
  * ## 形状（§1 关键机制逐条落到字段）
- * - `models.json`：`{"providers":{"<id>":{"baseUrl":…,"api":…,"apiKey":…?,"models":[{"id":…}]}}}`；
+ * - `models.json`：`{"providers":{"<id>":{"baseUrl":…,"api":…,"apiKey":…?,"models":[{"id":…,"reasoning":true?}]}}}`；
+ * - **`reasoning` 是思考档的唯一开关**（P3B-FIX1 §1 第 2/3 条）：pi 读盘是
+ *   `reasoning: definition.reasoning ?? false`（`provider-composer.ts:231`），缺省即 false，
+ *   于是 `getSupportedThinkingLevels` 只回 `["off"]`，`setThinkingLevel` 把请求档钳回 off 且**仍回 success:true**
+ *   ——「表面成功实际钳死」就是用户报的「模型思考无法调整」。写了 `"reasoning":true` 才有五档，
+ *   且请求侧才真的把 `reasoning` 参数发给中转（`model.reasoning && thinkingLevel !== "off"`）。
+ *   因此 false 的项**省略字段**（文件保持精瘦，`?? false` 与写 false 等价），true 的项**必须显式写**——
+ *   `applyModelsJson`（`:327-332`）对同名 id 是**整体替换**、不继承内置目录的 reasoning，改名也拿不到；
  * - **`baseUrl` 必填**（provider 级或 model 级）：`provider-composer.ts:289` 的链是
  *   `definition.baseUrl ?? config.baseUrl ?? 内置默认`，自定义 provider 没有内置默认，缺它 pi 直接报
  *   `"baseUrl" is required` —— 所以 [save] 把它做成 `require`，并且 UI 的提示文案要求带 `/v1` 这类路径前缀；
@@ -64,12 +71,15 @@ class RelayEndpointStore(private val homeDir: File) {
      *
      * [baseUrl] 允许上屏（不是凭据）；[keyConfigured] 只说「有没有可用 apiKey」。
      * 真值一律留在磁盘里 —— 连 `$ENV_NAME` 形态的引用串也不回显，app 不展开、也不显示它。
+     *
+     * [models] 是带思考旗的模型项（P3B-FIX1 §3.1 第 4 条）：原来的 `modelIds: List<String>`
+     * 表达不了「这个模型能调思考档」这件事，而那件事正是 pi 侧唯一的开关（见类头「形状」）。
      */
     data class RelayEntry(
         val providerId: String,
         val baseUrl: String,
         val api: String,
-        val modelIds: List<String>,
+        val models: List<RelayModel>,
         val keyConfigured: Boolean,
     )
 
@@ -81,7 +91,7 @@ class RelayEndpointStore(private val homeDir: File) {
     fun readRelays(): List<RelayEntry> =
         providersOf(AgentConfigFiles.readObject(modelsFile)).mapNotNull { (providerId, value) ->
             (value as? JsonObject)?.let {
-                RelayEntry(providerId, it.baseUrlText(), it.apiText(), it.modelIdList(), it.hasApiKey())
+                RelayEntry(providerId, it.baseUrlText(), it.apiText(), it.modelEntries(), it.hasApiKey())
             }
         }
 
@@ -101,16 +111,20 @@ class RelayEndpointStore(private val homeDir: File) {
      * 传非空 → 覆盖。原来没有 key 且这次也没给 → **不写** `apiKey` 字段（pi 侧该 provider 判为未配置，
      * 比写一条空串诚实）。值**原样落盘**：`$ENV_NAME` 形态由 pi 自己解析，app 不展开。
      *
-     * @throws IllegalArgumentException providerId/baseUrl/api 空白，或 modelIds 清洗后为空
+     * [models] 里 `reasoning=true` 的项多写一个 `"reasoning":true` 字段，false 的项**省略字段**
+     * （pi 的 `?? false` 与写 false 等价，而文件要保持精瘦——用户会直接看这份文件）。
+     * 同一 id 出现多次 → 按 id 折叠，reasoning **取或**（任一条 true → true）。
+     *
+     * @throws IllegalArgumentException providerId/baseUrl/api 空白，或 models 清洗后为空
      * @throws java.io.IOException 目录建不成（例如 `.pi` 位置被一个普通文件挡着）或原子替换失败
      */
-    fun save(providerId: String, baseUrl: String, api: String, modelIds: List<String>, apiKey: String?) {
+    fun save(providerId: String, baseUrl: String, api: String, models: List<RelayModel>, apiKey: String?) {
         require(providerId.isNotBlank()) { "providerId 不能为空" }
         require(baseUrl.isNotBlank()) { "baseUrl 不能为空：自定义 provider 没有内置默认地址，缺它 pi 报 \"baseUrl\" is required" }
         require(api.isNotBlank()) { "api 不能为空" }
-        require(modelIds.isNotEmpty()) { "modelIds 不能为空：中转至少要有一个模型 id" }
-        val cleanModelIds = modelIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-        require(cleanModelIds.isNotEmpty()) { "modelIds 清洗后为空：逗号分隔的每一项都得是模型 id" }
+        require(models.isNotEmpty()) { "models 不能为空：中转至少要有一个模型 id" }
+        val cleanModels = cleanModels(models)
+        require(cleanModels.isNotEmpty()) { "models 清洗后为空：每一项的模型 id 都是空白" }
         val target = modelsFile
         val dir = requireNotNull(target.parentFile) { "modelsFile 没有父目录：${target.path}" }
         AgentConfigFiles.ensureDirectory(dir)
@@ -126,7 +140,7 @@ class RelayEndpointStore(private val homeDir: File) {
             put(FIELD_BASE_URL, JsonPrimitive(baseUrl.trim()))
             put(FIELD_API, JsonPrimitive(api.trim()))
             resolvedKey?.let { put(FIELD_API_KEY, JsonPrimitive(it)) }
-            put(FIELD_MODELS, modelsArray(cleanModelIds))
+            put(FIELD_MODELS, modelsArray(cleanModels))
         }
         AgentConfigFiles.writeAtomic(dir, target, root.with(FIELD_PROVIDERS, providers.with(providerId, entry)))
     }
@@ -217,9 +231,36 @@ class RelayEndpointStore(private val homeDir: File) {
         this@without.forEach { (existing, existingValue) -> if (existing != key) put(existing, existingValue) }
     }
 
-    /** `models` 数组：每项一个 `{"id":"…"}`，顺序按传入顺序（[cleanModelIds] 已在 [save] 里清洗过）。 */
-    private fun modelsArray(modelIds: List<String>): JsonArray = buildJsonArray {
-        modelIds.forEach { add(buildJsonObject { put(FIELD_ID, JsonPrimitive(it)) }) }
+    /**
+     * 清洗一份模型清单：trim id、去空 id、按 id 去重——**同 id 混后缀时 reasoning 取或**
+     * （任一条 true → true）。顺序 = 首次出现的顺序，重复项不再往后插。
+     *
+     * 这一层与 `feature/settings` 的 `parseRelayModels` 是**两道同语义的门**（那份门防手滑、
+     * 这道门防脚本与手调）；两份都保留，因为绕开 UI 直调 store 是合法通路（P2H §3.1 同一决定）。
+     */
+    private fun cleanModels(models: List<RelayModel>): List<RelayModel> {
+        val merged = LinkedHashMap<String, Boolean>()
+        models.forEach { item ->
+            val id = item.id.trim()
+            if (id.isNotEmpty()) merged[id] = merged.getOrDefault(id, false) || item.reasoning
+        }
+        return merged.map { (id, reasoning) -> RelayModel(id, reasoning) }
+    }
+
+    /**
+     * `models` 数组：每项一个 `{"id":"…"}`，`reasoning=true` 的项多一个 `"reasoning":true`；
+     * false 的项**省略字段**（`provider-composer.ts:231` 的 `?? false` 让「省略」与「写 false」在 pi 侧
+     * 完全等价，而文件是用户会直接打开看的，少一个字少一份误读）。顺序按传入顺序（[cleanModels] 已在 [save] 里清洗过）。
+     */
+    private fun modelsArray(models: List<RelayModel>): JsonArray = buildJsonArray {
+        models.forEach { model ->
+            add(
+                buildJsonObject {
+                    put(FIELD_ID, JsonPrimitive(model.id))
+                    if (model.reasoning) put(FIELD_REASONING, JsonPrimitive(true))
+                },
+            )
+        }
     }
 
     private fun JsonObject.baseUrlText(): String = textOrNull(FIELD_BASE_URL).orEmpty()
@@ -230,22 +271,36 @@ class RelayEndpointStore(private val homeDir: File) {
     private fun JsonObject.hasApiKey(): Boolean = !textOrNull(FIELD_API_KEY).isNullOrBlank()
 
     /**
-     * `models` 里的模型 id：只认 `{"id":"…"}` 这种对象项（pi 的形状）。
+     * `models` 里的模型项：只认 `{"id":"…","reasoning":…}` 这种对象项（pi 的形状）。
      * 顶层不是数组、项不是对象、或 id 是空白 → 跳过该项；
      * 某项直接是字符串（`["gpt-4o"]`，pi 不收，但读的时候没必要比 pi 更严）也当 id 收下来，
      * 下一次 [save] 会把它规范成对象形态。
+     *
+     * **reasoning 只认真 `true`**（§3.1 第 4 条）：缺省、写 false、写 `"true"` 字符串、写数字 1、
+     * 写对象/数组 —— 一律读成 false。这一侧从严是有原因的：true 是「往请求里加参数」的那一侧，
+     * 把非布尔的值猜成 true 会让 app 发出 pi 自己都不会发的请求。
      */
-    private fun JsonObject.modelIdList(): List<String> = when (val models = this[FIELD_MODELS]) {
+    private fun JsonObject.modelEntries(): List<RelayModel> = when (val models = this[FIELD_MODELS]) {
         is JsonArray -> models.mapNotNull { element ->
             when (element) {
-                is JsonObject -> element.textOrNull(FIELD_ID)?.takeIf { it.isNotBlank() }
-                is JsonPrimitive -> element.contentOrNull?.takeIf { it.isNotBlank() }
+                is JsonObject -> element.textOrNull(FIELD_ID)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { RelayModel(it, element.reasoningFlag()) }
+
+                is JsonPrimitive -> element.contentOrNull
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { RelayModel(it, false) }
+
                 else -> null
             }
         }
 
         else -> emptyList()
     }
+
+    /** JSON 布尔真值 `true` 才返回 true；其余（缺字段/字符串/数字/null/对象）全算 false。 */
+    private fun JsonObject.reasoningFlag(): Boolean =
+        (this[FIELD_REASONING] as? JsonPrimitive)?.let { !it.isString && it.content == "true" } ?: false
 
     private fun JsonObject.textOrNull(field: String): String? = (this[field] as? JsonPrimitive)?.contentOrNull
 
@@ -270,6 +325,14 @@ class RelayEndpointStore(private val homeDir: File) {
         const val FIELD_API_KEY: String = "apiKey"
         const val FIELD_MODELS: String = "models"
         const val FIELD_ID: String = "id"
+
+        /**
+         * 模型级的思考旗（P3B-FIX1 §1 第 3/8 条）：pi 的 `ModelDefinitionSchema` 里
+         * `reasoning` 是 `Type.Optional(Type.Boolean())`（`model-config.ts:199-221`），
+         * 读盘缺省补 false（`provider-composer.ts:231`）—— 所以「不写」与「写 false」等价，
+         * 而 app 只在 true 时写出来。
+         */
+        const val FIELD_REASONING: String = "reasoning"
         const val FIELD_DEFAULT_PROVIDER: String = "defaultProvider"
         const val FIELD_DEFAULT_MODEL: String = "defaultModel"
 
@@ -304,3 +367,17 @@ class RelayEndpointStore(private val homeDir: File) {
         fun apiDisplayName(api: String): String = RELAY_APIS.firstOrNull { it.api == api }?.displayName ?: api
     }
 }
+
+/**
+ * 中转条目里的一个模型（P3B-FIX1 §3.1 第 1 条）。
+ *
+ * 为什么不是 `List<String>` 加一个并行布尔表：这两样必须**绑在一起走**，
+ * 因为 `reasoning` 是模型级的字段（`models.json` 的 `models` 数组里每项一个），
+ * 一旦拆成「id 表 + 一份思考 id 表」，中间任何一步的排序/去重都会让两份错位——
+ * 错位的结果不是崩，而是「思考档悄悄没了」，正是本轮要修的那类 bug。
+ *
+ * [reasoning] 的语义与 pi 侧一字不差：true = 这个模型有 off/minimal/low/medium/high 五档
+ * （`getSupportedThinkingLevels`），且设档后请求里真的带 `reasoning` 参数；
+ * false = 只有 off 一档。默认 false，所以老代码里「只有 id」的构造点行为不变。
+ */
+data class RelayModel(val id: String, val reasoning: Boolean = false)

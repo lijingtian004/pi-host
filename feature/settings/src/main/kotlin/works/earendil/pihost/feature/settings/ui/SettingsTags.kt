@@ -74,6 +74,9 @@ object SettingsTags {
     /** 行里的「设为默认」。 */
     fun relaySetDefault(providerId: String): String = "$RELAY_SECTION-set-default-$providerId"
 
+    /** 行里的「编辑」：把这一行播种回表单（P3B-FIX1 §3.2 第 2 条，思考尾缀跟着回来）。 */
+    fun relayEdit(providerId: String): String = "$RELAY_SECTION-edit-$providerId"
+
     /** 行里的「清除」。 */
     fun relayClear(providerId: String): String = "$RELAY_SECTION-clear-$providerId"
 
@@ -112,6 +115,8 @@ object SettingsTags {
         check(RELAY_DEFAULT_BADGE == "$RELAY_SECTION-default-badge")
         // 三个按 id 派生的函数与固定段名不能撞车：撞了就会让「点这行的清除」打到别的节点
         check(relayClear("x") != relaySetDefault("x") && relayRow("x") != relayClear("x"))
+        // P3B-FIX1 的「编辑」同样按 id 派生，四个行内 tag 必须互不相同
+        check(relayEdit("x") != relayClear("x") && relayEdit("x") != relaySetDefault("x") && relayEdit("x") != relayRowKey("x"))
         check(relayApiItem("x") != RELAY_API_BUTTON)
         // P3A §3.5 点名的一致性：诊断系列的前缀必须是 `SCREEN + "-diagnostics"`
         check(DIAGNOSTICS_SECTION == "$SCREEN-diagnostics")
@@ -222,7 +227,22 @@ object SettingsStrings {
     const val RELAY_URL_HINT: String = "要带路径前缀，例：https://relay.example.com/v1（pi 只补 /chat/completions）"
 
     const val RELAY_MODELS_LABEL: String = "模型 ID 列表"
-    const val RELAY_MODELS_HINT: String = "逗号分隔多个，例：deepseek-chat,gpt-4o"
+
+    /**
+     * P3B-FIX1 §3.2 第 2 条要求的文案：**语法入口必须写在屏幕上**，不然没人知道 `*` 是干什么的。
+     *
+     * 后半句说清后果（不标只有 off 一档），因为「我填了模型 id 为什么调不了思考档」正是本轮的用户反馈；
+     * 这条文案不解释机制（`reasoning` 字段名不上屏），只解释怎么填、填了有什么不同。
+     */
+    /**
+     * 那一串能照抄的例子。**placeholder 与 [RELAY_MODELS_HINT] 共用这一个常量**：
+     * 用户先看占位符、再看说明，两处一旦分开写就会各改各的（改文案忘了改例子=屏幕自相矛盾）。
+     */
+    const val RELAY_MODELS_EXAMPLE: String = "deepseek-chat,deepseek-reasoner*"
+
+    const val RELAY_MODELS_HINT: String =
+        "逗号分隔；模型 ID 后加 * 标记思考模型（例：$RELAY_MODELS_EXAMPLE）。标了才有 off/minimal/low/medium/high 五档，不标只有 off"
+
     const val RELAY_KEY_LABEL: String = "API 密钥"
 
     /** §3.2 那条语义要在屏幕上说出来，否则用户会以为留空 = 清空。 */
@@ -234,6 +254,9 @@ object SettingsStrings {
 
     const val RELAY_SAVE: String = "保存中转"
     const val RELAY_REFRESH: String = "重读列表"
+
+    /** P3B-FIX1 §3.2 第 2 条：行末那颗「编辑」——它存在的意义就是把思考尾缀原样带回表单。 */
+    const val RELAY_EDIT: String = "编辑"
     const val RELAY_SET_DEFAULT: String = "设为默认"
     const val RELAY_CLEAR: String = "清除"
     const val RELAY_NONE: String = "还没配置任何中转站。"

@@ -45,8 +45,9 @@ import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
+import works.earendil.pihost.core.engine.settings.RelayModel
 import works.earendil.pihost.core.environment.MemTier
-import works.earendil.pihost.feature.settings.parseModelIds
+import works.earendil.pihost.feature.settings.parseRelayModels
 import works.earendil.pihost.feature.settings.CrashReportSummary
 import works.earendil.pihost.feature.settings.ProbeState
 import works.earendil.pihost.feature.settings.RelayDraft
@@ -142,6 +143,7 @@ fun SettingsScreen(
                 draft = relayDraft,
                 onDraftChange = viewModel::onRelayDraftChange,
                 onSave = viewModel::saveRelay,
+                onEdit = viewModel::editRelay,
                 onSetDefault = viewModel::setRelayDefault,
                 onClear = viewModel::clearRelay,
                 onRefresh = viewModel::refreshRelays,
@@ -407,6 +409,9 @@ private const val RELAY_URL_DISPLAY_LIMIT = 36
  *   （material3 1.3→1.5 的 `menuAnchor` 签名漂移 + `Popup` 窗口在 Robolectric 零先例），这里不重做一遍；
  * - **保存按钮的启用条件是三个必填项，密钥不在内**（§3.2：留空 = 沿用已存 key，所以空 key 是合法输入）；
  *   VM 里还有同一套三道门，UI 只是第一道；
+ * - **行末「编辑」把已存条目播种回表单**（P3B-FIX1 §3.2 第 2 条）：模型清单里的思考尾缀 `*` 由
+ *   [works.earendil.pihost.feature.settings.relayModelsToText] 逐字还回来，否则「带 `*` 存的、
+ *   点开不带 `*`」，下一次保存就把思考档写没了（密钥仍**不**回填，§2 红线；用例 `h14`）；
  * - **行格式 = `providerId · baseUrl · N 个模型`**（§3.2 原文），默认行前面多一枚「默认」徽标，
  *   数据来自 `settings.json`（[defaultProvider]），不是本地布尔；
  * - **`RelayEntry` 里没有 apiKey**：这一层连*尝试*显示密钥的字段都拿不到，跟凭据通路一样不是靠 UI 克制
@@ -418,13 +423,14 @@ private fun RelaySection(
     defaultProvider: String?,
     draft: RelayDraft,
     onDraftChange: ((RelayDraft) -> RelayDraft) -> Unit,
-    onSave: (providerId: String, baseUrl: String, api: String, modelIds: List<String>, apiKey: String?) -> Unit,
+    onSave: (providerId: String, baseUrl: String, api: String, models: List<RelayModel>, apiKey: String?) -> Unit,
+    onEdit: (providerId: String) -> Unit,
     onSetDefault: (providerId: String, modelId: String) -> Unit,
     onClear: (providerId: String) -> Unit,
     onRefresh: () -> Unit,
 ) {
     var pickerOpen by remember { mutableStateOf(false) }
-    val modelIds = parseModelIds(draft.models)
+    val models = parseRelayModels(draft.models)
 
     Section(tag = SettingsTags.RELAY_SECTION, title = SettingsStrings.SECTION_RELAY) {
         Text(SettingsStrings.RELAY_HINT, style = MaterialTheme.typography.bodySmall)
@@ -449,7 +455,7 @@ private fun RelaySection(
             value = draft.models,
             onValueChange = { value -> onDraftChange { it.copy(models = value) } },
             label = { Text(SettingsStrings.RELAY_MODELS_LABEL) },
-            placeholder = { Text("deepseek-chat,gpt-4o") },
+            placeholder = { Text(SettingsStrings.RELAY_MODELS_EXAMPLE) },
             supportingText = { Text(SettingsStrings.RELAY_MODELS_HINT, style = MaterialTheme.typography.bodySmall) },
             singleLine = true,
             modifier = Modifier.fillMaxWidth().testTag(SettingsTags.RELAY_MODELS_FIELD),
@@ -478,8 +484,8 @@ private fun RelaySection(
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             // 三道门的第一道（VM 里还有第二道，core 的 require 是第三道）；空密钥**不在**条件里
             OutlinedButton(
-                onClick = { onSave(draft.providerId, draft.baseUrl, draft.api, modelIds, draft.apiKey) },
-                enabled = draft.providerId.isNotBlank() && draft.baseUrl.isNotBlank() && modelIds.isNotEmpty(),
+                onClick = { onSave(draft.providerId, draft.baseUrl, draft.api, models, draft.apiKey) },
+                enabled = draft.providerId.isNotBlank() && draft.baseUrl.isNotBlank() && models.isNotEmpty(),
                 modifier = Modifier.testTag(SettingsTags.RELAY_SAVE),
             ) { Text(SettingsStrings.RELAY_SAVE) }
             TextButton(
@@ -528,9 +534,15 @@ private fun RelaySection(
                         modifier = Modifier.testTag(SettingsTags.relayRowKey(entry.providerId)),
                     )
                     OutlinedButton(
+                        // 把这一行播种回表单（P3B-FIX1 §3.2 第 2 条）：思考尾缀 `*` 必须跟着回来，
+                        // 所以文本由 VM 侧的 relayModelsToText 生成，不在这里手拼
+                        onClick = { onEdit(entry.providerId) },
+                        modifier = Modifier.testTag(SettingsTags.relayEdit(entry.providerId)),
+                    ) { Text(SettingsStrings.RELAY_EDIT) }
+                    OutlinedButton(
                         // 没有模型 id 就钉不了默认（pi 的 defaultModel 必须指向一个真实 id）
-                        onClick = { entry.modelIds.firstOrNull()?.let { onSetDefault(entry.providerId, it) } },
-                        enabled = entry.modelIds.isNotEmpty(),
+                        onClick = { entry.models.firstOrNull()?.id?.let { onSetDefault(entry.providerId, it) } },
+                        enabled = entry.models.isNotEmpty(),
                         modifier = Modifier.testTag(SettingsTags.relaySetDefault(entry.providerId)),
                     ) { Text(SettingsStrings.RELAY_SET_DEFAULT) }
                     TextButton(
@@ -561,7 +573,7 @@ private fun relayRowText(entry: RelayEntry): String {
     } else {
         entry.baseUrl
     }
-    return "${entry.providerId} · $url · " + String.format(SettingsStrings.RELAY_MODEL_COUNT, entry.modelIds.size)
+    return "${entry.providerId} · $url · " + String.format(SettingsStrings.RELAY_MODEL_COUNT, entry.models.size)
 }
 
 /** api 选择对话框：固定五项（§3.2），每行一个 RadioButton，tag 用 api 原值。 */

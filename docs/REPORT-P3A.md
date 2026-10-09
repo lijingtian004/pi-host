@@ -553,6 +553,14 @@ bash /tmp/p3a-count-tests.sh      # 源文件：/root/pi/.tools/p3a-count-tests.
 cd /root/pi/android-host
 git diff --stat 1f77127..HEAD -- core/rpc core/process/src/main core/environment docs/protocol.md tools/capture tools/runtime-packaging
 grep -rn "sk-" feature core app --include="*.kt" | grep src/main | wc -l          # 期望 0
+find /root/pi/.tools/pi-1.0.4 -newermt '1 day ago' -type f | wc -l                 # 期望 0（pi 源码零写入）
+
+# —— 「没新增权限 / 运行时面不变」的对照（P2H 交付包 vs P3A 交付包，都在编译机 /root/apk-serve/）——
+A=/root/android-sdk/build-tools/36.0.0/aapt2
+diff <($A dump badging /root/apk-serve/0944f6f3e161/pi-host-full-debug.apk | grep '^uses-permission') \
+     <($A dump badging /root/apk-serve/515394fca808/pi-host-full-debug.apk | grep '^uses-permission')   # 无输出 = 五行逐字相同
+diff <(unzip -Z1 /root/apk-serve/0944f6f3e161/pi-host-full-debug.apk | grep '^lib/arm64-v8a/') \
+     <(unzip -Z1 /root/apk-serve/515394fca808/pi-host-full-debug.apk | grep '^lib/arm64-v8a/')          # 无输出 = so 名单一致
 
 # —— 本轮没做的（不假装做过，§8 第 23 条）——
 # 真机 adb install -r / 故意抛异常看诊断页 / out/ 复原流程自动化

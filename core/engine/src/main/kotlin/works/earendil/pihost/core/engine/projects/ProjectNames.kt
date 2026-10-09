@@ -89,19 +89,59 @@ object ProjectNames {
      *
      * 只做一层：宿主从不建嵌套项目（`projects/<name>/` 就是叶子），出现 `projects/a/b`
      * 说明那个会话来自别处，返回 null 让调用方走「未知项目」分支，比猜一个 `a` 更诚实。
+     *
+     * **两侧都先过 [foldDataAlias]**，原因见那个函数的注释——不加这一步，本函数在真机上
+     * 对任何会话都会返回 null（P3C §8.9 附）。
      */
     fun projectNameOfCwd(projectsRootPath: String?, cwd: String?): String? {
         val root = projectsRootPath?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null
         val target = cwd?.trim()?.takeIf { it.isNotEmpty() } ?: return null
-        if (!target.startsWith("$root/")) return null
-        val rest = target.substring(root.length + 1)
+        val foldedRoot = foldDataAlias(root)
+        val foldedTarget = foldDataAlias(target)
+        if (!foldedTarget.startsWith("$foldedRoot/")) return null
+        val rest = foldedTarget.substring(foldedRoot.length + 1)
         if (rest.isEmpty() || rest.contains('/')) return null
         return validate(rest)
     }
 
     /**
-     * 重名判据用的折叠键。显式钉 [Locale.ROOT]：土耳其语环境下 `"I".lowercase()` 得到 `ı`（不带点的 i），
+     * 把 Android data 目录的「两张脸」折成同一个键：`/data/user/<n>/<pkg>/…` → `/data/data/<pkg>/…`。
+     *
+     * 这是真机逼出来的一条，不是理论洁癖。设备上实测（REPORT-P3C §8.9 附）：
+     * ```
+     * readlink -f /data/data/<pkg>/files/projects/3   → /data/data/<pkg>/files/projects/3
+     * readlink -f /data/user/0/<pkg>/files/projects/3 → /data/user/0/<pkg>/files/projects/3
+     * 两条路径的 st_dev:st_ino 相同（65097:1388717）
+     * ```
+     * 也就是说它们是**同一棵树的两张脸（bind），不是符号链接**——所以
+     * [java.io.File.getCanonicalPath] **统一不了它们**（canonical 只解符号链接）。
+     *
+     * 而两侧恰好各用一张脸：
+     * - pi 记在会话头里的 cwd 是 `/data/data/…`（node 的 `process.cwd()` 原样）；
+     * - 宿主经 `Context.filesDir` 拿到的是 `/data/user/0/…`。
+     *
+     * 于是「拿宿主的根去前缀匹配 pi 记的 cwd」在真机上**永远不相等**，
+     * [projectNameOfCwd] 会对每一条真实会话返回 null —— 单测里两边都写同一串字面量，
+     * 所以全绿也照不出来（P3C §8.9 附那条跨项目告知就是这么失效的）。
+     */
+    fun foldDataAlias(path: String): String {
+        val match = USER_DIR_PREFIX.matchAt(path, 0) ?: return path
+        val tail = path.substring(match.range.last + 1)
+        return if (tail.isEmpty()) path else "$DATA_DATA_PREFIX$tail"
+    }
+
+    /**
+     * 大小写折叠重名的判据。显式钉 [Locale.ROOT]：土耳其语环境下 `"I".lowercase()` 得到 `ı`（不带点的 i），
      * 于是 `Istanbul` 与 `istanbul` 会被判成不同项目——折叠规则属于格式纪律，不跟设备语言走。
      */
     fun foldKey(name: String): String = name.lowercase(Locale.ROOT)
+
+    // 本对象自己就是一个 object，所以这两个是普通成员而不是 companion。
+    // 名字不加前缀：它们只在 foldDataAlias 里用，而 foldDataAlias 是本类唯一的公开出口。
+
+    /** `/data/user/<数字>/` 前缀（Android 的多用户 data 目录写法）。 */
+    private val USER_DIR_PREFIX: Regex = Regex("/data/user/\\d+/")
+
+    /** 统一后的目标前缀。选 `/data/data` 而不是 `/data/user/0`：它是 pi 侧那一张脸，也是人类读日志时更眼熟的一张。 */
+    private const val DATA_DATA_PREFIX: String = "/data/data/"
 }

@@ -1,10 +1,19 @@
 # REPORT-P3C — 新建项目 + git 可用 + 顶栏分支（versionCode 8 / 0.1.7）
 
-> 日期：2026-10-09 ｜ 基线：`80f5e13`（P3B-FIX1 收尾）｜ 交付：`dist/pi-host-full-debug-0.1.7-p3c.apk`
+> 日期：2026-10-09 起、2026-10-10 真机验证收尾 ｜ 基线：`80f5e13`（P3B-FIX1）
+> 交付：`dist/pi-host-full-debug-0.1.7-p3c.apk`（63,976,877 B，`86cd5e17…c4a7ac`，已装机）
 > 任务来源：用户指令「添加 git，允许在应用私有目录新建文件夹」，经 P3C 计划批准（9 个小节 + 红线重划）。
-> **本期起点有一次目标变更**：终点从「消费者上架」改为「这台 rooted 自有设备自用闭环」，
-> 因此 P3 原定的「资产 OTA + 验签」「国产 ROM onboarding」「Play specialUse/dataSafety」
-> **移出路线图**（见 §8.6，这是目标变更，不是未完成）。
+>
+> **目标变更**：终点从「消费者上架」改为「这台 rooted 自有设备自用闭环」，
+> 故「资产 OTA + 验签」「Play specialUse/dataSafety」移出路线图（目标变更，不是未完成）。
+> **但「国产 ROM 后台引导」被我跟着一起砍掉是错的**——真机证明 FGS 会被厂商冻结穿透，
+> 它是自用刚需，已恢复进路线图（§8.6）。
+>
+> **本期结论**：真机验收 ①–⑤ 全通过（§9），工具通路第一次在设备上跑通
+> （`note.txt` 由 app 自身 uid 写出、commit `67a321d` 署名 `pi host`、审计首次有 18 行内容）。
+> 同一次验证挖出一个 P2A/P2B 遗留的严重缺陷：**覆盖安装后运行时符号链接农场整体悬空**
+> （`runtime/bin` 109/109 悬空），后果是 `git clone/pull/push` 与 `gc` 静默失效
+> ——首装正常、592 条单测全绿、编译机上永远复现不出来。见 §8.9，P3D 第一优先。
 
 ---
 
@@ -248,51 +257,98 @@ bash .tools/p3c-device-smoke.sh files
 
 ## 8. 偏差、遗留与未执行
 
-### 8.1 真机部分执行：装机已做，工具通路仍未触发
+### 8.1 真机已执行：工具通路第一次跑通（含一次对用户设备的实际干扰）
 
-**已执行**：`pm install -r` 把设备从 0.1.6 升到 0.1.7（`dumpsys package` 实测
-`versionCode=7 → 8`、`versionName=0.1.6 → 0.1.7`，Success）。
-执行前用 `am force-stop` 清场，**打断了一次正在使用的会话**——会话本体在 jsonl 里，重开可续，
-但这是本轮对用户设备造成的一次实际干扰，记在这里。
-后续 UI 驱动（点「新建项目」）**主动停止**：dump 出来的屏幕上出现了一轮新的
-`你好` → 回复（带 `思考（展开）`、1605 tok），文本与既有 session 里的三条回复都不同，
-说明设备此刻有人在用；不再往里戳。
+**装机**：`pm install -r` 把设备从 0.1.6 升到 0.1.7（`dumpsys package` 实测
+`versionCode=7 → 8`、`versionName=0.1.6 → 0.1.7`，`Success`）。
+执行前 `am force-stop` 清场，**打断了一次正在使用的会话**；后续驱动又打断过一次。
+会话本体在 jsonl 里，重开可续，但这两次干扰是对用户设备的实际改动，记在这里。
 
-装机后的磁盘事实（`bash .tools/p3c-device-smoke.sh files` 的真实回显）：
+**工具通路第一次在设备上跑通**（此前所有期次的 `toolCall` 计数都是 0）。
+用 UI 建项目 `3` → 发一条「write 建 note.txt + bash 跑 git add/commit + 贴 git log」，
+审计最后一条 `TOOL_END` 的 `resultPreview` 原文：
 
 ```
-files/projects/            → 仍然只有 default（19:37 建），无一个新项目目录
-files/home/.gitconfig      → 存在，-rw------- u0_a401:u0_a401 80 字节，mtime 23:42（装在 0.1.7 之后）
-                              内容与 GitIdentity.DEFAULT_CONTENT 逐字一致（python 比对「逐字一致」）
-files/projects/default/.git→ GIT无
-files/audit/               → No such file or directory
-logcat -d | grep PiHostGit → 无输出
+[main (root-commit) 67a321d] p3c
+ 1 file changed, 1 insertion(+)
+ create mode 100644 note.txt
+-----
+commit 67a321dc3b69131b706a4c7e701468d996f9d26b
+Author: pi host <pi-host@localhost>
+Date:   Sat Oct 10 00:08:54 2026 +0800
+
+    p3c
 ```
 
-**这一条把 §8.2 的第 2 条 closes 掉一半**：`.gitconfig` 确实由 **app 自己的 uid**（非 root）
-在设备上写出且字节正确——`RuntimeInstallImpl` 走 `UpToDate` 分支播种这条路径**实机成立**
-（若只挂 `Installed` 分支，这个文件永远不会出现，正是 §3.2 特意补两条成功支的原因）。
-剩下的一半是「git 2.56 读不读这份配置」，那要一次真 `git commit` 才算证。
+配套事实（全部实读，非推断）：
 
-仍然**没有**证据的三件事：`projects/<新项目>` 能否在设备上建出来（§8.2 第 1、5 条）、
-`git init` 能否成功、以及**工具通路本身在设备上跑过没有**
-（`audit/` 不存在与 `toolCall` 计数为 0 是同一个事实的两面）。
-**592 条单测全绿不等于设备上是好的**——本期新代码里最要紧的那一步仍然空白。
+| 事实 | 取证 |
+|---|---|
+| `note.txt` 由 **app 自己的 uid** 写出 | `-rw------- u0_a401:u0_a401 6 Oct 10 00:02`，内容 `hello` |
+| 提交真的落地 | `.git/refs/heads/main` = `67a321dc3b69131b706a4c7e701468d996f9d26b`（41 字节 ref 文件） |
+| **P3A 的审计 sink 第一次有内容** | `files/audit/audit-2026-10-10.jsonl`，18 行，`TOOL_START`/`TOOL_END` 成对 |
+| 会话里工具事件计数不再是 0 | 该 jsonl：`toolCall` 18、`toolResult` 9、12 条 assistant |
+| 顶栏 chip 真的渲染出来 | 截图顶栏 `就绪 b5a77e2f | main | 选择模型`；`spawn-diagnostics.log` 有 00:02:00 / 00:02:12 / **00:08:56** 三条探针记录 |
+| `AgentSettled` 挂点生效 | 00:08:54 提交 → 00:08:56 探针，即 §3.6「一轮跑完重读」那条路在真机上走通了 |
+| `.gitconfig` 被真 git 认领 | author 就是 `pi host <pi-host@localhost>`；且 `HEAD` 是 `ref: refs/heads/main`，而 git 2.56 不配时默认 `master` |
 
-冒烟脚本已就位并可用（`.tools/p3c-device-smoke.sh`，子命令 `install|projects|files|logcat|all`）；
-`am`/`pm`/`input`/`uiautomator`/`dumpsys`/`logcat` 全部实测可达，只需 `PATH=/system/bin`
-——不这么做 `uiautomator` 会报 `app_process: inaccessible or not found`。
-另有一条**新发现的限制**：Compose 的 `testTag` 在真机 uiautomator 树里**不出现**
-（要 `testTagsAsResourceId` 才映射成 `resource-id`），所以脚本与人工都只能按 `text=` 定位；
-本期所有 UI 断言因此只存在于 JVM 侧，真机侧的可定位性要单开一小步才能补上。
+`.gitconfig` 本身：`-rw------- u0_a401:u0_a401 80 字节`，与 `GitIdentity.DEFAULT_CONTENT`
+逐字比对一致，mtime 23:42（装在 0.1.7 之后）。它是由 `RuntimeInstallImpl` 的 **`UpToDate`** 分支
+播种出来的——**§3.2 特意补第二条成功支的原因就在这**：这台早就装好运行时的机器永远走 `UpToDate`，
+只挂 `Installed` 的话这个文件至今不会存在。
 
-### 8.2 只有真机可验（五条，不许拿单测冒充）
+**仍然没有证据的**只剩 §8.2 的第 5 条（canonical 在真机挂载形态下的行为）。
 
-1. **`git init` 在 SELinux 下能否成功**——Robolectric 跑不了打包的 git，而 `p3b-matrix`
-   在编译机上以 **root** 运行，正是「编译机能跑 git」冒充「设备上 app 的 uid 能跑 git」的假绿形态
-   （`ProjectStoreWiringTest` 第 2 条专门把这条堵在测试图上：绑的是 `NoopGitInitializer`）。
-2. **git 2.56 是否真认我们写的 `$HOME/.gitconfig`**——要 pi 真发一次 `git commit`。
-3. **`safe.directory` 会不会对 `filesDir` 报警**——§3.2 决定不写它，前提是「属主同 uid」，未在真机证过。
+### 8.1b 一次误诊的完整记录（方法论，值得留在仓里）
+
+用户报「卡住」。我先给了**冻结**解释，被一句反驳推翻：「当时在前台，前台不会被冻」。
+继续量之后两个解释都不成立，真因是中转。全过程：
+
+1. **第一版解释（错）**：`do_freezer_trap` 出现在 app + 两个 `pi` 子进程上 → 判为厂商冻结。
+   反证：AMS 侧 `isFrozen=false`、`adj=200`、`cur=FGS`、`mState=ACTIVE`、屏幕亮着；
+   而且那三条 wchan 是**用户切回 Termux 之后**才取到的，解释不了截图时刻（00:05）。
+   冻结这件事本身是真的（见 §8.1c），但它不是这次「卡住」的原因。
+2. **第二版解释（也错）**：以为宿主没收到 `TOOL_END`。反证：审计里那条 `TOOL_END`
+   **就是宿主自己写的**——它收到了。
+3. **量出来的真相**：每对 `TOOL_START/TOOL_END` 间隔 **0.01–0.07 秒**，工具根本不慢；
+   慢的是工具之间：`00:02:57 → 00:06:46` 空 **229 秒**、`00:07:33 → 00:08:52` 空 **78 秒**。
+   会话 jsonl 里躺着原因：**`"Connection error."` ×2、`"terminated"` ×1、`stopReason:"error"` ×3**。
+   即一次模型请求在 undici 层挂了近 4 分钟才失败。
+4. **宿主有没有失职**？查了：`auto_retry_start` 建模正确、在 `KNOWN_EVENT_TYPES` 里
+   （`RpcWire.kt:25`）、`ChatViewModel.kt:1169` 会写 `retryNote`、`ChatScreen.kt:197` 会渲染。
+   顶栏是空的，说明 **pi 这次没发该事件**。UI 显示的「插一句，或排队追问」就是流式中，
+   它没骗人——只是**没有任何"已等待 N 秒"的时间感**（改进见 §8.10）。
+
+教训一句话：**「卡住」有三种截然不同的成因（进程被冻 / 宿主漏事件 / 上游慢），
+只有工具级时间戳能把它们分开**。以后遇到「卡住」，第一动作是量
+`TOOL_START→TOOL_END` 与工具**之间**的间隔，而不是先看 freezer。
+
+### 8.1c 顺带确认的两个真机事实
+
+- **厂商冻结确实存在**：用户切出 app 后，app 与两个 `pi` 子进程的 `wchan` 全部变成
+  `do_freezer_trap`，而 AMS 认为它 `isFrozen=false` 且处于 FGS。这台是 ColorOS/OxygenOS
+  （配置里满屏 `mOplus*`）。且 `dumpsys deviceidle whitelist` 里**只有 `com.termux`，没有 pihost**。
+  → 方案A §5.2 的第 1 层对策（FGS）在这台机器上被穿透，第 2 层（白名单引导）才是有效的，
+  而它正是我上一版按「不上架就不做」砍掉的那一项（见 §8.6 的更正）。
+- **`run-as` 不是忠实的 oracle**：以 `run-as`（uid 同为 10401，但域是 `runas_app`、
+  且继承 Termux 的挂载视图）跑同一个 `libpi_git.so`，会因
+  `/data/data/com.termux/files/usr/etc/gitconfig` 不可达而 `fatal: ... Permission denied`；
+  app 自己在它的命名空间里看不到那条路径，同一命令 `rc=0`。
+  我一度据此误判「git 读路径被 Termux 前缀残留咬住」，是错的。
+  真机上要以 app 身份取证，只能靠 app 自己的产物（`spawn-diagnostics.log`、审计、refs）。
+
+### 8.2 只有真机可验（五条，本期后状态）
+
+1. ~~`git init` 在 SELinux 下能否成功~~ → **已闭合**：`projects/3/.git` 完整
+   （`HEAD config index objects refs`），且对照实验证明「失败的 `git init` 什么都不留」
+   （在 `scratch` 目录里跑一次 fatal 的 init，事后 `ls` 里没有 `.git`）——
+   所以 `.git` 的存在本身就是成功的证据。注意这条闭合的是 **builtin**；
+   外部子命令在升级后全废，见 §8.9。
+2. ~~git 2.56 是否真认 `$HOME/.gitconfig`~~ → **已闭合**：commit 的 author 是
+   `pi host <pi-host@localhost>`，且新仓库默认分支是 `main`（不配时 git 2.56 给 `master`）。
+3. ~~`safe.directory` 会不会报警~~ → **对 app 自身不触发**（属主同 uid，实测 builtin 命令 `rc=0`）。
+   但**以 root 侧访问同一个仓库会报** `fatal: detected dubious ownership`——
+   这条留个话头：P3D 若加「诊断页导出 git 状态」这类 root/其它 uid 的读法，会撞上它。
 4. **空仓库 / 分离 HEAD 下 `status --porcelain=v1 --branch` 首行的实际措辞**——
    `ProcessGitProbeTest` 用的是按 man page 写的形状，不是从这台设备抓的。
 5. **`File.canonicalFile` 在 `filesDir` vs `/data/user/0` vs `/data/data` 的符号链接包含性**
@@ -339,11 +395,20 @@ spawn lambda 需要正是**同步、不挂起、不碰磁盘**的读——这条
 日志里同时有 FAILED 与 BUILD SUCCESSFUL，**分不清现在到底是什么状态**。
 已改成只重试传输层（ssh 退出码 255），gradle 的红当场返回。
 
-### 8.6 目标变更（不是未完成）：P3 的 OTA / onboarding / Play 合规移出路线图
+### 8.6 目标变更（不是未完成）：OTA / Play 合规移出路线图——但 onboarding 被我错砍了，现予更正
 
 用户 2026-10-09 决定终点是「这台 rooted 自有设备自用闭环」。
-方案A §12 里 P3 的出口判据（资产 OTA + 签名校验、国产 ROM onboarding、Play specialUse/dataSafety）
-**随之作废**。`AssetSource.kt:7` 那句「P3 OTA 换 OkHttp 实现」的接口留位继续保持原样（冻结区外，未动），
+方案A §12 里 P3 的出口判据中，**资产 OTA + 签名校验**与 **Play specialUse/dataSafety**
+确实随目标作废。
+
+**「国产 ROM onboarding」不属于合规项，我把它跟着上架一起砍了，判断错了。**
+真机证据（§8.1c）：用户一退出 app，app 与两个 `pi` 子进程立刻被塞进 cgroup freezer
+（`wchan=do_freezer_trap`），而 AMS 认为它 `isFrozen=false`、`adj=200`、处于 FGS——
+**方案A §5.2 的第 1 层对策（FGS 保活）在这台机器上被厂商策略直接穿透**；
+而 `dumpsys deviceidle whitelist` 里只有 `com.termux`，**pihost 不在白名单**。
+也就是说 §5.2 的第 2 层（电池白名单 + ROM 引导）不是「上架才需要」，
+而是**自用长会话能不能活过「切出去回个消息」这件事的唯一保障**。
+本期它排 P3D（见 §8.9 的优先级说明）。`AssetSource.kt:7` 那句「P3 OTA 换 OkHttp 实现」的接口留位继续保持原样（冻结区外，未动），
 以后若转分发再启用。写进报告是为了以后翻记录时不误读成「做了一半停了」。
 
 ### 8.7 `probe03` 是已知抖动（1/7），不是本期引入
@@ -374,19 +439,102 @@ spawn lambda 需要正是**同步、不挂起、不碰磁盘**的读——这条
 5. **仓库 `origin` 的 URL 里嵌着明文 GitHub token**（`.git/config`）。
    这条与红线 11 相冲突，但属于仓库配置而非本期代码面，**未擅自动**，待用户处理。
 
+### 8.9 【P3D 第一优先】覆盖安装后，运行时符号链接农场整体悬空
+
+这是本期由真机验证挖出来的**最严重缺陷**，而且它不在本期交付面上——
+`AssetInstaller` / `RuntimeInstall` 的这段逻辑是 P2A/P2B 的产物，本期只是第一次撞上它。
+
+**触发条件**：任何一次覆盖安装（`pm install -r`）。`/data/app/~~<随机>==/` 每次安装换名字，
+而 `runtime/bin` 与 `runtime/libexec` 里存的是**指向旧 nativeLibraryDir 的绝对路径符号链接**；
+`.installed.json` 标记没变 → `RuntimeInstall` 判 `UpToDate` → **没有任何东西去重链**。
+
+**实测数据**（我 23:42 装 0.1.7 之后）：
+
+```
+旧目录 /data/app/~~cGw9WdYapoY22nt2gQnK9A==   → No such file or directory
+新目录 /data/app/~~Cepn8CFX5XRgqLlmTyM4qw==/… → 当前 pm path
+runtime/bin      共 109 条链接，悬空 109   ← 100%
+runtime/libexec  共 172 条链接，悬空 150
+农场 mtime 19:37:18（= 0.1.6 那次装机）；.installed.json 同一时刻，未被刷新
+```
+
+**后果（逐条实测，非推测）**：
+
+| 后果 | 证据 |
+|---|---|
+| git 外部子命令全废 | `error: cannot run gc: No such file or directory` + `error: task 'gc' failed` `rc=1`；同一 uid 同一二进制跑 builtin `status` 则 `rc=0` |
+| **不能 clone / fetch / pull / push** | `fatal: unable to find remote helper for 'https'`（`git-remote-https → …/libpi_git_remote_http.so` 也是悬空链接） |
+| `SHELL` 指向死路径 | `EnvFactory.kt:27` 设 `SHELL=$runtime/bin/bash`，而 `bin/bash` 就在那 109 条里 |
+| coreutils 静默退化成 toybox | PATH 是 `runtime/bin:libDir:/system/bin`，悬空链接 exec 得 ENOENT → bash 落到 `/system/bin`。没有 `rg`，`sed -i`/`grep -P` 的 GNU 写法语义不同 |
+
+最后两条**没有任何报错**，是静默降级。它在本期还间接烧掉了用户的等待时间：
+模型在 00:06:46 去跑 `command -v pkg apt apk yum dnf brew pip npm` 摸环境
+（对应 §8.1b 里那两段 42s / 78s 的工具间空隙）。
+
+**为什么这条压过本期其它遗留**：它让「git 能被 agent 用起来」在**每一次升级之后**都不成立，
+而首装一切正常、592 条单测全绿、编译机上更是永远复现不出来（没有 `/data/app/~~` 这套形态）。
+只有「真机 + 覆盖安装」这个组合能暴露它。
+
+**修法（不需要动冻结区）**：农场由 `AssetInstaller`（`core/engine`，非冻结）按 zip manifest 建，所以：
+
+1. **推荐**：`.installed.json` 里记下 `nativeLibraryDir`，`UpToDate` 额外要求它等于当前值；
+   不等则**只重建链接**（不重解 250MB 的 `pi.zip`；280 个 `symlink()` 是毫秒级）。
+2. 更稳：每次引擎启动幂等重链一遍，顺带吃掉「用户手动清过目录」这类情况。
+3. 治本但此路不通：让链接指向稳定路径——这台机器上 `/data/data/<pkg>/lib` **不存在**（实测）。
+
+**你设备上的临时恢复**（会重解运行时；`files/home`、`files/projects` 不受影响）：
+
+```bash
+/data/data/com.termux/files/home/su -c \
+  "rm -f /data/data/works.earendil.pihost/files/runtime/.installed.json"
+# 打开 app 等它装完，再验：
+su -c "cd /data/data/works.earendil.pihost/files/runtime/bin && n=0;for l in *;do [ -e \"\$l\" ]||n=\$((n+1));done;echo 悬空\$n"   # 期望 0
+```
+
+### 8.10 上游慢的时候，界面没有任何时间感
+
+§8.1b 量出来的那次 229 秒停顿里，界面只有一个静态的「插一句，或排队追问」占位。
+宿主侧该有而没有的三样东西：
+
+1. **`abort_retry` / `set_auto_retry` 建模了但 UI 没接**（§1 那张「11 条建模却从未发出」的清单里就有它们），
+   所以用户既看不到重试策略、也不能干预；这次更是 pi **压根没发** `auto_retry_start`，
+   宿主连想显示都没素材。
+2. **没有「本轮已等待 Ns」的计时器**。`turnState=Streaming` 是对的，但一个不动的转圈
+   和「卡死」在用户眼里没有区别。
+3. **没有首字节超时**。pi-ai 层连接挂 4 分钟才失败，宿主对「请求发出但一个 delta 都没收到」
+   这件事没有任何阈值与提示。
+
+这三条合起来是一个可用性问题，不是正确性 bug；但对「手机上用编码 agent」这个场景，
+它是决定「用户会不会以为坏了然后强杀」的那一项。建议与 §8.9 同批进 P3D。
+
 ---
 
-## 9. 真机验收清单（五条，本期实交 1 条）
+## 9. 真机验收清单（五条，本期实交 ①②③④⑤）
 
-| # | 步骤 | 判据 | 本期状态 |
+| # | 步骤 | 判据 | 结果 |
 |---|---|---|---|
-| ① | `pm install -r` 0.1.7 | `dumpsys package` 的 versionCode 7 → 8 | **已执行 ✓**（`Success`，装后 `versionCode=8 / versionName=0.1.7`；执行中 `am force-stop` 打断了一次正在使用的会话） |
-| ② | 会话页点「新建项目」→ 输入名 → 创建 | `files/projects/<名>/` 出现且**内有 `.git/`** | **未执行**（屏幕此刻有人在用，主动停手；见 §8.1） |
-| ③ | 建项目后 | `files/home/.gitconfig` 出现且内容逐字等于 `GitIdentity.DEFAULT_CONTENT` | **已执行 ✓（非经②）**：文件由 app 自身 uid `u0_a401` 在 23:42 写出，80 字节，python 逐字比对「逐字一致」——走的是 `RuntimeInstallImpl` 的 `UpToDate` 分支，不是 `ProjectStore.create` |
-| ④ | 进聊天页 | 顶栏出现分支 chip | **未观测到，且这是正确行为**：`projects/default` 里没有 `.git`（②未做），`status` 判 `NotARepo` → 按设计不渲染节点；logcat 里 `PiHostGit*` 无输出 |
-| ⑤ | 让 pi「新建一个文件并 git commit」 | 会话 jsonl 出现 `toolCall`；`files/audit/` 首次出现 jsonl；`git log` 里有署名 `pi host` 的提交 | **未执行**。这条是本期真正的目的：**第一次**让工具通路在设备上跑起来，顺带覆盖 §8.2 的第 1、2、3 条 |
+| ① | `pm install -r` 0.1.7 | versionCode 7 → 8 | **通过**（`Success`；crash buffer 里无 `works.earendil.pihost`；两条旧 session jsonl 完好，19:38 那条一条没丢） |
+| ② | 会话页建项目 | `projects/<名>/` 出现且内有 `.git/` | **通过**（`projects/3/.git` = `HEAD config index objects refs`；`HEAD` = `ref: refs/heads/main`） |
+| ③ | 建项目后 | `home/.gitconfig` 逐字等于 `GitIdentity.DEFAULT_CONTENT` | **通过**（`u0_a401:u0_a401` 80 字节；且经 ⑤ 的 commit author 反证 git 真读了它）。注意它**不经②**也能拿到——走的是 `RuntimeInstallImpl` 的 `UpToDate` 分支，见 §3.2 |
+| ④ | 进聊天页 | 顶栏出现分支 chip | **通过**（实测顶栏 `就绪 b5a77e2f | main | 选择模型`；`NotARepo` 时不渲染也验到了：`projects/default` 无 `.git` → 无 chip） |
+| ⑤ | 让 pi 建文件并 commit | 会话出现 `toolCall`、`audit/` 首次有内容、`git log` 有署名提交 | **通过**（`note.txt` 6 字节由 app uid 写出；审计 18 行；commit `67a321d` author `pi host <pi-host@localhost>`） |
 
-②⑤ 两步需要动屏幕，而真机上 Compose 的 `testTag` 不映射进 uiautomator 树（§8.1 末），
-只能按 `text=` 定位——脚本 `p3c-device-smoke.sh projects` 已按此写好，
-在设备空闲时一条命令即可跑完。③ 之所以能「不经②」拿到，
-是因为本期特意把身份播种也挂在运行时安装的成功支上（§3.2）。
+**但同一次真机验证同时挖出了 §8.9 那个覆盖安装缺陷**——所以 ①–⑤ 的「通过」是有保质期的：
+再装一次（任何一次 `pm install -r`）之后，②③④ 仍然会过（builtin 不受影响），
+而 `git clone` / `pull` / `push` 与 `gc` 会静默失效。这条写在这里，是为了让以后有人
+照着这张表复验时不会以为「五条全绿 = 没事」。
+
+### 9.1 复现这张表所需的东西（都已就位）
+
+```bash
+# 装机 / 只读回读 / 建项目 / 驱动工具，四个脚本都在 pi/.tools/
+p3c-build.sh test :core:engine          # 编译机（替代已失效的 bbuild.sh）
+p3c-device-smoke.sh install|files       # 装机与磁盘事实
+p3c-device-create.sh                    # UI 建项目（按 text= 定位）
+p3c-device-tool.sh                      # 驱动 pi 跑 write+bash+git（ASCII 提示词）
+```
+
+三条实测出来的硬约束，写在这里省得下次重踩：
+1. 系统命令一律 `PATH=/system/bin`，否则 `uiautomator` 报 `app_process: inaccessible or not found`；
+2. Compose 的 `testTag` 在真机树里**不出现**（要 `testTagsAsResourceId`），只能按 `text=` 定位；
+3. `input text` **打不了中文**，自动化提示词必须是 ASCII（手打不受影响）。

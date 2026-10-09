@@ -11,6 +11,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -304,6 +305,15 @@ class MainActivityTest {
 
         composeRule.onNodeWithTag(Nav.TAG_ENTRY_SESSIONS).performClick()
         pump()
+        // 行是**后台线程**扫出来的：`SessionsViewModel.refresh()` → `PiSessionScanner.scan()`
+        // 走 `withContext(Dispatchers.IO)` 真读磁盘，`pump()` 只 idle 主 looper，
+        // IO 线程没跑完时那条续体还没投递——整包跑（四个测试类共用一个 JVM、Robolectric 沙箱已热过几轮）
+        // 时窗口更紧，这一行就会「节点不存在」。P3B §3.5 实测到的正是这条（单类跑绿、全量跑红），
+        // 所以这里改成**等行出现**再点：上限 5s，语义不变（点的仍是那条真扫出来的会话）。
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            composeRule.onAllNodesWithTag(SessionsTags.row(seeded.absolutePath))
+                .fetchSemanticsNodes().isNotEmpty()
+        }
         composeRule.onNodeWithTag(SessionsTags.row(seeded.absolutePath)).performScrollTo().performClick()
         pump()
 

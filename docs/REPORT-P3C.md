@@ -172,7 +172,7 @@ feature/sessions/.../ProjectsSource.kt                 UI 侧接缝（接口 + F
 
 | # | 红线 | 实测命令 | 结果 |
 |---|---|---|---|
-| 1 | pi 源码零写入 | `find .tools/pi-1.0.4 -newermt '1 day ago' -type f`（本机） | **0** |
+| 1 | pi 源码零写入 | `find ../.tools/pi-1.0.4 -type f -newermt '2026-10-09 00:00' \| wc -l`（本机，**不是** P3B 那条 `-newermt '1 day ago'`：跨零点跑会漏算，这里直接钉今日零点） | **0** |
 | 2 | 冻结区零 diff | `git diff --stat 80f5e13 -- core/rpc/src/main core/process/src/main core/environment docs/protocol.md tools/capture tools/runtime-packaging` | **空** ✓ |
 | 2b | `ChatEngine` / `RuntimeInstall` / `AssetInstaller` 公共 API 零改动 | `git diff 80f5e13 -- …/ChatEngine.kt …/RuntimeInstall.kt` | `ChatEngine` 未动；`RuntimeInstall` 只多一条 **private** `seedGitIdentity()` ✓ |
 | 3 | `feature/settings` **主源码**一字不动 | `git diff --stat 80f5e13 -- feature/settings/src/main` | **空** ✓（测试假体见 §8.4） |
@@ -208,6 +208,10 @@ e0c4b71 feat(p3c): §3.8/§3.9 app 注入边与版本 8 / 0.1.7
 因此**每个 commit 单独 checkout 不保证可编译**；可编译、可跑的保证点在 `e0c4b71` 这一次
 完整状态上，也就是 §4 矩阵那次数码（8 模块一条命令、`failures=0 errors=0`）。
 这条偏差比「一节一 commit」的信号弱，是本期在交付纪律上实际付出去的代价。
+
+提交后复验：`git status --short | wc -l` = **0**（工作树干净），
+`git log origin/master..HEAD | wc -l` = **5**（本地领先，**未 push**——推送需要用户点头，
+且 `origin` 的 URL 里现在带着明文 token，见 §8.8 第 5 条）。
 
 ## 7. 复现命令
 

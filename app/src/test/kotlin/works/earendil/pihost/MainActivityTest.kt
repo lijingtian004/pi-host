@@ -308,8 +308,8 @@ class MainActivityTest {
         pump()
 
         assertEquals(
-            "点行只发 switch_session，启动责任留在聊天页",
-            listOf(RpcCommand.SwitchSession(seeded.absolutePath)),
+            "点行发一条 switch_session（列表页）+ 一条 get_messages（聊天页只读回填），启动责任留在聊天页",
+            listOf(RpcCommand.SwitchSession(seeded.absolutePath), RpcCommand.GetMessages),
             engine.sent.map { it.command },
         )
         assertEquals(
@@ -319,9 +319,9 @@ class MainActivityTest {
         )
         composeRule.onNodeWithTag(SessionsTags.SCREEN).assertDoesNotExist()
         composeRule.onNodeWithTag(ChatTags.TRANSCRIPT).assertIsDisplayed()
-        // 外部切换 → VM 只做清场（§4.3 的「加载中」占位行），不发第二条命令
+        // 外部切换 → VM 清场并立刻问历史；get_messages 没有脚本回执，所以屏上仍是「会话切换中…」占位
         composeRule.onNodeWithText("会话切换中…").assertIsDisplayed()
-        assertEquals(1, engine.sent.size)
+        assertEquals(2, engine.sent.size)
     }
 
     // ── ⑤ 权限桥：Ready 屏上弹框，「允许一次」与「拒绝」各自回写 ──────────────────

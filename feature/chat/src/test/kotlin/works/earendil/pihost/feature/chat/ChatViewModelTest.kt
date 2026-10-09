@@ -15,6 +15,8 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.After
@@ -112,6 +114,20 @@ class ChatViewModelTest {
         val state = rig.vm.uiState.value
         assertTrue("期望 Ready，实际 $state", state is ChatUiState.Ready)
         return (state as ChatUiState.Ready).sessionId
+    }
+
+    /**
+     * 走一整圈「发命令 → pi 晚到的回执 → VM 处理回执」。
+     *
+     * 中间那次 [FakeChatEngine.deliverScripted] 是必须的：真机的 `response` 一定晚于 `send` 返回
+     * （pi 在另一条线程读管道），假体把这条时序如实搬过来（细节见 FakeChatEngine.scriptedOutbox 的 KDoc），
+     * 所以脚本回执要由测试在这一刻投进总线。投的过程中如果 VM 又发了命令
+     * （切换成功 → 立刻回填），那条回执也在同一次调用里接着投出去——一条因果链一次走完。
+     */
+    private fun TestScope.pumpScripted(rig: Rig) {
+        runCurrent()
+        rig.engine.deliverScripted()
+        runCurrent()
     }
 
     private fun Rig.assistant(): TranscriptItem.AssistantItem =
@@ -804,13 +820,17 @@ class ChatViewModelTest {
      * 钉三件事：
      * 1. **未 Ready 时惰性**：安装门/失败态下清场会把「运行时未安装」洗成一条占位行，
      *    用户就再也按不到安装按钮了 —— 必须原样不动；
-     * 2. **不发命令**：`switch_session` 已由 `:feature:sessions` 发过，这里再发就是同一目标切两遍；
+     * 2. **不代发 `switch_session`**：切换命令已由 `:feature:sessions` 发过，这里再发就是同一目标切两遍。
+     *    P3B §3.1 之后本页**会**补一条只读 `get_messages`（回填历史），所以判据收紧成
+     *    「外部滚只发回填这一条、且发的是 GetMessages」——列表页的命令仍然一条都不多；
      * 3. **不占 `switching` 闩**：外部滚完之后，本页自己的 `switchSession` 仍要能发出去。
      */
     @Test
     fun `case21 an external session roll clears without sending and is inert before Ready`() = runTest {
+        // switch_session 给了回执：③ 那段要走「切换成功 → 清场 → 再回填一条」的完整路径
+        val engine = FakeChatEngine().scriptReply("switch_session")
+        val rig = rig(engine = engine)
         // ① NotInstalled：一行都不许动
-        val rig = rig()
         assertEquals("装配后的初态就是安装门", ChatUiState.NotInstalled, rig.vm.uiState.value)
         rig.vm.onExternalSessionRoll()
         runCurrent()
@@ -818,7 +838,7 @@ class ChatViewModelTest {
         assertNull(rig.vm.notice.value)
         assertEquals(0, rig.engine.sent.size)
 
-        // ② Ready：清场 + 挂占位，零命令
+        // ② Ready：清场 + 挂占位 + 一条只读回填
         ready(rig)
         rig.engine.emit(PiEvent.MessageStart(PiMessage(role = "user", content = textBlocks("上一条会话的问题"))))
         runCurrent()
@@ -830,7 +850,11 @@ class ChatViewModelTest {
         rig.vm.onExternalSessionRoll()
         runCurrent()
 
-        assertEquals("外部滚不发任何 RPC", 0, rig.engine.sent.size)
+        assertEquals(
+            "外部滚只补一条只读回填，切换命令归列表页",
+            listOf(RpcCommand.GetMessages),
+            rig.engine.sent.map { it.command },
+        )
         val rolled = rig.vm.transcript.value
         assertEquals("上一条的内容整条换掉，只剩占位", 1, rolled.size)
         val note = rolled.single()
@@ -841,11 +865,15 @@ class ChatViewModelTest {
         assertNull(rig.vm.commandResult.value)
         assertNull("成功路径不该留提示", rig.vm.notice.value)
 
-        // ③ 闩没被吃掉：本页自己发起的切换照常发得出去（而且恰好一条）
+        // ③ 闩没被吃掉：本页自己发起的切换照常发得出去，且切换成功后照例再补一条回填
         val path = "/files/home/.pi/agent/sessions/--p--/b.jsonl"
         rig.vm.switchSession(path)
-        runCurrent()
-        assertEquals(listOf(RpcCommand.SwitchSession(path)), rig.engine.sent.map { it.command })
+        pumpScripted(rig)
+        assertEquals(
+            "回填（外部滚）→ 切换 → 回填（切换成功）：一条不多一条不少",
+            listOf(RpcCommand.GetMessages, RpcCommand.SwitchSession(path), RpcCommand.GetMessages),
+            rig.engine.sent.map { it.command },
+        )
     }
 
     // ── 用例 22（P2F §4.4）：spawn cause 含 error=13 → Failed.cause 追加 EACCES 提示 ──
@@ -1134,6 +1162,230 @@ class ChatViewModelTest {
         assertEquals(1, rig.engine.uiResponses.size)
     }
 
+    // ── 用例 32–39：P3B §3.1 转录回填（修「切回旧会话历史一片空白」的 P1）───────────
+
+    /**
+     * 回填的触发点：清场之后立刻一条 `get_messages`。
+     *
+     * 这一条钉的是**根因**：pi 的 switchSession 不重放任何历史事件，App 侧清完场没人补，
+     * 所以「清场」与「问历史」必须绑在同一个函数里（`onSessionRolled`），
+     * 少一次调用 = bug 原样复发；多发一次 = 每次切换都白读一遍盘。
+     */
+    @Test
+    fun `case32 a successful switch immediately asks pi for the history of the new session`() = runTest {
+        val engine = FakeChatEngine().scriptReply("switch_session")
+        val rig = rig(engine = engine)
+        ready(rig)
+
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/old.jsonl")
+        pumpScripted(rig)
+
+        val backfill = rig.engine.sent.last()
+        assertEquals("清完场必须紧跟着问一次历史", RpcCommand.GetMessages, backfill.command)
+        assertNotNull("回填也要带 requestId，否则认不出哪条回执属于它", backfill.id)
+        assertEquals("一次切换恰好一次回填", 1, engine.sent.count { it.command == RpcCommand.GetMessages })
+        assertEquals(
+            "回执未定之前，屏幕上还是那条占位行",
+            listOf(SWITCHING_NOTE_TEXT),
+            rig.vm.transcript.value.filterIsInstance<TranscriptItem.NoteItem>().map { it.text },
+        )
+    }
+
+    @Test
+    fun `case33 backfilled history replaces the loading note in transcript order`() = runTest {
+        val engine = FakeChatEngine()
+            .scriptReply("switch_session")
+            .scriptReply("get_messages", data = historyEnvelope())
+        val audit = FakeAuditSink()
+        val rig = rig(engine = engine, audit = audit)
+        ready(rig)
+
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/old.jsonl")
+        pumpScripted(rig)
+
+        val items = rig.vm.transcript.value
+        assertTrue(
+            "历史到了就不该再挂着「会话切换中…」",
+            items.none { it is TranscriptItem.NoteItem },
+        )
+        // 逐条比形状+正文，不硬编 id：占位行本身也要消耗一个 nextItemId()，
+        // 把 id 写死等于把「回填前挂过几行占位」这一实现细节钉进断言。
+        assertEquals(
+            "system 不上屏，其余按线格式顺序落进转录",
+            listOf(
+                "UserItem" to "跑一下分支命令",
+                "AssistantItem" to "已在 main 分支",
+                "ToolItem" to "On branch main",
+            ),
+            items.map { item ->
+                item::class.simpleName to when (item) {
+                    is TranscriptItem.UserItem -> item.text
+                    is TranscriptItem.AssistantItem -> item.text
+                    is TranscriptItem.ToolItem -> item.output
+                    else -> ""
+                }
+            },
+        )
+        val assistant = items[1] as TranscriptItem.AssistantItem
+        assertTrue("回填的 assistant 是终态，后面的 delta 不许往历史里写", assistant.settled)
+        val tool = items[2] as TranscriptItem.ToolItem
+        assertEquals("call-1", tool.callId)
+        assertEquals(ToolStatus.Ok, tool.status)
+        assertEquals("回填不记审计：历史重放不是第二次执行", 0, audit.entries.size)
+    }
+
+    @Test
+    fun `case34 a rejected get_messages leaves an empty page with a readable failure note`() = runTest {
+        val engine = FakeChatEngine()
+            .scriptReply("switch_session")
+            .scriptReply("get_messages", success = false, error = "会话文件不存在")
+        val rig = rig(engine = engine)
+        ready(rig)
+
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/gone.jsonl")
+        pumpScripted(rig)
+
+        assertEquals(
+            listOf(BACKFILL_FAILED_TEXT),
+            rig.vm.transcript.value.filterIsInstance<TranscriptItem.NoteItem>().map { it.text },
+        )
+        assertEquals("除了回填这一条，什么都没往线路上发", 2, engine.sent.size)
+    }
+
+    @Test
+    fun `case35 a response with an unknown shape is a failure, not a crash and not an empty history`() = runTest {
+        val engine = FakeChatEngine()
+            .scriptReply("switch_session")
+            .scriptReply("get_messages", data = buildJsonObject { put("entries", JsonArray(emptyList())) })
+        val rig = rig(engine = engine)
+        ready(rig)
+
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/weird.jsonl")
+        pumpScripted(rig)
+
+        assertEquals(
+            "形状不对要说「加载失败」，不能说成空历史（那是另一种真相）",
+            listOf(BACKFILL_FAILED_TEXT),
+            rig.vm.transcript.value.filterIsInstance<TranscriptItem.NoteItem>().map { it.text },
+        )
+        assertEquals(TurnState.Idle, rig.vm.turnState.value)
+    }
+
+    @Test
+    fun `case36 a backfill racing a fresh prompt appends history instead of overwriting it`() = runTest {
+        val engine = FakeChatEngine().scriptReply("switch_session")
+        val rig = rig(engine = engine)
+        ready(rig)
+
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/old.jsonl")
+        pumpScripted(rig)
+        val backfillId = engine.sent.last().id
+
+        // 用户没等历史就打字发出去了（真机上这是最常见的动作）
+        rig.vm.sendPrompt("新问题不等历史")
+        runCurrent()
+        rig.engine.emit(update(AssistantMessageEvent.TextStart(0)))
+        rig.engine.emit(update(AssistantMessageEvent.TextDelta(0, "正在流式的一半")))
+        runCurrent()
+
+        rig.engine.emit(
+            PiEvent.Response(id = backfillId, command = "get_messages", success = true, data = historyEnvelope()),
+        )
+        runCurrent()
+
+        val texts = rig.vm.transcript.value.map {
+            when (it) {
+                is TranscriptItem.UserItem -> it.text
+                is TranscriptItem.AssistantItem -> it.text
+                else -> "«${it::class.simpleName}»"
+            }
+        }
+        assertEquals(
+            "刚发的字与正在流式的一行都不许被历史抹掉（§3.1 的 append 语义）",
+            listOf("新问题不等历史", "正在流式的一半", "跑一下分支命令", "已在 main 分支", "«ToolItem»"),
+            texts,
+        )
+        assertEquals(TurnState.Streaming, rig.vm.turnState.value)
+    }
+
+    /**
+     * 真机上那条 P1 的**主路径**：从 sessions 屏点行进来，命令是列表页发的，
+     * 本页只清场（`onExternalSessionRoll`），所以回填也必须挂在这条路上——
+     * 只在 [ChatViewModel.rollSession] 里补历史等于没修。
+     */
+    @Test
+    fun `case37 an external roll backfills without sending a second switch_session`() = runTest {
+        val engine = FakeChatEngine().scriptReply("get_messages", data = historyEnvelope())
+        val rig = rig(engine = engine)
+        ready(rig)
+
+        rig.vm.onExternalSessionRoll()
+        pumpScripted(rig)
+
+        assertEquals(
+            "本页只发一条只读回填，切换命令归列表页",
+            listOf(RpcCommand.GetMessages),
+            engine.sent.map { it.command },
+        )
+        assertEquals(3, rig.vm.transcript.value.size)
+        assertTrue(rig.vm.transcript.value.none { it is TranscriptItem.NoteItem })
+    }
+
+    @Test
+    fun `case38 a brand new session answers zero messages and the page stays clean`() = runTest {
+        val engine = FakeChatEngine()
+            .scriptReply("new_session")
+            .scriptReply("get_messages", data = buildJsonObject { put("messages", buildJsonArray { }) })
+        val rig = rig(engine = engine)
+        ready(rig)
+
+        rig.vm.newSession()
+        pumpScripted(rig)
+
+        assertTrue("空历史是合法答案：不留占位行、也不报「加载失败」", rig.vm.transcript.value.isEmpty())
+    }
+
+    /**
+     * 连切两条会话：上一条 `get_messages` 的回执晚到，**绝不许**把旧会话的历史
+     * 糊到新会话的转录上（回填只认最新那个 requestId）。
+     */
+    @Test
+    fun `case39 a late backfill from the previous session is ignored`() = runTest {
+        val engine = FakeChatEngine().scriptReply("switch_session").scriptReply("switch_session")
+        val rig = rig(engine = engine)
+        ready(rig)
+
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/first.jsonl")
+        pumpScripted(rig)
+        val staleId = engine.sent.last().id // 第一条 get_messages 的 requestId
+
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/second.jsonl")
+        pumpScripted(rig)
+        val freshId = engine.sent.last().id
+
+        engine.emit(
+            PiEvent.Response(
+                id = staleId, command = "get_messages", success = true,
+                data = buildJsonObject {
+                    put("messages", buildJsonArray { add(messageEnvelope("user", "旧会话的历史")) })
+                },
+            ),
+        )
+        runCurrent()
+        assertTrue("晚到的旧回执一条都不许上屏", rig.vm.transcript.value.none { it is TranscriptItem.UserItem })
+
+        engine.emit(
+            PiEvent.Response(
+                id = freshId, command = "get_messages", success = true,
+                data = buildJsonObject {
+                    put("messages", buildJsonArray { add(messageEnvelope("user", "这一条才是当前的")) })
+                },
+            ),
+        )
+        runCurrent()
+        assertEquals(listOf("这一条才是当前的"), rig.vm.transcript.value.filterIsInstance<TranscriptItem.UserItem>().map { it.text })
+    }
+
     private companion object {
         fun update(event: AssistantMessageEvent): PiEvent =
             PiEvent.MessageUpdate(assistantMessageEvent = event)
@@ -1154,5 +1406,36 @@ class ChatViewModelTest {
             message = message,
             timeout = timeout,
         )
+
+        /** 一条 user 消息的线格式外壳（§3.1 里 toolResult/system 各自的形状见 ChatHistoryTest）。 */
+        fun messageEnvelope(role: String, text: String): JsonObject =
+            buildJsonObject { put("role", role); put("content", textBlocks(text)) }
+
+        /** golden 001/002 拼出来的四 role 历史（system + user + assistant + toolResult）。 */
+        fun historyEnvelope(): JsonObject = buildJsonObject {
+            put(
+                "messages",
+                buildJsonArray {
+                    add(buildJsonObject { put("role", "system"); put("content", "") })
+                    add(messageEnvelope("user", "跑一下分支命令"))
+                    add(
+                        buildJsonObject {
+                            put("role", "assistant")
+                            put("content", textBlocks("已在 main 分支"))
+                            put("stopReason", "stop")
+                        },
+                    )
+                    add(
+                        buildJsonObject {
+                            put("role", "toolResult")
+                            put("toolCallId", "call-1")
+                            put("toolName", "bash")
+                            put("content", textBlocks("On branch main"))
+                            put("isError", false)
+                        },
+                    )
+                },
+            )
+        }
     }
 }

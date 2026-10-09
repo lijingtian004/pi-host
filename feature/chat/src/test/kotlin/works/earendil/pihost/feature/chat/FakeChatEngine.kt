@@ -1,5 +1,7 @@
 package works.earendil.pihost.feature.chat
 
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.channels.BufferOverflow
@@ -10,12 +12,16 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.InstallProgress
 import works.earendil.pihost.core.engine.RuntimeInstall
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
 import works.earendil.pihost.core.rpc.PiEvent
+import works.earendil.pihost.core.rpc.PiJsonOut
 import works.earendil.pihost.core.rpc.RpcCommand
 
 /**
@@ -64,6 +70,75 @@ class FakeChatEngine(val sessionId: String = SESSION) : ChatEngine {
 
     private val replySeq = AtomicInteger(0)
 
+    // ── 可编程 response 队列（P3B §3.1）───────────────────────────────────────────
+
+    /**
+     * `command 线名 → 待回应的 response` 脚本表。
+     *
+     * 存在的理由：回填、队列、模型、统计四条新路径都要「发一条命令 → 收到一条 shape 正确的回执」，
+     * 而手写 `emit(PiEvent.Response(id = engine.sent.last().id, …))` 会把「谁发的」这件事
+     * 变成每条用例都要重做一遍的手工活（且极易在 id 上写出假绿）。
+     * 语义按真机：[send] 时**按 FIFO 取一条**同名片段回出去，`id` 用这次真实的 requestId 覆盖，
+     * 所以 VM 侧的 requestId 关联逻辑一行都不用为测试让步。
+     *
+     * 用 `ConcurrentLinkedQueue` 而不是普通 List：Unconfined 收集协程会在 [send] 返回之前
+     * 就地跑完整条 response 处理链，那里如果又发一条命令（未来 pull-to-refresh 之类），
+     * 重入是可能的；队列必须扛得住。
+     */
+    private val replyScripts = ConcurrentHashMap<String, ConcurrentLinkedQueue<PiEvent.Response>>()
+
+    /**
+     * `send` 收下、但**还没投进总线**的脚本回执。
+     *
+     * 这一层缓冲不是洁癖，是实测逼出来的（P3B §3.1 第一轮）：在 [send] 里就地 `emit` 的话，
+     * 回执比 `rollSession` 那条一次性收集协程注册得更早——`launch(Dispatchers.Unconfined)`
+     * 在测试派发器上是「排到当前 unconfined 块跑完才起」，于是 SharedFlow 面前无订阅者，
+     * 值进 512 的缓冲后被丢，切换永远等不到回执（表现：notice 仍为 null、transcript 空、
+     * 回填一条都没发）。真机的回执**必然晚于 send 返回**（pi 在另一个线程读管道），
+     * 所以这里也晚于：由测试调 [deliverScripted] 把它投出去。
+     */
+    private val scriptedOutbox = ConcurrentLinkedQueue<PiEvent.Response>()
+
+    /**
+     * 挂一条脚本：[command] 是线名（`"get_messages"`），[data] 是 response 的载荷。
+     *
+     * 同名可以挂多条，按 FIFO 消费——正好演「同一命令在两次回填里回不同东西」。
+     */
+    fun scriptReply(
+        command: String,
+        data: JsonObject? = null,
+        success: Boolean = true,
+        error: String? = null,
+    ): FakeChatEngine {
+        replyScripts.getOrPut(command) { ConcurrentLinkedQueue() }
+            .add(PiEvent.Response(id = null, command = command, success = success, data = data, error = error))
+        return this
+    }
+
+    /** 同名脚本还剩几条（用例拿它当「消费干净了没」的断言）。 */
+    fun pendingReplies(command: String): Int = replyScripts[command]?.size ?: 0
+
+    /**
+     * 把攒下的脚本回执按 FIFO 投进总线，返回投了几条。
+     *
+     * 投递过程中如果 VM 又发了命令（切换成功 → 立刻 `get_messages` 回填，正是这条链），
+     * 那条命令的回执会**在同一个循环里被接着投出去**——与真机上「一连串回执排队到达」同形，
+     * 所以用例里一次 [deliverScripted] 就能走完整条因果链。
+     */
+    fun deliverScripted(): Int {
+        var delivered = 0
+        while (true) {
+            val next = scriptedOutbox.poll() ?: break
+            emit(next)
+            delivered++
+        }
+        return delivered
+    }
+
+    /** 这次出站命令有没有命中一张脚本（命中即回，未命中就只是记进 [sent]）。 */
+    private fun replyFor(command: RpcCommand): PiEvent.Response? =
+        replyScripts[wireName(command)]?.poll()
+
     /** 事件注入：`tryEmit` 的返回值一并断言，别让「没订阅者」变成静默丢事件。 */
     fun emit(event: PiEvent) {
         check(bus.tryEmit(event)) { "事件未能进入总线：$event" }
@@ -107,6 +182,9 @@ class FakeChatEngine(val sessionId: String = SESSION) : ChatEngine {
         val requestId = id ?: "fake-${replySeq.incrementAndGet()}"
         sendError?.let { throw it }
         sent.add(Sent(sessionId, command, requestId))
+        // 有脚本就攒一条（id 用这次真正的 requestId，与 pi 的「原样回显」同形），
+        // 但**不在此刻投递**——理由见 [scriptedOutbox]
+        replyFor(command)?.let { scriptedOutbox.add(it.copy(id = requestId)) }
         return requestId
     }
 
@@ -121,6 +199,18 @@ class FakeChatEngine(val sessionId: String = SESSION) : ChatEngine {
         /** 固定 UUID：argv/断言都好看，且与 P2C 的 session-id 形状一致。 */
         const val SESSION: String = "11111111-2222-4444-8888-555555555555"
     }
+}
+
+/**
+ * 命令 → 线名（`get_messages` / `set_model` / …）。
+ *
+ * 取的是**冻结区自己的序列化出口**（`RpcCommand` 的 `@SerialName` 就是线上的 `type`，
+ * `encodeCommand` 也走同一条），不是本地再抄一张 map：
+ * 命令改名时脚本表跟着漂，用例立刻红，而不是「静默没回回执」那种难查的假失败。
+ */
+internal fun wireName(command: RpcCommand): String {
+    val obj = PiJsonOut.encodeToJsonElement(RpcCommand.serializer(), command) as? JsonObject
+    return obj?.get("type")?.jsonPrimitive?.contentOrNull ?: command::class.simpleName.orEmpty()
 }
 
 /**

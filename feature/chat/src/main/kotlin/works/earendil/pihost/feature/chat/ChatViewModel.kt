@@ -153,6 +153,15 @@ class ChatViewModel @Inject constructor(
     /** 切换/新建会话的进行闩（回执未定之前不接受第二次滚，见 [rollSession]）。 */
     private var switching = false
 
+    /**
+     * 在途回填的 requestId（P3B §3.1）。
+     *
+     * 只留**最新那一次**：回填是「清场之后补历史」，一旦又滚了一次会话，
+     * 上一条 `get_messages` 的回执就属于旧会话了——它落进 [onCommandResponse] 时
+     * 认不出这个 id，于是只进命令通道、绝不把旧历史 append 到新转录上。
+     */
+    private var backfillRequestId: String? = null
+
     private var itemSeq = 0
     private var commandSeq = 0
     private val pendingCommandIds = mutableSetOf<String>()
@@ -430,7 +439,16 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    /** 切换成功的清场（§4.3 原文：turnState=Idle + transcript 清空 + 「加载中」条目）。 */
+    /**
+     * 切换成功的清场（§4.3 原文：turnState=Idle + transcript 清空 + 「加载中」条目）。
+     *
+     * **P3B §3.1 补的最后一步**：清完场必须有人把历史补回来。
+     * pi 的 `switchSession` 只换 SessionManager 并重发 `session_start{reason:"resume"}`，
+     * **不重放任何历史事件**（`agent-session-runtime.ts:196`），所以「清场」与「有内容」
+     * 之间隔着一条必须由宿主填上的缝——这就是那条 P1 的全部成因。
+     * 挂在这里而不是只挂 [rollSession]：从 sessions 屏点行进来走的是 [onExternalSessionRoll]，
+     * 命令由列表页发、本页只清场，两条路最终都汇到这一个清场点，回填自然也只有一处。
+     */
     private fun onSessionRolled() {
         cancelPermissionOnce() // 挂着的权限弹框随旧会话一起作废（补 cancelled 恰好一次）
         flushDraft()
@@ -439,6 +457,7 @@ class ChatViewModel @Inject constructor(
         _commandResult.value = null
         _retryNote.value = null
         showLoadingNote()
+        backfillTranscript()
     }
 
     /** 挂「加载中」占位，并给它一个自动撤身时限（§4.3）。 */
@@ -457,6 +476,65 @@ class ChatViewModel @Inject constructor(
         noteExpiryJob = null
         if (_transcript.value.none { it is TranscriptItem.NoteItem }) return
         _transcript.update { list -> list.filterNot { it is TranscriptItem.NoteItem } }
+    }
+
+    // ── 转录回填（P3B §3.1）──────────────────────────────────────────────────────
+
+    /**
+     * 拉当前会话的历史并补进转录（`get_messages`，protocol.md §3.6 → `{messages: AgentMessage[]}`）。
+     *
+     * 三条取舍：
+     * 1. **纯读**（§2 红线 6）：这条路径只有 `get_messages` 一问一答，
+     *    不发 `switch_session`/`new_session`、不写任何 session 文件——回填失败也只是「看不到」，
+     *    绝不会让用户的历史在磁盘上少一行；
+     * 2. **不等超时**：与 [rollSession] 不同，这里不 `withTimeoutOrNull`。
+     *    rollSession 等的是「能不能清场」，超时不清场是对的；回填等的是「补不补得上」，
+     *    真机上的 pi 无响应最终会由 `get_messages` 自己的回执或会话失败面收场，
+     *    多挂一个计时器只会让「清完场到回执之间」那段本来就在滚的占位行提前变成假故障。
+     *    回执永不到 = 占位行按 [SWITCH_NOTE_TIMEOUT_MS] 自己退场，界面留空但不撒谎；
+     * 3. **append 不清场**（§3.1 的竞态约束）：结果用 `list + items` 追加，
+     *    期间用户已经发出去的 prompt、正在流式的 assistant 一条都不动。
+     *    代价是竞态时历史会落在新内容**下面**（顺序不如真机 pi 的时序），
+     *    这比「把用户刚打的字抹掉」好得多，规格书点名的就是这个取舍。
+     */
+    fun backfillTranscript() {
+        val id = sessionId ?: return
+        viewModelScope.launch(Dispatchers.Unconfined) {
+            val requestId = nextCommandId()
+            pendingCommandIds.add(requestId)
+            backfillRequestId = requestId
+            val sent = runCatching { engine.send(id, RpcCommand.GetMessages, requestId) }
+            if (sent.isFailure) {
+                pendingCommandIds -= requestId
+                backfillRequestId = null
+                onBackfillFailure(sent.exceptionOrNull()?.message)
+            }
+        }
+    }
+
+    /**
+     * 回填回执的唯一落地口（由 [onCommandResponse] 认出 [backfillRequestId] 后调用）。
+     *
+     * 三种结局：成功且有条目 → 追加；成功但空会话 → 只撤占位行；失败/形状不对 → 占位行换成
+     * 「历史加载失败」。三条都先停掉 [noteExpiryJob]：回填一结束，那条「会话切换中…」
+     * 的使命就到头了，再让计时器迟到一次去 `filterNot { NoteItem }` 会把刚挂上的故障提示也抹掉。
+     */
+    private fun applyBackfill(event: PiEvent.Response) {
+        noteExpiryJob?.cancel()
+        noteExpiryJob = null
+        val messages = if (event.success) ChatHistory.parseMessages(event.data) else null
+        if (messages == null) {
+            onBackfillFailure(event.error ?: "get_messages 回执形状不对")
+            return
+        }
+        val items = ChatHistory.toTranscriptItems(messages) { nextItemId() }
+        mutateTranscript { list -> list + items }
+    }
+
+    /** 回填失败的可见化：一行说明 + 一条 logcat（红线 6 要求「保留空 transcript + 提示」）。 */
+    private fun onBackfillFailure(cause: String?) {
+        Log.w(BACKFILL_LOG_TAG, "get_messages 回填失败：${cause ?: "无原因"}")
+        mutateTranscript { list -> list + TranscriptItem.NoteItem(nextItemId(), BACKFILL_FAILED_TEXT) }
     }
 
     /**
@@ -797,6 +875,12 @@ class ChatViewModel @Inject constructor(
         val id = event.id ?: return
         if (id !in pendingCommandIds) return
         pendingCommandIds -= id
+        // §3.1：回填那条走专属通道（历史落进 transcript），但它仍然是 VM 自己发的命令，
+        // 所以 commandResult 也照记——探针面板看到的形状对所有命令保持一致。
+        if (id == backfillRequestId) {
+            backfillRequestId = null
+            applyBackfill(event)
+        }
         _commandResult.value = event
     }
 
@@ -936,17 +1020,14 @@ class ChatViewModel @Inject constructor(
         /** 审计旁路自己的日志 tag（与 `FileAuditSink.TAG` 同一串，日志侧好聚合）。 */
         const val AUDIT_LOG_TAG = "PiHost/Audit"
 
-        const val ROLE_USER = "user"
-        const val ROLE_ASSISTANT = "assistant"
-
         /** protocol.md §3.7：pi 侧 confirm 的缺省超时（实测 15000ms）。 */
         const val DEFAULT_UI_TIMEOUT_MS = 15_000L
 
         /** 倒计时改写 remainingMs 的粒度（虚拟时间测试里 = 15 格）。 */
         const val TICK_MS = 1_000L
 
-        /** 失败原因上屏的截断长度（§6「cause（截断）」）。 */
-        const val CAUSE_MAX_LEN = 240
+        /** 回填失败的日志 tag（§3.1：提示上屏之外还要留一条可查的现场）。 */
+        const val BACKFILL_LOG_TAG = "PiHost/ChatHistory"
     }
 }
 

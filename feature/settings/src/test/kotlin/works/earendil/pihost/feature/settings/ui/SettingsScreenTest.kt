@@ -1,5 +1,7 @@
 package works.earendil.pihost.feature.settings.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.assertIsDisplayed
@@ -38,6 +40,8 @@ import works.earendil.pihost.core.engine.settings.RelayEndpointStore
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.feature.settings.ui.SettingsStrings
+import works.earendil.pihost.feature.settings.CrashReportSummary
+import works.earendil.pihost.feature.settings.FakeDiagnosticsSource
 import works.earendil.pihost.feature.settings.FakeEngine
 import works.earendil.pihost.feature.settings.FakeModelCredentialSource
 import works.earendil.pihost.feature.settings.FakeRelayEndpointSource
@@ -56,8 +60,9 @@ import works.earendil.pihost.core.rpc.RpcCommand
  *
  * `pump()` 抄 `MainActivityTest`/`SessionsScreenTest` 的配方：`waitForIdle()` 只收敛重组，
  * 不保证 `viewModelScope` 的 pending task 已跑完。
- * 本文件不建 Hilt 图（`SettingsViewModel` 是普通 `ViewModel`，五个依赖都是假体，
- * 手工构造比拉一条 `@HiltViewModel` 测试路径便宜得多）。
+ * 本文件不建 Hilt 图（`SettingsViewModel` 是普通 `ViewModel`，六个依赖都是假体，
+ * 手工构造比拉一条 `@HiltViewModel` 测试路径便宜得多）。P3A §3.5 加的诊断面走
+ * [FakeDiagnosticsSource]，默认空列表 —— 对 g 与 h 那两代用例零干扰。
  *
  * **`qualifiers` 的高度从 2400dp 抬到 6400dp（P2H 实测的必要改动，不是装饰）**：
  * 整屏是一个 `verticalScroll` 的 `Column`，提示条 `NOTICE` 排在**所有 Section 之后**，
@@ -66,9 +71,13 @@ import works.earendil.pihost.core.rpc.RpcCommand
  * g02/g09/g11/g12 四条老用例与 h02/h06/… 新用例一起转红（红的是「看不见」，不是「没内容」：
  * 同一句文案用 `assertExists()` 仍然通过）。这里选择**加高虚拟屏**而不是把老用例改成 `assertExists`：
  * 前者保住的是「用户一屏之内真能看见这条提示」这条断言的语义，后者会把它悄悄降级成「树上有个节点」。
+ *
+ * **P3A §3.5 再抬到 7200dp**：诊断 Section 插在 ProbeCard 之前（一段提示 + 三颗按钮 + 若干行），
+ * 又把 notice 往下推了一屏的几分之一。同一条理由，第二次加码——不是想要更大的屏，
+ * 是 `assertIsDisplayed` 的语义不允许 notice 掉出可见区。
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35], qualifiers = "w420dp-h6400dp")
+@Config(sdk = [35], qualifiers = "w420dp-h7200dp")
 class SettingsScreenTest {
 
     @get:Rule
@@ -181,6 +190,39 @@ class SettingsScreenTest {
             ?: "<节点上没有 EditableText 属性>"
     }
 
+    /**
+     * 此刻剪贴板上的纯文本（没有内容 → null）。
+     *
+     * `LocalClipboardManager` 在 Android 上就是 `ClipboardManager`（Robolectric 的
+     * `ShadowClipboardManager` 把 clip 存在内存里），所以这里直接问**系统服务**那一侧：
+     * 断言的是「用户 Ctrl+V 出来的是什么」，而不是「Compose 有没有调过 setText」。
+     * `primaryClip` 在没写过的时候可能是 itemCount=0 的空 ClipData，两种空形态都算 null。
+     */
+    private fun clipboardText(): String? {
+        val manager = composeRule.activity.getSystemService(ClipboardManager::class.java)
+        val clip = manager?.primaryClip ?: return null
+        if (clip.itemCount == 0) return null
+        return clip.getItemAt(0)?.coerceToText(composeRule.activity)?.toString()
+    }
+
+    /** 把剪贴板种成一个可辨认的值，好用「落空时不许动它」这条断言。 */
+    private fun seedClipboard(marker: String) {
+        composeRule.activity.getSystemService(ClipboardManager::class.java)!!
+            .setPrimaryClip(ClipData.newPlainText("test", marker))
+        assertEquals("假体没种上", marker, clipboardText())
+    }
+
+    /** 一行的第三段（时间）只断言**形状**：时区跟着跑测试的机器，写死 `11-14 22:13` 是一条假断言。 */
+    private fun rowParts(text: String): List<String> = text.split(" · ").map { it.trim() }
+
+    /** 诊断行节点：按 tag 取，返回其唯一显示文本。 */
+    private fun rowText(fileName: String): String =
+        composeRule.onNodeWithTag(SettingsTags.diagnosticsRow(fileName))
+            .fetchSemanticsNode("诊断行（file=$fileName）")
+            .config.getOrNull(SemanticsProperties.Text)!!
+            .single()
+            .text
+
     private class Rig(
         val vm: SettingsViewModel,
         val repository: FakeSettingsRepository,
@@ -188,6 +230,7 @@ class SettingsScreenTest {
         val info: FakeRuntimeInfo,
         val credentials: FakeModelCredentialSource,
         val relays: FakeRelayEndpointSource,
+        val diagnostics: FakeDiagnosticsSource,
     )
 
     private fun rig(
@@ -199,16 +242,17 @@ class SettingsScreenTest {
         ),
         credentials: FakeModelCredentialSource = FakeModelCredentialSource(),
         relays: FakeRelayEndpointSource = FakeRelayEndpointSource(),
+        diagnostics: FakeDiagnosticsSource = FakeDiagnosticsSource(),
     ): Rig {
         val engine = FakeEngine()
         if (live) engine.setState(FakeEngine.SESSION, SessionState.Ready)
         val repository = FakeSettingsRepository(settings)
-        val vm = SettingsViewModel(repository, engine, info, credentials, relays)
+        val vm = SettingsViewModel(repository, engine, info, credentials, relays, diagnostics)
         composeRule.setContent {
             SettingsScreen(viewModel = vm, onBack = { backs.incrementAndGet() })
         }
         pump()
-        return Rig(vm, repository, engine, info, credentials, relays)
+        return Rig(vm, repository, engine, info, credentials, relays, diagnostics)
     }
 
     // ── g01 四个部件都在树上 ──────────────────────────────────────────────────────
@@ -827,5 +871,167 @@ class SettingsScreenTest {
         assertRelayKeyValue("sk-relay-live")
         assertKeyNotEchoed("sk-relay-live")
         composeRule.onNodeWithTag(SettingsTags.RELAY_EMPTY).assertIsDisplayed()
+    }
+
+    // ══ P3A §3.5 诊断 section ════════════════════════════════════════════════════
+    //
+    // 编号另起一代 `i`：g*（P2 的四个部件）、h*（P2H 的模型接入）之后，
+    // 崩溃报告是第三批往同一屏上挂的 Section。夹具与它们共用 `rig()`，
+    // 只是多给了第六个依赖 [FakeDiagnosticsSource]（默认空列表 → 与老用例零干扰）。
+
+    // ── i01 空态：一句「无崩溃记录」，三个按钮都不禁用 ──────────────────────────
+
+    @Test
+    fun `i01 an empty crash dir shows one empty state and three live buttons`() {
+        val rig = rig()
+
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_SECTION).assertExists()
+        composeRule.onNodeWithText(SettingsStrings.SECTION_DIAGNOSTICS).assertIsDisplayed()
+        composeRule.onNodeWithText(SettingsStrings.DIAGNOSTICS_HINT, substring = true).assertIsDisplayed()
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_EMPTY).assertIsDisplayed()
+            .assertTextEquals(SettingsStrings.DIAGNOSTICS_NONE)
+        // 三颗按钮空列表时也**必须**能点：readLatest 的语义是「最近一份读得动的」，
+        // 列表空但有坏文件时，只有点下去才拿得到 null、才有那条落空回执。
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_COPY).assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_CLEAR).assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_REFRESH).assertIsDisplayed().assertIsEnabled()
+        assertEquals("进屏自己发一次列表读口，不靠 UI 补一枪", 1, rig.diagnostics.listCalls.get())
+    }
+
+    // ── i02 有报告：一行「文件名 · 大小 · 时间」，正文一个字都不许上屏 ────────────
+
+    @Test
+    fun `i02 reports render one row each and the crash body never reaches the screen`() {
+        val body = "time=2026-10-09T02:03:04Z epoch=1760000000000 version=0.1.4\n" +
+            "java.lang.IllegalStateException: /data/user/0/works.earendil.pihost/files/home/.pi/agent 崩了\n" +
+            "\tat works.earendil.pihost.feature.settings.SettingsViewModel.clearCrashReports(SettingsViewModel.kt:187)"
+        val rig = rig(
+            diagnostics = FakeDiagnosticsSource(
+                initial = listOf(
+                    CrashReportSummary("crash-1700000000000.txt", 1_200L, java.time.Instant.ofEpochMilli(1_700_000_000_000L)),
+                    CrashReportSummary("crash-1699999999000.txt", 512L, java.time.Instant.ofEpochMilli(1_699_999_999_000L)),
+                ),
+                body = body,
+            ),
+        )
+
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_EMPTY).assertDoesNotExist()
+        assertEquals(
+            "两份报告就该是两行，不多不少",
+            2,
+            composeRule.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsProperties.TestTag))
+                .fetchSemanticsNodes()
+                .count { it.config.getOrNull(SemanticsProperties.TestTag)?.startsWith(SettingsTags.DIAGNOSTICS_SECTION + "-row-") == true },
+        )
+        val newest = rowParts(rowText("crash-1700000000000.txt"))
+        assertEquals("一行的三段：${newest}", 3, newest.size)
+        assertEquals("crash-1700000000000.txt", newest[0])
+        assertEquals("1.2 KB", newest[1])
+        assertTrue("时间列得是 MM-dd HH:mm 的形状，实际值跟着测试机的时区走：${newest[2]}",
+            Regex("""\d{2}-\d{2} \d{2}:\d{2}""").matches(newest[2]))
+        assertEquals("512 B", rowParts(rowText("crash-1699999999000.txt"))[1])
+
+        // §3.5 的红线：正文（绝对路径 + 完整栈 + 用户语境）只出剪贴板，屏幕上一个字都不给。
+        assertFalse("屏幕上看不到栈里的类名", displayTexts().any { it.contains("at works.earendil") })
+        assertFalse("屏幕上看不到崩溃正文", displayTexts().any { it.contains("崩了") })
+        assertFalse("屏幕上看不到沙箱绝对路径", displayTexts().any { it.contains("/data/user/0") })
+        assertEquals("列表渲染不调读口（正文是按需读的）", 0, rig.diagnostics.latestCalls.get())
+    }
+
+    // ── i03 清空：走 VM 一次，回执说实际份数，行当场消失 ──────────────────────────
+
+    @Test
+    fun `i03 clearing goes through the view model and reports how many were deleted`() {
+        val rig = rig(
+            diagnostics = FakeDiagnosticsSource(
+                initial = listOf(
+                    CrashReportSummary("crash-1.txt", 10L, java.time.Instant.ofEpochMilli(1_700_000_000_000L)),
+                    CrashReportSummary("crash-2.txt", 20L, java.time.Instant.ofEpochMilli(1_700_000_000_000L)),
+                ),
+            ),
+        )
+        composeRule.onNodeWithTag(SettingsTags.diagnosticsRow("crash-1.txt")).assertIsDisplayed()
+
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_CLEAR).performClick()
+        pump()
+
+        assertEquals("清空只问 source 一次", 1, rig.diagnostics.clearCalls.get())
+        composeRule.onNodeWithTag(SettingsTags.NOTICE).assertIsDisplayed()
+        composeRule.onNodeWithText(SettingsStrings.crashCleared(2)).assertIsDisplayed()
+        composeRule.onNodeWithTag(SettingsTags.diagnosticsRow("crash-1.txt")).assertDoesNotExist()
+        composeRule.onNodeWithTag(SettingsTags.diagnosticsRow("crash-2.txt")).assertDoesNotExist()
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_EMPTY).assertIsDisplayed()
+    }
+
+    // ── i04 复制最近一份：正文进剪贴板，notice 只说结果不念内容 ───────────────────
+
+    @Test
+    fun `i04 copying puts the body on the clipboard and the notice only states the outcome`() {
+        val body = "time=2026-10-09T02:03:04Z epoch=1760000000000 version=0.1.4\njava.lang.IllegalStateException: boom"
+        val rig = rig(
+            diagnostics = FakeDiagnosticsSource(
+                initial = listOf(
+                    CrashReportSummary("crash-1700000000000.txt", 1_200L, java.time.Instant.ofEpochMilli(1_700_000_000_000L)),
+                ),
+                body = body,
+            ),
+        )
+
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_COPY).performClick()
+        pump()
+
+        assertEquals("剪贴板里必须就是那份正文", body, clipboardText())
+        assertEquals("读口只被问一次", 1, rig.diagnostics.latestCalls.get())
+        composeRule.onNodeWithText(SettingsStrings.DIAGNOSTICS_COPIED).assertIsDisplayed()
+        assertFalse("回执不许念正文", displayTexts().any { it.contains("boom") })
+    }
+
+    // ── i05 复制落空：没有可读的一份 → 剪贴板原样不动 + 那条回执 ──────────────────
+
+    @Test
+    fun `i05 a copy with nothing readable leaves the clipboard alone`() {
+        val rig = rig(diagnostics = FakeDiagnosticsSource())
+        seedClipboard("别动我")
+
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_COPY).performClick()
+        pump()
+        assertEquals("落空时不许把用户原来拷的东西顶掉", "别动我", clipboardText())
+        composeRule.onNodeWithText(SettingsStrings.DIAGNOSTICS_NONE_NOTICE).assertIsDisplayed()
+
+        // 同一颗按钮的另一半：有了**可读**的一份就真写进去（落空与成功共用一条通路）。
+        rig.diagnostics.body = "time=…\njava.lang.IllegalStateException: 这次成功了"
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_COPY).performClick()
+        pump()
+        assertEquals("读得动的时候同一颗按钮真的写进去了", rig.diagnostics.body, clipboardText())
+        composeRule.onNodeWithText(SettingsStrings.DIAGNOSTICS_COPIED).assertIsDisplayed()
+
+        // 第三种：读口自己抛（文件被掉电截成半截、权限坏了）→ 与「没有」同样落空，不崩、不动剪贴板。
+        rig.diagnostics.boom = IOException("读不动")
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_COPY).performClick()
+        pump()
+        assertEquals("抛异常时剪贴板依旧不动", rig.diagnostics.body, clipboardText())
+        composeRule.onNodeWithText(SettingsStrings.DIAGNOSTICS_NONE_NOTICE).assertIsDisplayed()
+    }
+
+    // ── i06 重读 + 读失败：按钮真的再问一次，失败只是空着，不弹提示 ───────────────
+
+    @Test
+    fun `i06 refresh re-reads the list and a failing read just leaves it empty`() {
+        val rig = rig()
+
+        rig.diagnostics.seed(CrashReportSummary("crash-7.txt", 7L, java.time.Instant.ofEpochMilli(1_700_000_000_000L)))
+        composeRule.onNodeWithTag(SettingsTags.diagnosticsRow("crash-7.txt")).assertDoesNotExist()
+
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_REFRESH).performClick()
+        pump()
+        assertEquals("重读口有效：source 被问了两次", 2, rig.diagnostics.listCalls.get())
+        composeRule.onNodeWithTag(SettingsTags.diagnosticsRow("crash-7.txt")).assertIsDisplayed()
+        assertNull("这一路没有失败要说", rig.vm.notice.value)
+
+        rig.diagnostics.boom = IOException("盘读不动")
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_REFRESH).performClick()
+        pump()
+        composeRule.onNodeWithTag(SettingsTags.DIAGNOSTICS_EMPTY).assertIsDisplayed()
+        assertNull("读失败不弹 notice：空态已经说明「没有可读的报告」", rig.vm.notice.value)
     }
 }

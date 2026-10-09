@@ -6,6 +6,8 @@ import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import javax.inject.Singleton
 import works.earendil.pihost.feature.settings.AndroidRuntimeInfo
+import works.earendil.pihost.feature.settings.DiagnosticsSource
+import works.earendil.pihost.feature.settings.FileDiagnosticsSource
 import works.earendil.pihost.feature.settings.FileModelCredentialSource
 import works.earendil.pihost.feature.settings.FileRelayEndpointSource
 import works.earendil.pihost.feature.settings.ModelCredentialSource
@@ -53,4 +55,16 @@ object SettingsModule {
     @Provides
     @Singleton
     fun relayEndpointSource(impl: FileRelayEndpointSource): RelayEndpointSource = impl
+
+    /**
+     * 诊断面（P3A §3.5）：与 [modelCredentialSource] / [relayEndpointSource] 同一条形状的转发边。
+     *
+     * 被包的 `CrashReporter` 本体**不在这里提供**——它绑在 `:app` 的 `CrashReportModule`
+     * （版本号只有 app 的 `BuildConfig` 才是真相，§3.3）。于是本模块**不会**被
+     * `@UninstallModules(EngineModule::class)` 连带卸掉，`:app` 的测试图拿到的是
+     * 「真 CrashReporter（真目录 = Robolectric 沙箱 filesDir/crash）+ 本条转发边」。
+     */
+    @Provides
+    @Singleton
+    fun diagnosticsSource(impl: FileDiagnosticsSource): DiagnosticsSource = impl
 }

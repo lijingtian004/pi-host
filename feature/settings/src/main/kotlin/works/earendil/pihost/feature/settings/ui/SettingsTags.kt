@@ -80,6 +80,17 @@ object SettingsTags {
     /** 行尾的密钥状态（§2：只有「已配置 / 无可用密钥」两种字，永无明文）。 */
     fun relayRowKey(providerId: String): String = "$RELAY_SECTION-key-$providerId"
 
+    // ── P3A §3.5 诊断（tag 前缀照 §3.5 原文：`SCREEN + "-diagnostics"`）─────────
+
+    const val DIAGNOSTICS_SECTION: String = "screen-settings-diagnostics"
+    const val DIAGNOSTICS_EMPTY: String = "screen-settings-diagnostics-empty"
+    const val DIAGNOSTICS_CLEAR: String = "screen-settings-diagnostics-clear"
+    const val DIAGNOSTICS_COPY: String = "screen-settings-diagnostics-copy"
+    const val DIAGNOSTICS_REFRESH: String = "screen-settings-diagnostics-refresh"
+
+    /** 一份崩溃报告的一行：tag 里带文件名（`crash-<毫秒>.txt`，天然唯一），测试不依赖展示文案。 */
+    fun diagnosticsRow(fileName: String): String = "$DIAGNOSTICS_SECTION-row-$fileName"
+
     init {
         // 与上面三个常量保持一致（Kotlin 侧只有一处真相：tag 名由枚举派生）
         check(MEM_TIER_LOW == tier(MemTier.LOW) && MEM_TIER_MID == tier(MemTier.MID) && MEM_TIER_HIGH == tier(MemTier.HIGH))
@@ -102,6 +113,15 @@ object SettingsTags {
         // 三个按 id 派生的函数与固定段名不能撞车：撞了就会让「点这行的清除」打到别的节点
         check(relayClear("x") != relaySetDefault("x") && relayRow("x") != relayClear("x"))
         check(relayApiItem("x") != RELAY_API_BUTTON)
+        // P3A §3.5 点名的一致性：诊断系列的前缀必须是 `SCREEN + "-diagnostics"`
+        check(DIAGNOSTICS_SECTION == "$SCREEN-diagnostics")
+        check(DIAGNOSTICS_EMPTY == "$DIAGNOSTICS_SECTION-empty")
+        check(DIAGNOSTICS_CLEAR == "$DIAGNOSTICS_SECTION-clear")
+        check(DIAGNOSTICS_COPY == "$DIAGNOSTICS_SECTION-copy")
+        check(DIAGNOSTICS_REFRESH == "$DIAGNOSTICS_SECTION-refresh")
+        // 「清空」「复制」「重读」三个按钮 tag 互不相同，且行 tag 撞不上任何按钮
+        check(DIAGNOSTICS_CLEAR != DIAGNOSTICS_COPY && DIAGNOSTICS_CLEAR != DIAGNOSTICS_REFRESH)
+        check(diagnosticsRow("crash-1.txt") != DIAGNOSTICS_CLEAR)
     }
 }
 
@@ -237,6 +257,42 @@ object SettingsStrings {
 
     /** 中转写盘失败：措辞与凭据通路一致，原因同样只来自 IOException 的 message（只含路径）。 */
     fun relayWriteFailed(reason: String): String = "写入失败：$reason"
+
+    // ── P3A §3.5 诊断 ─────────────────────────────────────────────────────────────
+
+    const val SECTION_DIAGNOSTICS: String = "诊断"
+
+    /**
+     * 生效语义说清楚：崩溃报告是**本机文件**，不进备份面（§3.4 已把 `crash` 排除），
+     * 也不联网上传——本页没有任何「发送日志」的按钮，别让用户以为点一下就会传走。
+     */
+    const val DIAGNOSTICS_HINT: String = "崩溃报告只写在手机本地（filesDir/crash），只留最新 10 份，不备份、不上传。"
+
+    /** §3.5 原文要求的空态文案。 */
+    const val DIAGNOSTICS_NONE: String = "无崩溃记录"
+
+    const val DIAGNOSTICS_CLEAR: String = "清空"
+    const val DIAGNOSTICS_COPY: String = "复制最近一份"
+    const val DIAGNOSTICS_REFRESH: String = "重读列表"
+
+    /** 空列表时点「复制最近一份」（列表刚被清空、或所有文件都读不动）。 */
+    const val DIAGNOSTICS_NONE_NOTICE: String = "没有可复制的崩溃记录。"
+
+    /**
+     * 复制成功的回执。**不写文件名**：`readLatest` 的语义是「最近一份*读得动的*」，
+     * 最新那份被掉电截成空文件时它会顺延到下一份——回执里报哪个名字都可能说谎，
+     * 而「已复制最近一份」这句话在两种情况下都成立。
+     */
+    const val DIAGNOSTICS_COPIED: String = "已复制最近一份到剪贴板"
+
+    /** §3.5 的清空回执：用**实际删掉的份数**，不用「已清空」这种可能说谎的措辞。 */
+    fun crashCleared(deleted: Int): String = "已清除 $deleted 份崩溃报告"
+
+    /** 清空失败：措辞与凭据/中转通路一致，原因只来自异常 message（内容是路径，不含正文）。 */
+    fun crashClearFailed(reason: String): String = "清除失败：$reason"
+
+    /** 行里的时间格式（固定 pattern，不用 `DateFormat.getDateTimeInstance`——那会跟区域设置漂移，测试没法断言）。 */
+    const val DIAGNOSTICS_TIME_FORMAT: String = "MM-dd HH:mm"
 
     const val NOTICE_AUTO_DISMISS_HINT: String = "（稍后自动收起）"
 

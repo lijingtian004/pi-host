@@ -322,3 +322,58 @@ fun probeResponse(id: String?, success: Boolean = true, keys: Int = 1, error: St
         error = error,
     )
 }
+
+/**
+ * 诊断面假体（P3A §3.5）：三态全靠三个可写字段演——
+ * `rows` 空 = 无崩溃记录，非空 = 有报告；`body` = 可读正文（null = 读不出来）；
+ * `boom` 一置，三个口全抛（验「读失败 → 空列表而不是半成品」「清失败 → notice 说原因」）。
+ *
+ * 与另两个假体同一决定：**不做线程切换**（生产实现切 IO，假体不切），
+ * 于是 `runTest` + `UnconfinedTestDispatcher` 下「调一次 → 立刻断言」成立。
+ * 真盘面（`pendingReports`/`readLatest`/`clearReports` 的语义）在 `:core:engine` 的
+ * `CrashReporterTest`（11 条）里，这里只演形状。
+ */
+class FakeDiagnosticsSource(
+    initial: List<CrashReportSummary> = emptyList(),
+    var body: String? = null,
+    var clearCount: Int = initial.size,
+) : DiagnosticsSource {
+
+    val listCalls = AtomicInteger(0)
+    val latestCalls = AtomicInteger(0)
+    val clearCalls = AtomicInteger(0)
+
+    /** 一置非 null，三个口都抛它。 */
+    var boom: Throwable? = null
+
+    private val rows = initial.toMutableList()
+
+    /** 最近一次 `clear()` 之后剩下的行数（VM 清完会立刻重读一次列表，断言点在这）。 */
+    fun currentRows(): List<CrashReportSummary> = rows.toList()
+
+    fun seed(report: CrashReportSummary) {
+        rows.add(report)
+        clearCount = rows.size
+    }
+
+    override suspend fun list(): List<CrashReportSummary> {
+        listCalls.incrementAndGet()
+        boom?.let { throw it }
+        return rows.toList()
+    }
+
+    override suspend fun latestText(): String? {
+        latestCalls.incrementAndGet()
+        boom?.let { throw it }
+        return body
+    }
+
+    override suspend fun clear(): Int {
+        clearCalls.incrementAndGet()
+        boom?.let { throw it }
+        val deleted = rows.size
+        rows.clear()
+        clearCount = deleted
+        return deleted
+    }
+}

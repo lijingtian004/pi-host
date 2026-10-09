@@ -48,6 +48,7 @@ class SettingsViewModelTest {
         val info: FakeRuntimeInfo,
         val credentials: FakeModelCredentialSource,
         val relays: FakeRelayEndpointSource,
+        val diagnostics: FakeDiagnosticsSource,
     )
 
     private fun TestScope.rig(
@@ -56,16 +57,18 @@ class SettingsViewModelTest {
         info: FakeRuntimeInfo = FakeRuntimeInfo(),
         credentials: FakeModelCredentialSource = FakeModelCredentialSource(),
         relays: FakeRelayEndpointSource = FakeRelayEndpointSource(),
+        diagnostics: FakeDiagnosticsSource = FakeDiagnosticsSource(),
     ): Rig {
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         val repository = FakeSettingsRepository(settings)
         return Rig(
-            SettingsViewModel(repository, engine, info, credentials, relays),
+            SettingsViewModel(repository, engine, info, credentials, relays, diagnostics),
             repository,
             engine,
             info,
             credentials,
             relays,
+            diagnostics,
         )
     }
 
@@ -228,7 +231,7 @@ class SettingsViewModelTest {
         repository.writeError = IllegalStateException("disk full")
         repository.applyToSnapshot = false
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        val vm = SettingsViewModel(repository, FakeEngine(), FakeRuntimeInfo(), FakeModelCredentialSource(), FakeRelayEndpointSource())
+        val vm = SettingsViewModel(repository, FakeEngine(), FakeRuntimeInfo(), FakeModelCredentialSource(), FakeRelayEndpointSource(), FakeDiagnosticsSource())
 
         vm.setMemTier(MemTier.LOW)
         runCurrent()
@@ -447,7 +450,7 @@ class SettingsViewModelTest {
         credentials.boom = java.io.IOException("读不动")
 
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        val vm = SettingsViewModel(FakeSettingsRepository(), FakeEngine(), FakeRuntimeInfo(), credentials, FakeRelayEndpointSource())
+        val vm = SettingsViewModel(FakeSettingsRepository(), FakeEngine(), FakeRuntimeInfo(), credentials, FakeRelayEndpointSource(), FakeDiagnosticsSource())
 
         assertEquals("进屏读失败 → 空列表（不是半成品）", emptyList<ProviderEntry>(), vm.credentials.value)
         assertNull("读失败不弹 notice：列表空着已经说明问题", vm.notice.value)
@@ -579,7 +582,7 @@ class SettingsViewModelTest {
             override suspend fun setDefault(providerId: String, modelId: String) = Unit
         }
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        val vm = SettingsViewModel(FakeSettingsRepository(), FakeEngine(), FakeRuntimeInfo(), FakeModelCredentialSource(), dirty)
+        val vm = SettingsViewModel(FakeSettingsRepository(), FakeEngine(), FakeRuntimeInfo(), FakeModelCredentialSource(), dirty, FakeDiagnosticsSource())
 
         assertEquals(listOf("still-here"), vm.relays.value.map { it.providerId })
         assertNull("settings.json 指着一条已经不存在的行 → 徽标不该亮", vm.defaultRelay.value)
@@ -618,4 +621,109 @@ class SettingsViewModelTest {
         assertEquals(emptyList<String>(), parseModelIds(" , ， "))
         assertEquals(listOf("deepseek-chat"), parseModelIds("deepseek-chat"))
     }
+
+    // ── P3A §3.5 诊断面（崩溃报告列表 / 清空 / 复制） ───────────────────────────
+
+    @Test
+    fun `t27 entering the screen reads the crash list once and keeps the source order`() = runTest {
+        val diagnostics = FakeDiagnosticsSource(
+            initial = listOf(summary("crash-2000.txt", 2_048), summary("crash-1000.txt", 512)),
+        )
+        val rig = rig(diagnostics = diagnostics)
+
+        assertEquals("进屏读一次（与 credentials/relays 同一条 init 通路）", 1, diagnostics.listCalls.get())
+        assertEquals(
+            "顺序由 source 定（新的在前），VM 不重排",
+            listOf("crash-2000.txt", "crash-1000.txt"),
+            rig.vm.crashReports.value.map { it.fileName },
+        )
+        assertEquals(2_048L, rig.vm.crashReports.value.first().sizeBytes)
+        assertEquals(1_700_000_000_000L, rig.vm.crashReports.value.first().modified.toEpochMilli())
+
+        rig.vm.refreshCrashReports()
+        runCurrent()
+        assertEquals("手动重读口是有效的", 2, diagnostics.listCalls.get())
+    }
+
+    @Test
+    fun `t28 clearing reports the deleted count and empties the list`() = runTest {
+        val diagnostics = FakeDiagnosticsSource(
+            initial = listOf(summary("crash-1.txt", 10), summary("crash-2.txt", 20)),
+        )
+        val rig = rig(diagnostics = diagnostics)
+        assertEquals(2, rig.vm.crashReports.value.size)
+
+        rig.vm.clearCrashReports()
+        runCurrent()
+
+        assertTrue("回执说的是**实际删掉的份数**：${rig.vm.notice.value}", rig.vm.notice.value!!.contains("2 份"))
+        assertEquals(emptyList<CrashReportSummary>(), rig.vm.crashReports.value)
+        assertEquals(1, diagnostics.clearCalls.get())
+        assertEquals("清完由 VM 自己重读列表，不靠 UI 再点一次", 2, diagnostics.listCalls.get())
+    }
+
+    @Test
+    fun `t29 readLatestCrash covers present, absent and unreadable`() = runTest {
+        val diagnostics = FakeDiagnosticsSource(initial = listOf(summary("crash-9.txt", 9)), body = "time=…\njava.lang.IllegalStateException: boom")
+        val rig = rig(diagnostics = diagnostics)
+
+        assertEquals("有一份可读 → 原样交回正文", diagnostics.body, rig.vm.readLatestCrash())
+
+        diagnostics.body = null
+        assertNull("一份都没有 → null（不是抛、不是空串）", rig.vm.readLatestCrash())
+
+        diagnostics.boom = java.io.IOException("读不动")
+        assertNull("读口自己抛也被 VM 的 runCatching 兜住", rig.vm.readLatestCrash())
+        assertEquals("三次都只问 source，VM 不自己碰磁盘", 3, diagnostics.latestCalls.get())
+    }
+
+    @Test
+    fun `t30 a failed list read leaves an empty list and says nothing`() = runTest {
+        val diagnostics = FakeDiagnosticsSource(initial = listOf(summary("crash-1.txt", 1)))
+        diagnostics.boom = java.io.IOException("读不动")
+        val rig = rig(diagnostics = diagnostics)
+
+        assertEquals("读失败 → 空列表（不是半成品）", emptyList<CrashReportSummary>(), rig.vm.crashReports.value)
+        assertNull("读失败不弹 notice：这一页是诊断页，空着已经说明问题", rig.vm.notice.value)
+        assertNull(rig.vm.readLatestCrash())
+    }
+
+    @Test
+    fun `t31 a failed clear keeps the list and reports the reason`() = runTest {
+        val diagnostics = FakeDiagnosticsSource(
+            initial = listOf(summary("crash-1.txt", 1), summary("crash-2.txt", 2)),
+        )
+        val rig = rig(diagnostics = diagnostics)
+
+        diagnostics.boom = java.io.IOException("只读文件系统")
+        rig.vm.clearCrashReports()
+        runCurrent()
+
+        val notice = rig.vm.notice.value!!
+        assertTrue("清失败要带原因：$notice", notice.startsWith("清除失败：") && notice.contains("只读文件系统"))
+        assertEquals("失败时列表原样留着，让人原地重试", 2, rig.vm.crashReports.value.size)
+
+        diagnostics.boom = null
+        rig.vm.clearCrashReports()
+        runCurrent()
+        assertEquals("恢复后同一颗按钮真的清掉了", emptyList<CrashReportSummary>(), rig.vm.crashReports.value)
+        assertTrue(rig.vm.notice.value!!.contains("2 份"))
+    }
+
+    @Test
+    fun `t32 both copy outcomes get their notice text from the VM`() = runTest {
+        val rig = rig()
+
+        rig.vm.crashCopied()
+        assertEquals(SettingsStrings.DIAGNOSTICS_COPIED, rig.vm.notice.value)
+        rig.vm.consumeNotice()
+        assertNull("一次性提示消费后归零（与其余 section 同一条通路）", rig.vm.notice.value)
+
+        rig.vm.crashCopyMissed()
+        assertEquals(SettingsStrings.DIAGNOSTICS_NONE_NOTICE, rig.vm.notice.value)
+    }
+
+    /** 一行崩溃报告的假体形态：文件名带毫秒，大小与 mtime 都是定值（断言点不在时间上）。 */
+    private fun summary(fileName: String, sizeBytes: Long) =
+        CrashReportSummary(fileName, sizeBytes, java.time.Instant.ofEpochMilli(1_700_000_000_000L))
 }

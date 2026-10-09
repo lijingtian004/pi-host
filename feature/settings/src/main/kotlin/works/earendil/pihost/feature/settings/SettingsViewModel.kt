@@ -79,6 +79,11 @@ sealed interface ProbeState {
  *    不进日志、不回显；出参只有 [RelayEntry]（`keyConfigured` 旗），而 [baseUrl] **不是**凭据，
  *    按 §3.1 的判断可以上屏（用户要能看见自己填的地址）。唯一比凭据通路多出来的语义：
  *    [saveRelay] 的空白 key 是「沿用」而不是「抹掉」，这条转换必须在 VM 里发生，不能让 UI 猜。
+ * 7. **诊断面只报「有没有」，不报「内容」**（P3A §3.5 + §2 红线）：[crashReports] 的元素是
+ *    [CrashReportSummary]（文件名 + 字节数 + mtime），崩溃正文唯一的出口是 [readLatestCrash]
+ *    ——它把字符串交给调用方，VM 自己**不存副本、不上屏**（正文里有绝对路径与完整栈）。
+ *    三个动作（刷新/清空/复制）全部经 [DiagnosticsSource] 转发给 `CrashReporter`，
+ *    本类不碰 `File`、不拼路径、不排序：目录布局只有一份实现在 `core/engine`。
  */
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
@@ -87,6 +92,7 @@ class SettingsViewModel @Inject constructor(
     private val runtimeInfo: RuntimeInfoSource,
     private val credentialStore: ModelCredentialSource,
     private val relayStore: RelayEndpointSource,
+    private val diagnostics: DiagnosticsSource,
 ) : ViewModel() {
 
     /** 三键快照，直接转发仓库的流（UI `collectAsState`）。 */
@@ -138,10 +144,77 @@ class SettingsViewModel @Inject constructor(
     /** 中转表单的五个字段（四个输入框 + 选中的 api）。 */
     val relayDraft: StateFlow<RelayDraft> = _relayDraft.asStateFlow()
 
+    private val _crashReports = MutableStateFlow<List<CrashReportSummary>>(emptyList())
+
+    /**
+     * 崩溃报告列表（P3A §3.5），**新的在前**，顺序由 [DiagnosticsSource] 背后的 `CrashReporter` 定。
+     *
+     * 只有 [CrashReportSummary] 三样：文件名、字节数、mtime。**没有正文**——
+     * 正文里是绝对路径与完整栈，上屏等于把内部结构贴进可截图的 UI；要读它只有一个出口，
+     * 就是「复制最近一份」按钮（[readLatestCrash]）。
+     */
+    val crashReports: StateFlow<List<CrashReportSummary>> = _crashReports.asStateFlow()
+
     init {
         refreshRuntimeInfo()
         refreshCredentials()
         refreshRelays()
+        refreshCrashReports()
+    }
+
+    // ── 诊断（P3A §3.5）───────────────────────────────────────────────────────
+
+    /**
+     * 重读崩溃报告列表（进屏一次 + 每次清空后 + UI 的手动刷新）。
+     *
+     * 读失败**不进 notice**，与 [refreshCredentials] / [refreshRelays] 同一决定：
+     * 进屏首帧就该有这张列表，磁盘抖动时显示「无崩溃记录」比弹一条提示更诚实——
+     * 而且这一页是**诊断**页，用户来看的就是「有没有」，一条红色 toast 反而是噪音。
+     */
+    fun refreshCrashReports() {
+        viewModelScope.launch {
+            _crashReports.value = runCatching { diagnostics.list() }.getOrDefault(emptyList())
+        }
+    }
+
+    /**
+     * 清空崩溃报告（§3.5 的「清空」按钮）：成功 → 刷列表 + notice 报**删了几份**；
+     * 失败 → notice 说原因，列表原样留着让人原地重试。
+     *
+     * notice 用「删了几份」而不是「已清空」：`clear()` 返回的是**实际删掉的份数**，
+     * 有一个文件被别的进程握着删不掉时，屏幕上说的必须是那个数字（§2「真实输出」的 UI 版）。
+     */
+    fun clearCrashReports() {
+        viewModelScope.launch {
+            val outcome = runCatching { diagnostics.clear() }
+            outcome.fold(
+                onSuccess = { deleted ->
+                    _crashReports.value = runCatching { diagnostics.list() }.getOrDefault(emptyList())
+                    _notice.value = SettingsStrings.crashCleared(deleted)
+                },
+                onFailure = { throwable -> _notice.value = SettingsStrings.crashClearFailed(reasonOf(throwable)) },
+            )
+        }
+    }
+
+    /**
+     * 「复制最近一份」的读侧原语（§3.5）：交回正文，**没有可读的一份就回 null**。
+     *
+     * `suspend`：读的是磁盘（[CrashReporter.readLatest] 是同步 IO），调用方（UI 的按钮）在
+     * `rememberCoroutineScope` 里 await，主线程只等一个文件读完。
+     * 剪贴板写入留在 UI 侧——VM 不碰 `LocalClipboardManager`，那是 Compose 的东西；
+     * 两条结果的**文案**则留在这里（[crashCopied] / [crashCopyMissed]），UI 不自己编句子。
+     */
+    suspend fun readLatestCrash(): String? = runCatching { diagnostics.latestText() }.getOrNull()
+
+    /** 复制成功那条 notice（正文已经在剪贴板里了，这里只说结果，不念内容）。 */
+    fun crashCopied() {
+        _notice.value = SettingsStrings.DIAGNOSTICS_COPIED
+    }
+
+    /** 复制落空那条 notice（列表刚被清空、或全坏时点按钮）。 */
+    fun crashCopyMissed() {
+        _notice.value = SettingsStrings.DIAGNOSTICS_NONE_NOTICE
     }
 
     /**

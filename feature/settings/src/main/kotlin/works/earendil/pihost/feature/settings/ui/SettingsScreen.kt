@@ -24,22 +24,30 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
 import works.earendil.pihost.core.environment.MemTier
 import works.earendil.pihost.feature.settings.parseModelIds
+import works.earendil.pihost.feature.settings.CrashReportSummary
 import works.earendil.pihost.feature.settings.ProbeState
 import works.earendil.pihost.feature.settings.RelayDraft
 import works.earendil.pihost.feature.settings.RuntimeInfo
@@ -76,6 +84,14 @@ fun SettingsScreen(
     val relays by viewModel.relays.collectAsState()
     val defaultRelay by viewModel.defaultRelay.collectAsState()
     val relayDraft by viewModel.relayDraft.collectAsState()
+    val reports by viewModel.crashReports.collectAsState()
+
+    // 诊断面的两个「设备能力」入口（P3A §3.5）：剪贴板 + 一条挂在组合上的协程作用域。
+    // 用 `LocalClipboardManager`（Compose 自带，走 `LocalClipboard` 抽象）而不是
+    // `ClipboardManager`：后者在 API 31+ 上要 `CONTEXT_CLIPBOARD服务` 那套新签名，
+    // Robolectric 里拿不到真剪贴板；前者在测试里可用 `clipboardManager.getText()` 直接读回。
+    val clipboard = LocalClipboardManager.current
+    val copyScope = rememberCoroutineScope()
 
     LaunchedEffect(notice) {
         if (notice != null) {
@@ -129,6 +145,25 @@ fun SettingsScreen(
                 onSetDefault = viewModel::setRelayDefault,
                 onClear = viewModel::clearRelay,
                 onRefresh = viewModel::refreshRelays,
+            )
+            HorizontalDivider()
+            DiagnosticsSection(
+                reports = reports,
+                onRefresh = viewModel::refreshCrashReports,
+                onClear = viewModel::clearCrashReports,
+                onCopy = {
+                    // 读盘是 suspend（`readLatestCrash`），剪贴板是 Compose 侧的东西：
+                    // 两件事都发生在这一层，VM 只交回字符串（§3.5 的分工）。
+                    copyScope.launch {
+                        val text = viewModel.readLatestCrash()
+                        if (text == null) {
+                            viewModel.crashCopyMissed()
+                        } else {
+                            clipboard.setText(AnnotatedString(text))
+                            viewModel.crashCopied()
+                        }
+                    }
+                },
             )
             HorizontalDivider()
             ProbeCard(state = probe, onRun = viewModel::runProbe, onClear = viewModel::clearProbe)
@@ -575,6 +610,84 @@ private fun RelayApiPickerDialog(
         modifier = Modifier.testTag(SettingsTags.RELAY_API_PICKER),
     )
 }
+
+/**
+ * 诊断（规格书 P3A §3.5）：崩溃报告列表 + 空态 + 三个动作（重读 / 复制最近一份 / 清空）。
+ *
+ * 四条形状决定：
+ * - **正文永不上屏**：一行只有「文件名 · 大小 · 时间」（[crashRowText]）。
+ *   崩溃正文里是绝对路径 + 完整栈 + 用户当时的操作语境，把它渲染进屏幕等于
+ *   把内部结构交给每一张截图；要读它只有「复制最近一份」这一条路（走剪贴板，不走 UI 文本）。
+ * - **三个按钮都不因列表为空而禁用**：`readLatest` 的语义是「最近一份**读得动**的」，
+ *   列表非空但全坏（掉电截成空文件）时按钮必须还能点，点了才拿得到 null，
+ *   才有 [SettingsStrings.DIAGNOSTICS_NONE_NOTICE] 那条回执；禁用反而把这条通路堵死。
+ * - **空态只有一句**：§3.5 原文要求的「无崩溃记录」。不在「还没读」与「读了没有」之间造第三态——
+ *   `refreshCrashReports()` 在 `init` 里就发了出去，而它读的是本地 ≤10 个小文件，
+ *   一帧之内必有结果；造一个「读取中…」占位要额外一个状态位，换来的是一句几乎没人看见的话。
+ * - **清空说份数**：回执文案来自 [SettingsStrings.crashCleared]，参数是**实际删掉的份数**。
+ */
+@Composable
+private fun DiagnosticsSection(
+    reports: List<CrashReportSummary>,
+    onRefresh: () -> Unit,
+    onClear: () -> Unit,
+    onCopy: () -> Unit,
+) {
+    Section(tag = SettingsTags.DIAGNOSTICS_SECTION, title = SettingsStrings.SECTION_DIAGNOSTICS) {
+        Text(SettingsStrings.DIAGNOSTICS_HINT, style = MaterialTheme.typography.bodySmall)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = onCopy,
+                modifier = Modifier.testTag(SettingsTags.DIAGNOSTICS_COPY),
+            ) { Text(SettingsStrings.DIAGNOSTICS_COPY) }
+            OutlinedButton(
+                onClick = onClear,
+                modifier = Modifier.testTag(SettingsTags.DIAGNOSTICS_CLEAR),
+            ) { Text(SettingsStrings.DIAGNOSTICS_CLEAR) }
+            TextButton(
+                onClick = onRefresh,
+                modifier = Modifier.testTag(SettingsTags.DIAGNOSTICS_REFRESH),
+            ) { Text(SettingsStrings.DIAGNOSTICS_REFRESH) }
+        }
+
+        if (reports.isEmpty()) {
+            Text(
+                SettingsStrings.DIAGNOSTICS_NONE,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.testTag(SettingsTags.DIAGNOSTICS_EMPTY),
+            )
+        } else {
+            reports.forEach { report ->
+                Text(
+                    crashRowText(report),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.fillMaxWidth().testTag(SettingsTags.diagnosticsRow(report.fileName)),
+                )
+            }
+        }
+    }
+}
+
+/** 一行报告：`crash-1700000000000.txt · 1.2 KB · 10-09 12:34`（正文不在这里，永远不在这里）。 */
+private fun crashRowText(report: CrashReportSummary): String =
+    "${report.fileName} · ${crashSizeText(report.sizeBytes)} · ${crashTimeText(report.modified)}"
+
+/** 字节数人性化：1024 以下给 B，往上 KB/MB 各一档，保留一位小数（诊断页不需要精确到字节的读数）。 */
+private fun crashSizeText(bytes: Long): String = when {
+    bytes < 1_024 -> "$bytes B"
+    bytes < 1_048_576 -> String.format("%.1f KB", bytes / 1_024.0)
+    else -> String.format("%.1f MB", bytes / 1_048_576.0)
+}
+
+/** mtime → 本地时间（固定 pattern，见 [SettingsStrings.DIAGNOSTICS_TIME_FORMAT] 的区域漂移理由）。 */
+private fun crashTimeText(instant: Instant): String =
+    DateTimeFormatter.ofPattern(SettingsStrings.DIAGNOSTICS_TIME_FORMAT)
+        .withZone(ZoneId.systemDefault())
+        .format(instant)
 
 @Composable
 private fun ProbeCard(

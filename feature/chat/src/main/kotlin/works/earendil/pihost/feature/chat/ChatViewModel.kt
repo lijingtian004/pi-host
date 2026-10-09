@@ -569,7 +569,7 @@ class ChatViewModel @Inject constructor(
      * 审计面里 `cwd` 的取值来源（§3.2 留给 REPORT §8 的那条）。
      *
      * 不是新造的跨模块查询：这两者都是**现成公开 API**，且与生产装配喂给
-     * `SessionSupervisor.workingDir` 的那一条是同一个表达式（`EngineModule:174`），
+     * `SessionSupervisor.workingDir` 的那一条是同一个表达式（`EngineModule.kt:216`），
      * 所以审计记下的目录 = 子进程真实 chdir 的目录，不存在第二份真相。
      * `PathLayout.projectDir` 只构造路径不建目录，因此这里既不碰磁盘也不挂起。
      */

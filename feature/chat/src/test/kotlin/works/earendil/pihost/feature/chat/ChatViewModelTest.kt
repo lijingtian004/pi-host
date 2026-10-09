@@ -40,6 +40,7 @@ import works.earendil.pihost.core.engine.audit.AuditKind
 import works.earendil.pihost.core.engine.audit.AuditSink
 import works.earendil.pihost.core.engine.audit.FileAuditSink
 import works.earendil.pihost.core.engine.audit.NoopAuditSink
+import works.earendil.pihost.core.engine.git.GitSnapshot
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.rpc.AssistantMessageEvent
 import works.earendil.pihost.core.rpc.PiEvent
@@ -79,6 +80,8 @@ class ChatViewModelTest {
         val settings: FakeSettingsRepository,
         /** P3A §3.2：审计假体（默认 [NoopAuditSink] = 既有用例一字不改）。 */
         val audit: AuditSink,
+        /** P3C §3.6：git 探针假体（默认 [NoopGitProbe]，既有用例一字不改）。 */
+        val git: FakeGitProbe,
     )
 
     private fun TestScope.rig(
@@ -86,6 +89,7 @@ class ChatViewModelTest {
         installer: FakeRuntimeInstall = FakeRuntimeInstall(),
         settings: FakeSettingsRepository = FakeSettingsRepository(),
         audit: AuditSink = NoopAuditSink,
+        git: FakeGitProbe = FakeGitProbe(),
     ): Rig {
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         val app = RuntimeEnvironment.getApplication()
@@ -93,11 +97,12 @@ class ChatViewModelTest {
         // 但构造点必须与 production 一致，否则「渲染层换实现」这类回归在这里测不出来。
         return Rig(
             app,
-            ChatViewModel(app, engine, installer, settings, buildMarkwon(app), audit),
+            ChatViewModel(app, engine, installer, settings, buildMarkwon(app), audit, git),
             engine,
             installer,
             settings,
             audit,
+            git,
         )
     }
 
@@ -2207,5 +2212,193 @@ class ChatViewModelTest {
         /** 探测 p07 的 `cycle_model` data（外层 `model` + `thinkingLevel` + `isScoped`）。 */
         fun cycleEnvelope(id: String, name: String, thinkingLevel: String): JsonObject =
             probeCycleData(id, name, thinkingLevel)
+    }
+
+    // ── P3C §3.6：顶栏分支 chip 的读时机的映射（case73–case86）───────────────────
+
+    @Test
+    fun `case73 reaching Ready reads the branch exactly once`() = runTest {
+        val rig = rig()
+
+        ready(rig)
+
+        assertEquals("进页面只读一次", 1, rig.git.reads())
+    }
+
+    @Test
+    fun `case74 the probe reads the active project dir, not a hardcoded default`() = runTest {
+        val rig = rig()
+
+        ready(rig)
+
+        val dir = rig.git.readDirs.single()!!
+        assertTrue("必须是沙盒里的 projects/default，实为 $dir", dir.endsWith("/files/projects/default"))
+    }
+
+    /** AgentSettled 是唯一「分支会自己变」的时刻（pi 刚可能 commit 过）；TurnEnd 不是。 */
+    @Test
+    fun `case75 agent settled re-reads while turn end does not`() = runTest {
+        val rig = rig()
+        val id = ready(rig)
+
+        rig.engine.emit(PiEvent.TurnEnd(message = PiMessage(role = "assistant")))
+        runCurrent()
+        assertEquals("一轮里的 turn_end 不该多起一个 git 进程", 1, rig.git.reads())
+
+        rig.engine.emit(PiEvent.AgentSettled)
+        runCurrent()
+        assertEquals(2, rig.git.reads())
+    }
+
+    /** 永不轮询是本期最硬的一条纪律：手机上每起一个 git 子进程都在和 node 抢 CPU。 */
+    @Test
+    fun `case76 ten simulated minutes change nothing`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        advanceTimeBy(10 * 60 * 1000L)
+        runCurrent()
+
+        assertEquals("没有任何定时器该在跑", 1, rig.git.reads())
+    }
+
+    /** 在飞闸门：第一次还没回来时，第二次 settle 不许再起一个进程读同一个 index。 */
+    @Test
+    fun `case77 an in-flight read collapses the next settle into nothing`() = runTest {
+        val rig = rig()
+        val gate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        rig.git.gate = gate
+
+        ready(rig)
+        assertEquals("读已发起、挂在 gate 上未返回", 1, rig.git.reads())
+
+        rig.engine.emit(PiEvent.AgentSettled)
+        runCurrent()
+        assertEquals("第二次必须被闸门吃掉：不许同时有两个 git 进程读同一个 index", 1, rig.git.reads())
+
+        gate.complete(Unit)
+        runCurrent()
+        assertEquals("闸门释放后不偷偷补读（下一次 settle 才是新机会）", 1, rig.git.reads())
+
+        rig.git.gate = null
+        rig.vm.refreshGit()
+        runCurrent()
+        assertEquals("闸门归还后手动刷新要真的读第二次", 2, rig.git.reads())
+    }
+
+    @Test
+    fun `case78 a probe that throws leaves the chip silent and the vm alive`() = runTest {
+        val rig = rig()
+        val states = record(rig.vm.git)
+        rig.git.boom = IllegalStateException("git died")
+
+        ready(rig)
+
+        assertNull("异常不许变成一份快照", rig.vm.git.value)
+        assertTrue("也不许多出一份快照", states.size <= 1)
+        assertTrue("VM 照常 Ready", rig.vm.uiState.value is ChatUiState.Ready)
+    }
+
+    @Test
+    fun `case79 unavailable and not-a-repo both reach the state as themselves`() = runTest {
+        val rig = rig(git = FakeGitProbe(answer = GitSnapshot.Unavailable("error=2")))
+        ready(rig)
+        assertEquals(GitSnapshot.Unavailable("error=2"), rig.vm.git.value)
+
+        val other = rig(git = FakeGitProbe(answer = GitSnapshot.NotARepo))
+        ready(other)
+        assertEquals(GitSnapshot.NotARepo, other.vm.git.value)
+    }
+
+    /** 切项目后手动刷新必须读**新**目录（chip 与审计同源这条纪律的反面用例）。 */
+    @Test
+    fun `case80 after a project switch the next read targets the new project dir`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        rig.settings.setActiveProject("shop")
+        runCurrent()
+        rig.vm.refreshGit()
+
+        assertEquals(2, rig.git.reads())
+        assertTrue("第二次读的是 shop，实为 ${rig.git.readDirs[1]}", rig.git.readDirs[1]!!.endsWith("/files/projects/shop"))
+    }
+
+    /** 快照 → 文案的映射归 UI（case81 测 VM 侧只负责原样带出 displayName 需要的信息）。 */
+    @Test
+    fun `case81 the dirty flag is carried out untouched`() = runTest {
+        val rig = rig(git = FakeGitProbe(answer = GitSnapshot.Repo("fix/a", dirty = true)))
+
+        ready(rig)
+
+        val snapshot = rig.vm.git.value as GitSnapshot.Repo
+        assertEquals("fix/a", snapshot.branch)
+        assertTrue(snapshot.dirty)
+        assertEquals("fix/a", snapshot.displayName)
+    }
+
+    @Test
+    fun `case82 a detached snapshot keeps its display label`() = runTest {
+        val rig = rig(git = FakeGitProbe(answer = GitSnapshot.Repo("HEAD", dirty = false, detached = true)))
+
+        ready(rig)
+
+        assertEquals("分离 HEAD", (rig.vm.git.value as GitSnapshot.Repo).displayName)
+    }
+
+    /** 未 Ready（安装门/失败）时一次都不许读：那时连工作目录都不该被碰。 */
+    @Test
+    fun `case83 nothing is read while the engine is not ready`() = runTest {
+        val rig = rig(installer = FakeRuntimeInstall(outcome = FakeRuntimeInstall.Outcome.Failure))
+
+        rig.vm.installAndStart()
+        runCurrent()
+
+        assertEquals(0, rig.git.reads())
+    }
+
+    @Test
+    fun `case84 a manual refresh reads again even when nothing else happened`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        rig.vm.refreshGit()
+        runCurrent()
+        rig.vm.refreshGit()
+        runCurrent()
+
+        assertEquals(3, rig.git.reads())
+    }
+
+    /** 两次刷新之间快照换了就换文案（chip 唯一的可观测面）。 */
+    @Test
+    fun `case85 the snapshot is replaced by the newest read`() = runTest {
+        val probe = FakeGitProbe(answer = GitSnapshot.Repo("main", dirty = false))
+        val rig = rig(git = probe)
+        ready(rig)
+        assertEquals(GitSnapshot.Repo("main", dirty = false), rig.vm.git.value)
+
+        probe.answer = GitSnapshot.Repo("main", dirty = true)
+        rig.vm.refreshGit()
+        runCurrent()
+
+        assertEquals(GitSnapshot.Repo("main", dirty = true), rig.vm.git.value)
+    }
+
+    /**
+     * 手动刷新在闸门已释放后必须真的再读一次（[case77] 的另一半：闸门不许变成「只读一次」）。
+     */
+    @Test
+    fun `case86 the in-flight latch is released even when the probe throws`() = runTest {
+        val rig = rig()
+        rig.git.boom = IllegalStateException("first one dies")
+        ready(rig)
+        assertEquals(1, rig.git.reads())
+
+        rig.git.boom = null
+        rig.vm.refreshGit()
+        runCurrent()
+
+        assertEquals("闸门必须在异常路径也归还", 2, rig.git.reads())
     }
 }

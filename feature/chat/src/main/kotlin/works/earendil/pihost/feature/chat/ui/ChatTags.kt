@@ -18,6 +18,17 @@ object ChatTags {
     const val ENGINE_STATUS = "chat-engine-status"
     const val QUEUE_BADGE = "chat-queue-badge"
 
+    /**
+     * P3C §3.6：顶栏的 git 分支 chip。
+     *
+     * 这颗 chip **只在目录真的是仓库时才存在**（`NotARepo` / `Unavailable` / 在飞 / `null`
+     * 一律不渲染节点）。这不是省事，是为了不破既有断言：
+     * `topBarShowsEngineShortCodeAndQueueBadge()` 用 `onNodeWithTag(...)` + `assertTextEquals`
+     * 定位顶栏那几行字，一个**常驻**的新节点会多出一份可匹配文本，
+     * 而「时有时无」的节点在没有 git 时根本不在树里。
+     */
+    const val GIT_CHIP = "chat-git-chip"
+
     /** §3.2：点徽标展开的队列明细（steering 在前、followUp 在后，逐条一个 tag）。 */
     const val QUEUE_DETAILS = "chat-queue-details"
     const val QUEUE_ITEM_PREFIX = "chat-queue-item"

@@ -6,6 +6,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import works.earendil.pihost.core.engine.audit.AuditEntry
 import works.earendil.pihost.core.engine.audit.AuditKind
 import works.earendil.pihost.core.engine.audit.AuditSink
+import works.earendil.pihost.core.engine.git.GitProbe
+import works.earendil.pihost.core.engine.git.GitSnapshot
+import works.earendil.pihost.core.engine.projects.ProjectNames
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
@@ -48,6 +51,18 @@ class FakeSettingsRepository(initial: AppSettings = AppSettings()) : SettingsRep
         writes.add(Write("default_model", model))
         _settings.value = _settings.value.copy(defaultModel = model)
     }
+
+    /**
+     * P3C §3.2 接口扩员带来的第四条 override（chat 侧现有用例**不**调它，只是为了编译）。
+     *
+     * 与真实现同构：`Write` 记的是调用方**原样**要的值（断言要看的是"VM 传了什么"），
+     * 快照里落的是洗过的形状（`ProjectNames.sanitizeOrFallback`）——假体若两头都用原始值，
+     * 就测不出"脏值不会进 spawn lambda"这条承诺。
+     */
+    override suspend fun setActiveProject(name: String?) {
+        writes.add(Write("active_project", name))
+        _settings.value = _settings.value.copy(activeProject = ProjectNames.sanitizeOrFallback(name))
+    }
 }
 
 /**
@@ -77,3 +92,35 @@ class FakeAuditSink : AuditSink {
     /** 某一类的全部条目，按写入序。 */
     fun all(kind: AuditKind): List<AuditEntry> = entries.filter { it.kind == kind }
 }
+
+/**
+ * git 探针假体（P3C §3.6）。
+ *
+ * 三条能力刚好覆盖本期要断言的面：
+ * - [readDirs]：读了**哪个目录**（chip 与审计必须同源，这条是那条纪律的唯一可测形式）；
+ * - [answer]：给一个预设快照，测映射；
+ * - [gate]：非空即挂在 await 上——用它测「两次 settle 只发一次读」的在飞闸门，
+ *   而不是靠真进程去抢时序（那种用例在编译机上会 flaky，P3B §8.10 的 ④c 就是同一条坑）。
+ * [boom] 沿用本仓三件套：来源抛异常时 VM 不许崩、chip 不许出现。
+ */
+class FakeGitProbe(
+    var answer: GitSnapshot = GitSnapshot.Repo(branch = "main", dirty = false),
+) : GitProbe {
+
+    val readDirs = CopyOnWriteArrayList<String?>()
+    var boom: Throwable? = null
+
+    /** 非空 → [read] 挂在它上面直到测试 complete，用来模拟「第一次还没回来」。 */
+    var gate: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+
+    override suspend fun read(workingDir: String?): GitSnapshot {
+        readDirs += workingDir
+        boom?.let { throw it }
+        gate?.await()
+        return answer
+    }
+
+    /** 断言用：一共读了几次。 */
+    fun reads(): Int = readDirs.size
+}
+

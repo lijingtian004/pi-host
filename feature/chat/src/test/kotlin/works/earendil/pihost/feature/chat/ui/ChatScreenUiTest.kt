@@ -14,6 +14,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
@@ -43,6 +44,8 @@ import works.earendil.pihost.feature.chat.CHIP_PICK_LOADING
 import works.earendil.pihost.feature.chat.ChatUiState
 import works.earendil.pihost.feature.chat.ChatViewModel
 import works.earendil.pihost.feature.chat.FakeChatEngine
+import works.earendil.pihost.core.engine.git.GitSnapshot
+import works.earendil.pihost.feature.chat.FakeGitProbe
 import works.earendil.pihost.feature.chat.FakeRuntimeInstall
 import works.earendil.pihost.feature.chat.QueueState
 import works.earendil.pihost.feature.chat.FakeSettingsRepository
@@ -91,6 +94,8 @@ class ChatScreenUiTest {
     private val settings = FakeSettingsRepository()
     private lateinit var vm: ChatViewModel
 
+    private val gitProbe = FakeGitProbe()
+
     @Before
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
@@ -100,6 +105,9 @@ class ChatScreenUiTest {
             installer,
             settings,
             buildMarkwon(RuntimeEnvironment.getApplication()),
+            // P3C §3.6：注入项目假体。默认那份返回 Repo("main", clean)，
+            // 于是「chip 该出现」的用例一字不改就能跑，「该沉默」的用例各自换掉它。
+            gitProbe = gitProbe,
         )
     }
 
@@ -668,6 +676,93 @@ class ChatScreenUiTest {
                 message = "pi 请求执行 $method",
             )
     }
+
+    // ── P3C §3.6：顶栏分支 chip ────────────────────────────────────────────────
+
+    /**
+     * 分支 + 脏标记的那颗星。
+     *
+     * 断言走 `assertTextEquals(tag)` 而不是 `onNodeWithText`：顶栏一行里同时有好几处短文本
+     * （会话短码、重试条、模型 chip），按文本找节点会撞上「多个匹配」——`topBarShows...`
+     * 那条既有用例用的是同一个理由。
+     */
+    @Test
+    fun gitChipShowsBranchAndDirtyStar() {
+        gitProbe.answer = GitSnapshot.Repo(branch = "main", dirty = true)
+
+        showReadyScreen()
+
+        composeRule.onNodeWithTag(ChatTags.GIT_CHIP).assertIsDisplayed().assertTextEquals("main*")
+    }
+
+    /**
+     * 「说不清」的形状不渲染节点。
+     *
+     * 拆成三条而不是循环一遍：`showReadyScreen()` 会点掉安装门、走一次 Ready，
+     * 而快照**只在 Ready 那一刻推一次**——同一个组合里翻 answer 不会产生新的读，
+     * 循环写法测的其实是「第一次」。三条各自从未 Ready 起步，才是三种独立事实。
+     *
+     * 这条同时是既有断言的保险丝：`topBarShowsEngineShortCodeAndQueueBadge` 用
+     * `assertDoesNotExist` 查队列徽标，若我为了放 git 而加了个常驻带文本的节点，那里就会红。
+     */
+    @Test
+    fun notARepoRendersNothing() {
+        gitProbe.answer = GitSnapshot.NotARepo
+
+        showReadyScreen()
+
+        assertTrue("读了才敢说不渲染", gitProbe.reads() > 0)
+        composeRule.onNodeWithTag(ChatTags.GIT_CHIP).assertIsNotDisplayed()
+    }
+
+    @Test
+    fun busyIndexRendersNothing() {
+        gitProbe.answer = GitSnapshot.Busy
+
+        showReadyScreen()
+
+        composeRule.onNodeWithTag(ChatTags.GIT_CHIP).assertIsNotDisplayed()
+    }
+
+    @Test
+    fun anUnavailableProbeRendersNothing() {
+        gitProbe.answer = GitSnapshot.Unavailable("error=13")
+
+        showReadyScreen()
+
+        composeRule.onNodeWithTag(ChatTags.GIT_CHIP).assertIsNotDisplayed()
+    }
+
+    /** Ready 之前（还停在安装门）一次都不该读：那时工作目录都可能还没建出来。 */
+    @Test
+    fun nothingIsReadBeforeReady() {
+        composeRule.setContent { PiHostTheme { ChatScreen(viewModel = vm, notificationGate = {}) } }
+        composeRule.waitForIdle()
+
+        assertEquals(0, gitProbe.reads())
+        composeRule.onNodeWithTag(ChatTags.GIT_CHIP).assertIsNotDisplayed()
+    }
+
+    /**
+     * 点 chip → VM 再读一次，且**不牵动模型 chip**。
+     *
+     * 后半句是这条用例存在的理由：两颗 chip 在同一行、都用 labelMedium，
+     * 若我为了放 git 而动过 ModelChip 的调用点，这里就会红。
+     */
+    @Test
+    fun tappingTheGitChipReReadsAndLeavesTheModelChipAlone() {
+        gitProbe.answer = GitSnapshot.Repo(branch = "dev", dirty = false)
+        showReadyScreen()
+        val before = gitProbe.reads()
+
+        composeRule.onNodeWithTag(ChatTags.GIT_CHIP).performClick()
+        composeRule.waitForIdle()
+
+        assertEquals("点一次多读一次", before + 1, gitProbe.reads())
+        composeRule.onNodeWithTag(ChatTags.GIT_CHIP).assertTextEquals("dev")
+        composeRule.onNodeWithTag(ChatTags.MODEL_CHIP).assertIsDisplayed()
+    }
+
 }
 
 /** 安装门的独立渲染宿主（只验 InstallGate 的三档分支，不牵 VM）。 */

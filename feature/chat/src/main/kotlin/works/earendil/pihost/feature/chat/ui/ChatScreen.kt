@@ -24,6 +24,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import works.earendil.pihost.core.engine.SessionState
+import works.earendil.pihost.core.engine.git.GitSnapshot
 import works.earendil.pihost.feature.chat.ChatUiState
 import works.earendil.pihost.feature.chat.ChatViewModel
 import works.earendil.pihost.feature.chat.ModelPickerState
@@ -51,6 +52,7 @@ fun ChatScreen(
     val turnState by viewModel.turnState.collectAsState()
     val transcript by viewModel.transcript.collectAsState()
     val queueState by viewModel.queueState.collectAsState()
+    val git by viewModel.git.collectAsState()
     val modelPicker by viewModel.modelPicker.collectAsState()
     val stats by viewModel.stats.collectAsState()
     val permission by viewModel.permissionRequest.collectAsState()
@@ -102,6 +104,8 @@ fun ChatScreen(
                         sessionId = (uiState as ChatUiState.Ready).sessionId,
                         engineStatus = engineStatus,
                         queueState = queueState,
+                        git = git,
+                        onGitRefresh = viewModel::refreshGit,
                         queueExpanded = queueExpanded,
                         onQueueToggle = { queueExpanded = !queueExpanded },
                         retryNote = retryNote,
@@ -162,6 +166,8 @@ private fun EngineTopBar(
     sessionId: String,
     engineStatus: SessionState?,
     queueState: QueueState,
+    git: GitSnapshot?,
+    onGitRefresh: () -> Unit,
     queueExpanded: Boolean,
     onQueueToggle: () -> Unit,
     retryNote: String?,
@@ -190,6 +196,20 @@ private fun EngineTopBar(
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             retryNote?.let {
                 Text(text = it, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+            }
+            // P3C §3.6：分支 chip。`null` / NotARepo / Busy / Unavailable **一律不渲染节点**，
+            // 顶栏因此永远不会有「一行说不清的话」；只在真的是仓库时出现。
+            // 形状照 ModelChip：labelMedium + 单行 + 省略号 + 可点重读。
+            (git as? GitSnapshot.Repo)?.let { repo ->
+                Text(
+                    text = if (repo.dirty) "${repo.displayName}*" else repo.displayName,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .testTag(ChatTags.GIT_CHIP)
+                        .clickable(onClick = onGitRefresh),
+                )
             }
             ModelChip(
                 state = modelPicker,

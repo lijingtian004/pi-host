@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.SessionState
+import works.earendil.pihost.core.engine.projects.ProjectNames
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore.ProviderEntry
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore.RelayEntry
@@ -41,7 +42,7 @@ class FakeSettingsRepository(initial: AppSettings = AppSettings()) : SettingsRep
     val writes = CopyOnWriteArrayList<Write>()
     val writeCalls = AtomicInteger(0)
 
-    /** 置非 null → 三个 setter 抛它（验「写盘失败时提示说没改」这条分支）。 */
+    /** 置非 null → 四个 setter 全部抛它（验「写盘失败时提示说没改」这条分支）。 */
     var writeError: Throwable? = null
 
     /** 置 false → setter **不**改快照（模拟 edit 失败后仓库保持原值）。 */
@@ -72,6 +73,20 @@ class FakeSettingsRepository(initial: AppSettings = AppSettings()) : SettingsRep
         writes.add(Write("defaultModel", model))
         writeError?.let { throw it }
         if (applyToSnapshot) _settings.update { it.copy(defaultModel = model) }
+    }
+
+    /**
+     * P3C §3.2 接口扩员补的一条 override。
+     *
+     * 三个旧 setter 的契约（`writeCalls` 计数 + `writeError` 先抛 + `applyToSnapshot` 决定动不动快照）
+     * 原样继承，否则「置非 null → setter 抛它」这句 KDoc 就当场失效。
+     * 快照里落 `sanitizeOrFallback` 后的形状，记进 [Write] 的是调用方原样给的值。
+     */
+    override suspend fun setActiveProject(name: String?) {
+        writeCalls.incrementAndGet()
+        writes.add(Write("activeProject", name))
+        writeError?.let { throw it }
+        if (applyToSnapshot) _settings.update { it.copy(activeProject = ProjectNames.sanitizeOrFallback(name)) }
     }
 }
 

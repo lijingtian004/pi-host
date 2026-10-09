@@ -30,6 +30,9 @@ import works.earendil.pihost.core.engine.audit.AuditEntry
 import works.earendil.pihost.core.engine.audit.AuditKind
 import works.earendil.pihost.core.engine.audit.AuditSink
 import works.earendil.pihost.core.engine.audit.FileAuditSink
+import works.earendil.pihost.core.engine.git.GitProbe
+import works.earendil.pihost.core.engine.git.GitSnapshot
+import works.earendil.pihost.core.engine.git.NoopGitProbe
 import works.earendil.pihost.core.engine.audit.NoopAuditSink
 import works.earendil.pihost.core.engine.di.EngineModule
 import works.earendil.pihost.core.engine.settings.SettingsRepository
@@ -83,6 +86,15 @@ class ChatViewModel @Inject constructor(
      * `AppTestEngineModule`（测试假体）两边都得有（§3.6 收尾）。
      */
     private val auditSink: AuditSink = NoopAuditSink,
+    /**
+     * git 只读探针（P3C §3.6）。与 [auditSink] 同一条手法：**尾位 + 默认值**，
+     * 于是既有 5/6 实参的构造点（`ChatViewModelTest` 的 rig 与 `:app` 的几处）一字不改就能编译。
+     *
+     * 默认值是 [NoopGitProbe]（永远 `Unavailable`）而不是真探针：
+     * Dagger 看不见 Kotlin 默认值，生产侧照样要 `EngineModule.gitProbe` 那条 binding；
+     * 而测试侧拿到空假体正好是想要的——**没有一条既有用例该因为多了个真 shell-out 而变慢或变黄**。
+     */
+    private val gitProbe: GitProbe = NoopGitProbe,
 ) : AndroidViewModel(app) {
 
     /**
@@ -113,6 +125,24 @@ class ChatViewModel @Inject constructor(
      * （[QueueState.depth]），顶栏与列表页因此不可能显示两个不同的数。
      */
     val queueState: StateFlow<QueueState> = _queueState.asStateFlow()
+
+    /**
+     * 顶栏分支 chip 的数据源（P3C §3.6）。`null` = **还没读过**（与 `Unavailable` 不同：
+     * 后者是「读过但读不出来」）。UI 对两者一律不渲染节点，但 VM 里留着这个区分，
+     * 好让「进页面还没读过」与「git 坏了」在日志里是两句话。
+     */
+    private val _git = MutableStateFlow<GitSnapshot?>(null)
+    val git: StateFlow<GitSnapshot?> = _git.asStateFlow()
+
+    /**
+     * 在飞闸门：一次 `AgentSettled` 只允许有一条读在跑。
+     *
+     * 为什么不靠 StateFlow 自己合并：探针是**真子进程**（一次 spawn + 最多 3s），
+     * 连续两轮 settle 之间若第一条还没回，第二条会并发起两个 git 进程去读同一个
+     * `.git/index`——git 自己有 index.lock，但我们只读不写，撞上的代价是
+     * 一次 `Busy` 与一条多余的进程。宁可丢一次刷新（下一轮 settle 还会读）。
+     */
+    private val gitInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val _permissionRequest = MutableStateFlow<PendingPermission?>(null)
     val permissionRequest: StateFlow<PendingPermission?> = _permissionRequest.asStateFlow()
@@ -282,6 +312,8 @@ class ChatViewModel @Inject constructor(
 
         subscribe(id!!)
         _uiState.value = ChatUiState.Ready(id)
+        // P3C §3.6：进页面第一次读分支。放在 Ready 之后，chip 才有状态可挂。
+        refreshGit()
     }
 
     /** 订阅先于任何 send（纪律 1）：两条收集协程都用 Unconfined 就地注册。 */
@@ -1000,8 +1032,39 @@ class ChatViewModel @Inject constructor(
      * `PathLayout.projectDir` 只构造路径不建目录，因此这里既不碰磁盘也不挂起。
      */
     private fun auditCwd(): String = runCatching {
-        PathLayout.projectDir(getApplication(), EngineModule.DEFAULT_PROJECT).absolutePath
+        PathLayout.projectDir(getApplication(), settings.activeProject).absolutePath
     }.getOrDefault("")
+
+    /**
+     * 顶栏分支 chip 的唯一刷新入口（P3C §3.6）。**公开**是因为 UI 上那颗 chip 可点。
+     *
+     * 三个时机，**没有一个是定时器**：启动落定（进页面）、一轮跑完（`AgentSettled`，
+     * 这一刻分支/脏态才是真的变了——pi 刚可能跑过 commit）、用户点 chip。
+     * 轮询在这个进程里意味着每隔几秒起一个 git 子进程去和 node 抢 CPU，而手机上的
+     * CPU 与电池就是本项目最贵的两种资源（方案 §9 整节都在为它做取舍）。
+     *
+     * **`onSessionRolled` 故意不挂**：本期的探针目录 = [auditCwd] = 活动项目目录
+     * （`ScannedSession.cwd` 还没接进导航参数，见 REPORT-P3C §8 偏差 3）。
+     * 跨项目续用时重读一次，chip 说的是「你的活动项目在 main」而用户正看着别的项目——
+     * 那句真话在这里是误导，不如不读。
+     *
+     * 探针任何失败都不许冒出来：它只有一次 `Log.w` 的资格，UI 保持沉默（无 chip 即无信息）。
+     */
+    fun refreshGit() {
+        val dir = auditCwd()
+        if (dir.isBlank()) return
+        if (!gitInFlight.compareAndSet(false, true)) return
+        viewModelScope.launch {
+            try {
+                _git.value = runCatching { gitProbe.read(dir) }.getOrElse {
+                    android.util.Log.w(GIT_TAG, "git 探针异常，chip 保持沉默", it)
+                    null
+                }
+            } finally {
+                gitInFlight.set(false)
+            }
+        }
+    }
 
     // ── 入站装配（§5.1 事件映射）─────────────────────────────────────────────────
 
@@ -1083,6 +1146,9 @@ class ChatViewModel @Inject constructor(
             is PiEvent.AgentSettled -> {
                 settleLastAssistant()
                 if (_turnState.value != TurnState.PermissionPending) _turnState.value = TurnState.Idle
+                // P3C §3.6：一轮结束是分支/脏态**唯一会自己变**的时刻（pi 刚可能跑过 git commit）。
+                // 与 §3.4 的会话统计同挂点，理由也一样：一次运行只到一条，且绝不设定时器。
+                refreshGit()
                 // §3.4：跑完一轮就把会话统计问一次。规格书写的是「TurnEnd 或 AgentSettled」，
                 // 这里取 AgentSettled——一次运行只到一条（探测里 turn_end 有 2 条，
                 // 挂在 TurnEnd 上等于每轮多问一次同样的数），且 pi 自己说「settled」的时候
@@ -1442,6 +1508,9 @@ class ChatViewModel @Inject constructor(
 
         /** 审计旁路自己的日志 tag（与 `FileAuditSink.TAG` 同一串，日志侧好聚合）。 */
         const val AUDIT_LOG_TAG = "PiHost/Audit"
+
+        /** 只用于一条 logcat 标签；git 探针的失败**不进 UI**（见 [refreshGit]）。 */
+        const val GIT_TAG = "PiHostGitChip"
 
         /** protocol.md §3.7：pi 侧 confirm 的缺省超时（实测 15000ms）。 */
         const val DEFAULT_UI_TIMEOUT_MS = 15_000L

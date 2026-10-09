@@ -197,13 +197,14 @@ $ find /root/pi/.tools/pi-1.0.4 -type f -newermt "2026-10-09 00:00" | wc -l → 
 
 ## 6. commit 与复现命令
 
-本轮三条 commit（§0 前缀纪律）：
+本轮 commit（§0 前缀纪律，窗口 `7754e45..HEAD`；逐条实参见 `git log --oneline 7754e45..HEAD`）：
 
 | commit | 步骤 | 面 |
 |---|---|---|
-| `9479b22` | §3.1 + §3.2（签名变更必须同 commit，否则整树编译红） | core/engine 1 + feature/settings 4（main）+ 4（test）共 9 个路径 |
-| `1a4ec50` | §3.3 版本 7 / 0.1.6 | `app/build.gradle.kts` + `ManifestPermissionTest` + `AppTestDoubles` |
-| `（本条 docs）` | §3.6 | `docs/REPORT-P3B-FIX1.md` |
+| `9479b22` `feat(p3b-fix1)` | §3.1 + §3.2（签名变更必须同 commit，否则整树编译红） | core/engine 1 + feature/settings 4（main）+ 4（test）共 9 个路径 |
+| `1a4ec50` `feat(p3b-fix1)` | §3.3 版本 7 / 0.1.6 | `app/build.gradle.kts` + `ManifestPermissionTest` + `AppTestDoubles` |
+| `ba5f443` `docs(p3b-fix1)` | §3.6 | `docs/REPORT-P3B-FIX1.md` |
+| `13614ea` `docs(p3b-fix1)` | §2 一句计数口径 | 同上（本报告；此后不再自引用地追加 commit） |
 
 ```bash
 # 第 0 步（每条 gradle 命令都要，sync 会 gitignore 掉 local.properties）：

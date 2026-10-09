@@ -16,14 +16,18 @@ android {
         applicationId = "works.earendil.pihost"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.1.3"
+        versionCode = 5
+        versionName = "0.1.4"
         // 方案 §2.3 / §8：只发 arm64-v8a（Termux 运行时仅有 aarch64）
         ndk { abiFilters += "arm64-v8a" }
     }
 
     buildFeatures {
         compose = true
+        // P3A §3.3：AGP 8 起 buildConfig 默认关（RECON：全仓此前无一处引用 BuildConfig），
+        // 崩溃报告首行要写 versionName（§3.3 原文「DI @Provides 提供真 dir + BuildConfig.VERSION_NAME」），
+        // 故显式打开。只此一处：feature 模块不需要版本号，不跟着改（少一个生成物少一份 APK 方法数）。
+        buildConfig = true
     }
 
     // 方案 §8：libpi_*.so 必须由安装器解压成真实文件（nativeLibraryDir）才能 execve，

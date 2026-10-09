@@ -155,6 +155,23 @@ object AppTestEngineModule {
      */
     @Provides
     fun auditSink(): AuditSink = AppTestHolder.audit
+
+    /**
+     * §3.6 注入边清点（P3A 新增的两条依赖，**这里一条都不补**，写下来是为了让下一个人不必再试）：
+     *
+     * - [CrashReporter]：绑定住在 `:app` **主源集**的 `CrashReportModule`，本文件只卸载
+     *   `EngineModule`，所以它没被卸掉；再给一条就是 `DuplicateBindings`（KSP 期直接失败）。
+     *   真图里它由 Robolectric 沙箱 Application 的 `filesDir/crash` 落地，`appVersion` 取
+     *   `BuildConfig.VERSION_NAME`——版本一升（§3.6 的 5 / 0.1.4）崩溃报告首行跟着变，
+     *   不需要在这里再写一份真相。
+     * - [works.earendil.pihost.feature.settings.DiagnosticsSource]：接口→实现那条转发边住在
+     *   **没有被卸载**的 `SettingsModule` 里，与 P2H 的 `RelayEndpointSource` 完全同一课
+     *   （见 [relayEndpointStore] 的说明）：`:app` 缺的从来只是 store 本体，而 `CrashReporter`
+     *   本体在上面那条里已经有人给了。
+     *
+     * 实证就是 `MainActivityTest:241-253` 那条设置路由：它真造 `SettingsViewModel`
+     * （六个依赖全图解析），P3A §3.5 之后仍然是绿的——图建得起来，就不该再加边。
+     */
 }
 
 /**

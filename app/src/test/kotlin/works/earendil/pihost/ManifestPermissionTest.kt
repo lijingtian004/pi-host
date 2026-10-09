@@ -35,6 +35,11 @@ import org.xmlpull.v1.XmlPullParser
  *
  * **P3A §3.4 起本文件还管「备份面」**（④⑤）：备份排除清单是指向 `res/xml` 的资源引用，
  * 只有 aapt 编译进 APK 之后才解得出引用对不对，所以放在这里用合并资源读，而不是读仓库里的源文件。
+ *
+ * **P3B §3.5 起还管「权限清单一字不改」**（⑥）：①② 是「不能丢」的下界，⑥ 补上「不能多」的上界——
+ * P3B 的三张脸（模型切换 / 统计条 / 压缩）都走既有 RPC 通道，没有任何一条需要新的系统能力，
+ * 所以合并清单必须还是那四条。同一条里 ③ 把 versionCode/versionName 升到 6 / 0.1.5
+ * （本轮唯一允许的 `app/build.gradle.kts` 改动，其余字段一字未动）。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], application = Application::class)
@@ -77,19 +82,19 @@ class ManifestPermissionTest {
             declared.contains(Manifest.permission.POST_NOTIFICATIONS))
     }
 
-    // ── ③ 版本必须升到 versionCode=5 / versionName=0.1.4（§2 红线「版本必须升」） ────
+    // ── ③ 版本必须升到 versionCode=6 / versionName=0.1.5（§2 红线「版本必须升」） ────
 
     @Test
-    fun `03 the apk identity is bumped to versionCode 5 and versionName 0 point 1 point 4`() {
+    fun `03 the apk identity is bumped to versionCode 6 and versionName 0 point 1 point 5`() {
         val info = app.packageManager.getPackageInfo(app.packageName, 0)
-        // 用 5L：longVersionCode 是 Long，写字面量 5 会落到 assertEquals(String, Object, Object)
-        // 那条重载上，Integer(5) != Long(5) 会假红——这是 JUnit 装箱陷阱，不是版本没升。
-        assertEquals("versionCode 不升，真机会装成同版本、覆盖不掉带 bug 的旧包", 5L, info.longVersionCode)
-        assertEquals("0.1.4", info.versionName)
+        // 用 6L：longVersionCode 是 Long，写字面量 6 会落到 assertEquals(String, Object, Object)
+        // 那条重载上，Integer(6) != Long(6) 会假红——这是 JUnit 装箱陷阱，不是版本没升。
+        assertEquals("versionCode 不升，真机会装成同版本、覆盖不掉带 bug 的旧包", 6L, info.longVersionCode)
+        assertEquals("0.1.5", info.versionName)
         assertEquals("works.earendil.pihost", info.packageName)
-        // 单调性单列一条：P2F 发的是 2、P2G 是 3、P2H 是 4、P3A 是 5。写死 5L 已经隐含这件事，
+        // 单调性单列一条：P2F 发的是 2、P2G 是 3、P2H 是 4、P3A 是 5、P3B 是 6。写死 6L 已经隐含这件事，
         // 但这条的失败信息会直接说出「必须严格大于上一版」，排查 adb install -r 拒装时少绕一步。
-        assertTrue("必须严格高于 P2H 的 4，否则覆盖安装被拒", info.longVersionCode > 4L)
+        assertTrue("必须严格高于 P3A 的 5，否则覆盖安装被拒", info.longVersionCode > 5L)
     }
 
     // ── ④ 备份排除清单（P3A §3.4）：API ≤ 30 的那份 ────────────────────────────
@@ -130,6 +135,54 @@ class ManifestPermissionTest {
             flags and ApplicationInfo.FLAG_ALLOW_BACKUP,
         )
     }
+
+    // ── ⑥ P3B §3.5：权限清单**一字不改**（双向：既不许丢，也不许多） ────────────────
+
+    /**
+     * ①② 只保证「这四条都在」，加第五条照样绿——而 P3B 全程不该新增任何权限
+     * （§3.3 模型切换、§3.4 统计条都走既有 RPC 通道，没有新的系统能力面）。
+     * 这条把集合钉成**恰好四个**：manifest 一旦多一条 `uses-permission` 立刻红。
+     *
+     * 断的是合并清单（与 ①② 同一份真相），所以库模块的 `uses-permission` 也会被算进来——
+     * 这正是「依赖偷偷要权限」的检出方式。而它**确实**检出到一条：
+     * `androidx.core:core`（本轮解析到的是 1.18.0）在自己的 manifest 里写了
+     * ```
+     * <permission android:name="${'$'}{applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+     *             android:protectionLevel="signature" />
+     * <uses-permission android:name="${'$'}{applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+     * ```
+     * （实测位置：编译机 `~/.gradle/caches/8.13/transforms/…/core-1.18.0/AndroidManifest.xml:22-26`；
+     * 合并产物 `app/build/intermediates/merged_manifests/debug/processDebugManifest/AndroidManifest.xml`
+     * 里 `uses-permission` 共 5 条 = 我们这 4 条 + 它这 1 条）。
+     * **这不是能力申请**：名字带 `applicationId` 前缀、`protectionLevel=signature`、由 App 自己声明自己使用，
+     * 是 AndroidX 为 `ContextCompat.registerReceiver(…, RECEIVER_NOT_EXPORTED)` 造的内部闸门，
+     * 从 P2A 起每一份 APK 都有它，P3B 一条没加。所以断言分成两半：
+     * 系统命名空间（`android.permission.*`）必须**恰好**是 [P3B_SYSTEM_PERMISSIONS]，
+     * 剩下的杂项必须**只有**这条库自带的 [selfDefinedReceiverGate]。
+     */
+    @Test
+    fun `06 the permission list is exactly the four and nothing was added in p3b`() {
+        val declared = requestedPermissions().toSet()
+        val system = declared.filterTo(linkedSetOf()) { it.startsWith("android.permission.") }
+
+        assertEquals(
+            "P3B §3.5 红线「不新增权限」：合并清单里 android.permission.* 必须恰好是这四条" +
+                "（丢→①② 已各自报警，多→这条报警）。实际=$system",
+            P3B_SYSTEM_PERMISSIONS,
+            system,
+        )
+
+        assertEquals(
+            "除上面四条外，合并清单只允许 androidx.core 自带的那条自定义 signature 权限" +
+                "（不是系统能力，见 KDoc）。实际多余项=${declared - P3B_SYSTEM_PERMISSIONS}",
+            setOf(selfDefinedReceiverGate()),
+            declared - P3B_SYSTEM_PERMISSIONS,
+        )
+    }
+
+    /** `androidx.core` 注入的那条：<applicationId>.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION。 */
+    private fun selfDefinedReceiverGate(): String =
+        "${app.packageName}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
 
     // ── 工具 ──────────────────────────────────────────────────────────────────
 
@@ -172,5 +225,24 @@ class ManifestPermissionTest {
         /** §3.4 点名的四个目录 × `domain="file"`（= `<包>/files/`）。 */
         private val SUCCESS_EXCLUDES: Set<String> =
             setOf("home", "audit", "crash", "runtime").map { "file:$it" }.toSet()
+
+        /**
+         * P3B §3.5 的系统权限基线：**恰好**这四条 `android.permission.*`，一条不多一条不少。
+         *
+         * 逐条来历（与 ①② 的分工一致）：
+         * - `INTERNET`（P2F §4.3(a)）：pi 调模型 API 的 socket，缺了直接 `ERR_CONNECTION_FAILURE`；
+         * - `FOREGROUND_SERVICE`（P2C）：引擎服务必须常驻，否则后台被杀；
+         * - `FOREGROUND_SERVICE_SPECIAL_USE`（P2C，API 34 起强制）：少了它 `startForeground` 抛异常；
+         * - `POST_NOTIFICATIONS`（P2C）：FGS 通知门，Android 13+ 是 runtime 权限。
+         *
+         * 字符串与 `Manifest.permission.*` 常量同值，但按「清单里的原始串」写：断言对象是合并清单的
+         * 字面量，保持①② 同一套写法，免得读者以为换了来源。
+         */
+        private val P3B_SYSTEM_PERMISSIONS: Set<String> = setOf(
+            Manifest.permission.INTERNET,
+            Manifest.permission.FOREGROUND_SERVICE,
+            "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+            "android.permission.POST_NOTIFICATIONS",
+        )
     }
 }

@@ -162,7 +162,7 @@ object AppTestEngineModule {
      * - [CrashReporter]：绑定住在 `:app` **主源集**的 `CrashReportModule`，本文件只卸载
      *   `EngineModule`，所以它没被卸掉；再给一条就是 `DuplicateBindings`（KSP 期直接失败）。
      *   真图里它由 Robolectric 沙箱 Application 的 `filesDir/crash` 落地，`appVersion` 取
-     *   `BuildConfig.VERSION_NAME`——版本一升（§3.6 的 5 / 0.1.4）崩溃报告首行跟着变，
+     *   `BuildConfig.VERSION_NAME`——版本一升（P3B §3.5 的 6 / 0.1.5）崩溃报告首行跟着变，
      *   不需要在这里再写一份真相。
      * - [works.earendil.pihost.feature.settings.DiagnosticsSource]：接口→实现那条转发边住在
      *   **没有被卸载**的 `SettingsModule` 里，与 P2H 的 `RelayEndpointSource` 完全同一课
@@ -171,6 +171,14 @@ object AppTestEngineModule {
      *
      * 实证就是 `MainActivityTest:241-253` 那条设置路由：它真造 `SettingsViewModel`
      * （六个依赖全图解析），P3A §3.5 之后仍然是绿的——图建得起来，就不该再加边。
+     *
+     * **P3B §3.5 复查（结论仍是一条都不补）**：本轮把 `ChatViewModel` 从「发消息/插话」扩到
+     * 「模型白名单 + 统计条 + 压缩开关」，新增的全是**方法**（`refreshModels/refreshModelState/
+     * setModel/refreshStats/compactContext/setAutoCompaction`）与**UI 合成品**（`ModelChip/ModelPickerDialog/StatsBar`），
+     * `@Inject constructor` 的六个参数一字未动——统计与模型都经既有 [ChatEngine.send] 走 RPC，
+     * 解析住在 `:feature:chat` 的 `ChatSessionStats/ChatModelPicker`，没有任何新的可注入协作者。
+     * 所以规格书 §3.5 那句「AppTestDoubles 补新注入边（若有）」实测为**无**，
+     * 报告 §8 记这条「若有 → 判定为无」的偏差。
      */
 }
 

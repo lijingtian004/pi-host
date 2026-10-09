@@ -566,7 +566,42 @@ node /root/pi/.tools/p3b-probe.js /root/pi/.capture/probe33/rpc33.jsonl /root/pi
 # 真机 adb install -r / 真机大会话压缩（mock 会话太小，pi 回 Nothing to compact）
 ```
 
-## 11. 计数汇总
+## 11. §3.7 真机验收清单（交给用户执行，v0.1.5）
+
+下载：`http://64.90.11.50:8000/8f02f9bda5f9/pi-host-full-debug.apk`（debug 签名，`versionCode=6` 支持覆盖安装，不必先卸载）。
+
+| # | 操作 | 期望 |
+|---|---|---|
+| 1 | 装机 → 会话列表 → 切回一条**旧会话** | 转录**完整显示**（user/assistant/工具卡按原顺序），不再是空白页；这是 P1 那个 bug 的正面验收 |
+| 2 | 发一条会跑很久的 prompt → 流式期间在输入框打字 → 按「插入」 | pi 在当前轮的下一个工具边界回应插话；徽标从「排队中: steer×0 followUp×0 ▸」变化，点开能看到逐条内容 |
+| 3 | 点顶栏模型 chip → 选另一个模型 → 关对话框 → 再发一条 prompt | chip 上名字立刻变成所选模型（`●` 高亮跟着动）；下一轮由新模型应答；思考档只列 pi 给的白名单 |
+| 4 | 看输入框上方那一行统计 → 点开展开 → 按「压缩上下文」并确认 | 一行式出现 `tokens｜cost｜ctx tokens/window (percent%)`；展开有 userMessages/assistantMessages/toolCalls/toolResults/totalMessages；压缩后 ctx% 明显下降（小会话会看到 pi 的原话 `Nothing to compact (session too small)`，这是正常回执）；「自动压缩」开关按下去后重开 App 仍是那个值（`get_state` 是唯一真相） |
+| 5 | 既有回归三项 | 审计照旧（`files/audit/audit-<日期>.jsonl` 仍只记工具与权限三类）；权限对话框照旧（pi 发 `confirm` 时弹框、三个按钮各自回写）；崩溃收集照旧（`files/crash/*.txt` 首行 `version=0.1.5`） |
+
+装机与观测点（`versionCode` 5 → 6，所以 `-r` 覆盖安装即可，`files/` 与 pi 的会话目录都不动）：
+
+```bash
+curl -fSO http://64.90.11.50:8000/8f02f9bda5f9/pi-host-full-debug.apk
+adb install -r pi-host-full-debug.apk                     # 期望尾部 Success
+adb shell dumpsys package works.earendil.pihost | grep versionName   # 期望 versionName=0.1.5
+
+# 四条新逻辑各自的 logcat tag（全部是代码里现存的常量，不是推测）：
+adb logcat -s PiHost/ChatHistory   # 第 1 条：回填失败才会写 W 行（成功静默）——ChatViewModel.kt:1453 / ChatHistory.kt:107
+adb logcat -s PiHost/Queue         # 第 2 条：每次 steer/follow_up 入队一行 disposition——ChatViewModel.kt:1456
+adb logcat -s PiHost/ModelCatalog  # 第 3 条：模型快照形状不对才会写（白名单/当前模型都来自回执）——ChatModelPicker.kt:46
+adb logcat -s PiHost/Audit    # 第 5 条：审计 sink 违约才会写；正常静默——ChatViewModel.kt:1444
+```
+
+第 4 条（统计）没有专用 tag：`get_session_stats` / `compact` 的结果都直接进界面那行文字与 notice，
+形状不对时**保留上一版数字**并写明「形状不对」（用例 `st04`/`case62`），所以真机上按数字看不出来时，
+先按「⟳」手动刷新一次再判——仍是旧数就是 `get_session_stats` 没回，不是解析吞了。
+
+三条最容易误判成 bug 的正常现象（都有 §9.1 的实探证据）：
+① 刚切会话那一下可能先看到「会话切换中…」占位行，回填成功才换成历史（`case32`–`case39` 的时序）；
+② 插话徽标在 pi 消化完之后才归零，队列内容由 `queue_update` 整表替换，不按点击次数预加（§3.2 纪律）；
+③ 小会话点「压缩上下文」会原样显示 pi 的 `Nothing to compact (session too small)`——这是回执不是错误弹窗（§8 第 6 条）。
+
+## 12. 计数汇总
 
 | 项 | 值 |
 |---|---|

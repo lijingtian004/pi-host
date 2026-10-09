@@ -1,7 +1,7 @@
 # REPORT-P3A — 审计日志 + 崩溃收集 + 备份合规 + 诊断页（versionCode 5 / 0.1.4）
 
 规格书：`/root/pi/.tools/qoder-task-p3a.md`（P3 产品化首批）。
-交付窗口：`29571fa`（REPORT-P2H）→ HEAD，**7 条 commit，一小节一条**（§3.1–§3.6 六条 `feat(p3a)` + §3.7 一条 `docs(p3a)`）。
+交付窗口：`29571fa`（REPORT-P2H）→ `0356165`，**8 条 commit，一小节一条**（§3.1–§3.6 六条 `feat(p3a)` + §3.7 两条 `docs(p3a)`；本行所在的第 9 条只是报告收尾文字，不动任何代码）。
 
 ## 1. 结论摘要
 
@@ -155,7 +155,8 @@ TurnEnd 抢跑补 cancelled 不是 timeout、虚拟时钟到点 `cancelled-timeo
 | `a0a93c6` | §3.4 | manifest 两属性 + 两份 `res/xml` + `ManifestPermissionTest` 04/05 |
 | `4f5197a` | §3.5 | `Diagnostics.kt` + VM/Module/Screen/Tags + 12 条（t27–32、i01–06） |
 | `88ad549` | §3.6 | versionCode 5 / 0.1.4 + 用例 03 换值 + 注入边清点 KDoc |
-| `docs(p3a)` | §3.7 | 本报告 + 一处 KDoc 行号引用修正（`ChatViewModel.kt:572` 的 `EngineModule:174` → `EngineModule.kt:216`，注释文字，不动代码行号；§8 第 22 条）|
+| `fa2b24b` | §3.7 | 本报告 + 一处 KDoc 行号引用修正（`ChatViewModel.kt:572` 的 `EngineModule:174` → `EngineModule.kt:216`，注释文字，不动代码行号；§8 第 22 条）|
+| `0356165` | §3.7 | §10 补两条验收对照命令（pi 目录 0 写入、P2H↔P3A 权限/so 名单 diff）|
 
 ## 4. 红线复核（规格书 §2 逐条，全部实测）
 
@@ -570,7 +571,7 @@ diff <(unzip -Z1 /root/apk-serve/0944f6f3e161/pi-host-full-debug.apk | grep '^li
 
 | 项 | 值 |
 |---|---|
-| P3A 小节 | 7（§3.1–§3.7）→ 6 条 feat commit + 1 条 `docs(p3a)`（§3.7 的构建与落盘不产生代码提交，报告与一处 KDoc 行号修正进这一条） |
+| P3A 小节 | 7（§3.1–§3.7）→ 6 条 `feat(p3a)` + 3 条 `docs(p3a)`（§3.7 的构建与落盘不产生代码提交；三条 docs 分别是报告本体、两条验收命令、计数收尾） |
 | 改动路径 | 31 个代码路径（14 新增 / 17 修改）+ 本报告 = 32，全部在非冻结区 |
 | 测试 | 304 → **355**（+51），`failures=0 errors=0`，skip=1（`:core:rpc` 环境门控） |
 | 新增用例分布 | `:core:engine` 25（审计 14 + 崩溃 11）/ `:feature:chat` 8 / `:feature:settings` 12（VM 6 + UI 6）/ `:app` 6（崩溃装配 4 + 备份 2） |

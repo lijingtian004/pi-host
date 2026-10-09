@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  云备份 / 「转移到其他设备」的排除清单（Android 11 及以前，`android:fullBackupContent`）。
+  规格书 P3A §3.4。
+
+  ## 动机：allowBackup=false 之外的纵深防御
+  `AndroidManifest.xml` 里 `android:allowBackup="false"`（§1.6 实测 :16）本身就已经整包不备，
+  所以这份文件在今天的配置下**一个字节都不生效**。仍然写满四条排除的理由：
+  1. `allowBackup` 是一个「产品决策」而不是「技术事实」——将来有人为了换机迁移体验把它翻成 true，
+     翻的那一刻这份清单就是唯一还站在敏感目录前面的闸；把它留在这里，翻标志的人不用重新学一遍
+     「哪几个目录不能带走」。
+  2. §2 红线「凭据永不离开本机」：`home/` 装的是 pi 的 `auth.json`（明文 key，P2G §4.1）与
+     `models.json` 的 `apiKey` 字段（P2H §3.1）；备份面（Google oneDrive/云备份、ADB 迁移）
+     不是本仓的信任边界。
+  3. `audit/` 与 `crash/` 是 P3A 新增的两面：审计 jsonl 里有**用户原文的命令行与文件内容预览**，
+     崩溃正文里有**绝对路径与栈**（能反推包内部结构）。这两类都不该出现在云端。
+  4. `runtime/` 是 100MB 级的解压产物（P2B 起的 node + libpi_*.so），备份它纯属浪费配额，
+     而且安装器会原子切换目录，云端那份永远可能是错的版本。
+
+  ## 为什么路径不带尾斜杠
+  AOSP 把 `android:path` 当**相对路径段**解析（`File(domainDir, path)`），官方示例
+  `<exclude domain="file" path="do_not_back_up"/>` 也不带斜杠；目录的内容随目录一起排除。
+  规格书 §3.4 原文写作 `home/`、`audit/`、`crash/`、`runtime/`，这里按平台语义去掉斜杠，
+  语义一字不变（报告 §8 记这条形态差异）。
+
+  `domain="file"` = `<包>/files/`，正是 `PathLayout.homeDir/runtimeDir` 与
+  `AuditPaths.AUDIT_DIR_NAME` / `CrashPaths.CRASH_DIR_NAME` 的宿主目录。
+-->
+<full-backup-content>
+    <exclude domain="file" path="home" />
+    <exclude domain="file" path="audit" />
+    <exclude domain="file" path="crash" />
+    <exclude domain="file" path="runtime" />
+</full-backup-content>

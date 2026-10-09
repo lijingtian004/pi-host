@@ -11,9 +11,24 @@
          方向层 RECON-P2F §3.5 实测本清单此前只有上面 3 条，core/feature 各模块 Manifest 也无 uses-permission。 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!--
+      备份面（规格书 P3A §3.4）。三条一起看：
+      - `allowBackup="false"`：§1.6 实测的既有值，**P3A 不动它**——它是唯一真正生效的开关，
+        API 31+ 上同时关掉云备份与设备转移。
+      - `fullBackupContent`（API ≤ 30 读）/ `dataExtractionRules`（API ≥ 31 读）：两份清单都排除
+        `home`（凭据：auth.json 的明文 key + models.json 的 apiKey）、`audit`（用户命令行原文与
+        工具结果预览）、`crash`（绝对路径与完整栈）、`runtime`（100MB 级解压产物）。
+      为什么在 false 之上还要留两份「暂时不生效」的清单：**纵深防御**。allowBackup 是产品决策
+      而不是技术事实，将来若有人为了换机迁移体验把它翻成 true，这两份清单就是唯一还站在敏感目录
+      前面的闸；翻标志的人不需要重新学一遍「哪几个目录不能带走」。这也是 §2 红线
+      「凭据/API key 永不离开本机」在清单层的落点。
+      （两个属性都不带 res/xml 之外的引用，不新增权限、不新增依赖。）
+    -->
     <application
         android:name=".PiHostApp"
         android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:label="pi host"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">

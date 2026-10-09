@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12（API 31）起的备份/传输规则，规格书 P3A §3.4。
+  挂在 `android:dataExtractionRules` 上，同时管两条通路：
+  - `<cloud-backup>`：云端备份与「恢复到新设备」；
+  - `<device-transfer>`：D2D（换机精灵 / ADB 近场迁移 / 备份到电脑）。
+
+  ## 为什么两块都写、而且内容一样
+  API 31 把「云备份」与「设备转移」**拆成了两个独立决策**：只写 `<cloud-backup>` 的话
+  设备转移仍按默认策略全量带走 filesDir。本仓的敏感面（凭据 / 审计原文 / 崩溃栈）对两条通路
+  同样敏感，所以两块都列全 —— 规格书 §3.4 原文点名的正是「cloud-backup + device-transfer 两块」。
+
+  ## 与 backup_rules.xml 的分工
+  `backup_rules.xml`（`android:fullBackupContent`）服务 API ≤ 30，本文件服务 API ≥ 31，
+  两份是**同一套排除集的两个语法形态**（§3.4 要求两份都建）。
+  路径不带尾斜杠的理由同那个文件（AOSP 把 path 当相对路径段，官方示例不带斜杠）。
+
+  ## 为什么这些排除在当前配置下不生效（依然要留着）
+  `android:allowBackup="false"`（§1.6 实测 :16，P3A 不动它）在 API 31+ 上直接关掉两条通路，
+  于是这份清单是**纵深防御**：它守的是「将来有人把标志翻成 true」那一刻。
+  翻标志的成本必须低到「不用重新学一遍哪些目录不能带走」，这是产品化里最常见的回归来源。
+
+  四个目录的来历：
+  - `home`   → `filesDir/home/.pi/agent/auth.json` + `models.json`（凭据，P2G §4.1 / P2H §3.1）
+  - `audit`  → P3A §3.1 审计 jsonl（用户命令行原文 + 结果预览）
+  - `crash`  → P3A §3.3 崩溃正文（绝对路径 + 完整栈）
+  - `runtime`→ P2B 起的解压产物（100MB 级，且安装器原子切换，云端那份永远可能是错的版本）
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="home" />
+        <exclude domain="file" path="audit" />
+        <exclude domain="file" path="crash" />
+        <exclude domain="file" path="runtime" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="home" />
+        <exclude domain="file" path="audit" />
+        <exclude domain="file" path="crash" />
+        <exclude domain="file" path="runtime" />
+    </device-transfer>
+</data-extraction-rules>

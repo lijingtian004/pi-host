@@ -6,6 +6,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import works.earendil.pihost.core.rpc.PiJsonOut
+import works.earendil.pihost.core.rpc.RpcCommand
 
 /**
  * 聊天核心链的 UI 状态与转录条目模型（规格书 §5.1 / §6）。
@@ -139,4 +141,16 @@ internal fun resultToText(result: JsonElement?): String = when (result) {
     is JsonObject -> contentToText(result["content"]).ifEmpty { result.toString() }
     is JsonArray -> contentToText(result)
     else -> result.toString()
+}
+
+/**
+ * 命令 → 线名（`get_available_models` / `set_model` / …），§3.3/§3.4 回执分发的唯一键源。
+ *
+ * **不另抄一张 map**：取的是冻结区自己的序列化出口（`RpcCommand` 的 `@SerialName` 就是线上的
+ * `type`，`encodeCommand` 也走同一条）。命令改名时这里跟着漂，分发点立刻红，
+ * 而不是安静地「回执到了但没人认领」。
+ */
+internal fun wireNameOf(command: RpcCommand): String {
+    val obj = PiJsonOut.encodeToJsonElement(RpcCommand.serializer(), command) as? JsonObject
+    return obj?.get("type")?.jsonPrimitive?.contentOrNull ?: command::class.simpleName.orEmpty()
 }

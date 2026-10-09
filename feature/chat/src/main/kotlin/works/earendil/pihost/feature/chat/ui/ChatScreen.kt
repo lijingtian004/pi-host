@@ -26,6 +26,8 @@ import kotlinx.coroutines.delay
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.feature.chat.ChatUiState
 import works.earendil.pihost.feature.chat.ChatViewModel
+import works.earendil.pihost.feature.chat.ModelPickerState
+import works.earendil.pihost.feature.chat.ProviderModel
 import works.earendil.pihost.feature.chat.QueueState
 
 /**
@@ -49,6 +51,7 @@ fun ChatScreen(
     val turnState by viewModel.turnState.collectAsState()
     val transcript by viewModel.transcript.collectAsState()
     val queueState by viewModel.queueState.collectAsState()
+    val modelPicker by viewModel.modelPicker.collectAsState()
     val permission by viewModel.permissionRequest.collectAsState()
     val engineStatus by viewModel.engineStatus.collectAsState()
     val retryNote by viewModel.retryNote.collectAsState()
@@ -101,6 +104,12 @@ fun ChatScreen(
                         queueExpanded = queueExpanded,
                         onQueueToggle = { queueExpanded = !queueExpanded },
                         retryNote = retryNote,
+                        modelPicker = modelPicker,
+                        onModelOpen = viewModel::refreshModels,
+                        onModelPick = viewModel::setModel,
+                        onModelCycle = viewModel::cycleModel,
+                        onThinkingLevelPick = viewModel::setThinkingLevel,
+                        onThinkingLevelCycle = viewModel::cycleThinkingLevel,
                     )
                     if (queueExpanded && !queueState.isEmpty) {
                         QueueDetails(queueState = queueState)
@@ -132,9 +141,13 @@ fun ChatScreen(
 }
 
 /**
- * 顶栏（§6）：引擎状态短码 + 队列徽标。
+ * 顶栏（§6）：引擎状态短码 + 模型 chip + 队列徽标。
  *
  * 短码规则写死在这里，app 侧测试按同一函数断言（不重复字面量）。
+ *
+ * **§3.3 的模型 chip 放在徽标前面**：这一行从左到右是「会话在哪 → 会话用什么 → 会话排了什么」，
+ * 后两者都是可点开的入口，顺序按「改错代价」排——切错模型会让下一轮跑在错误的 provider 上，
+ * 而队列里的东西还没发出去。
  */
 @Composable
 private fun EngineTopBar(
@@ -144,6 +157,12 @@ private fun EngineTopBar(
     queueExpanded: Boolean,
     onQueueToggle: () -> Unit,
     retryNote: String?,
+    modelPicker: ModelPickerState,
+    onModelOpen: () -> Unit,
+    onModelPick: (ProviderModel) -> Unit,
+    onModelCycle: () -> Unit,
+    onThinkingLevelPick: (String) -> Unit,
+    onThinkingLevelCycle: () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -164,6 +183,14 @@ private fun EngineTopBar(
             retryNote?.let {
                 Text(text = it, style = MaterialTheme.typography.labelMedium, maxLines = 1)
             }
+            ModelChip(
+                state = modelPicker,
+                onOpen = onModelOpen,
+                onPickModel = onModelPick,
+                onCycleModel = onModelCycle,
+                onPickThinkingLevel = onThinkingLevelPick,
+                onCycleThinkingLevel = onThinkingLevelCycle,
+            )
             if (!queueState.isEmpty) {
                 // 徽标本身就是开关：§3.2 要的「点开看内容片段」不给它另找一处入口，
                 // 否则用户要在屏幕上找一个「看不见但存在」的展开按钮。

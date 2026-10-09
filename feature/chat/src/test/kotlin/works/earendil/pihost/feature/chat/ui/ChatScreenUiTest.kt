@@ -5,11 +5,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -34,6 +36,10 @@ import org.robolectric.annotation.Config
 import works.earendil.pihost.core.engine.InstallProgress
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.rpc.PiEvent
+import works.earendil.pihost.core.rpc.RpcCommand
+import works.earendil.pihost.feature.chat.CHIP_NO_MODELS
+import works.earendil.pihost.feature.chat.CHIP_PICK
+import works.earendil.pihost.feature.chat.CHIP_PICK_LOADING
 import works.earendil.pihost.feature.chat.ChatUiState
 import works.earendil.pihost.feature.chat.ChatViewModel
 import works.earendil.pihost.feature.chat.FakeChatEngine
@@ -44,6 +50,11 @@ import works.earendil.pihost.feature.chat.ToolCallRecord
 import works.earendil.pihost.feature.chat.ToolStatus
 import works.earendil.pihost.feature.chat.TranscriptItem
 import works.earendil.pihost.feature.chat.TurnState
+import works.earendil.pihost.feature.chat.probeEmptyModelsData
+import works.earendil.pihost.feature.chat.probeLevelsData
+import works.earendil.pihost.feature.chat.probeModelsData
+import works.earendil.pihost.feature.chat.probeStateData
+import works.earendil.pihost.feature.chat.wireName
 
 /**
  * Compose UI 用例（规格书 §7 交付物 D 的 UI 侧 ≥3 条，实交 5 条）。
@@ -392,11 +403,150 @@ class ChatScreenUiTest {
         composeRule.onNodeWithTag(ChatTags.NOTICE).assertDoesNotExist()
     }
 
+    // ── §3.3 模型 chip：三档文案 + 点开才拉列表 + 选择/轮换/刷新 ────────────────────
+
+    @Test
+    fun modelChipStaysSilentUntilTappedAndThenAsksPiThreeThings() {
+        showReadyScreen()
+        // 脚本必须**先挂再点**：FakeChatEngine 在 send 那一刻才把脚本回执攒进 outbox
+        // （见其 scriptedOutbox 的 KDoc），点完再挂 = 这条命令永远等不到回执，
+        // 对话框会一直停在「加载中」——一个看起来像「实现没做」的假失败。
+        engine
+            .scriptReply("get_available_models", data = probeModelsData())
+            .scriptReply("get_available_thinking_levels", data = probeLevelsData("off"))
+            .scriptReply("get_state", data = probeStateData("mock-1", "Mock Model 1", "off"))
+
+        // 初始态：chip 在，文案是「选择模型」，且一条模型命令都没发（§3.3 不主动拉）
+        composeRule.onNodeWithTag(ChatTags.MODEL_CHIP).assertTextEquals(CHIP_PICK)
+        assertEquals("没点 chip 就不许问 pi", 0, engine.sent.count { wireName(it.command) in MODEL_REFRESH_WIRES })
+
+        composeRule.onNodeWithTag(ChatTags.MODEL_CHIP).performClick()
+        composeRule.waitForIdle()
+
+        assertEquals(MODEL_REFRESH_WIRES, engine.sent.map { wireName(it.command) }.filter { it in MODEL_REFRESH_WIRES })
+
+        // 回执未到之前先说「加载中」：列表空有两种原因，chip 与对话框都得把话说清
+        composeRule.onNodeWithTag(ChatTags.MODEL_DIALOG).assertIsDisplayed()
+        composeRule.onNodeWithText(CHIP_PICK_LOADING).assertIsDisplayed()
+
+        engine.deliverScripted()
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithTag(ChatTags.modelItem(0)).assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.modelItem(1)).assertIsDisplayed()
+        composeRule.onNodeWithText("Mock Model 1").assertIsDisplayed()
+        composeRule.onNodeWithText("Mock Model 2").assertIsDisplayed()
+        // 高亮只有一条，且就是 get_state 认出来的那条（列表里本身没有 current 标记，探测 p01）
+        composeRule.onAllNodesWithText(MARK_CURRENT).assertCountEquals(1)
+        composeRule.onNodeWithTag(ChatTags.MODEL_CHIP).assertTextEquals("Mock Model 1 · 思考 off")
+        // 白名单只有一条 off → 只渲染一个档位，不给用户点出 reasoning 档的出口
+        composeRule.onNodeWithTag(ChatTags.thinkingItem(0)).assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.thinkingItem(1)).assertDoesNotExist()
+    }
+
+    @Test
+    fun pickingTheSecondRowSendsItsOwnProviderAndIdAndClosesTheDialog() {
+        showReadyScreen()
+        engine
+            .scriptReply("get_available_models", data = probeModelsData())
+            .scriptReply("get_available_thinking_levels", data = probeLevelsData("off"))
+            .scriptReply("get_state", data = probeStateData("mock-1", "Mock Model 1", "off"))
+        composeRule.onNodeWithTag(ChatTags.MODEL_CHIP).performClick()
+        engine.deliverScripted()
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithTag(ChatTags.modelItem(1)).performClick()
+        composeRule.waitForIdle()
+
+        assertEquals(
+            "点第二行 = 发这一行的 provider/id，不是列表第一条",
+            RpcCommand.SetModel("mock", "mock-2"),
+            engine.sent.last().command,
+        )
+        assertEquals(1, engine.sent.count { it.command == RpcCommand.SetModel("mock", "mock-2") })
+        composeRule.onNodeWithTag(ChatTags.MODEL_DIALOG).assertDoesNotExist()
+    }
+
+    @Test
+    fun thinkingRowsAndTheThreeFooterButtonsEachSendTheirOwnCommand() {
+        showReadyScreen()
+        engine
+            .scriptReply("get_available_models", data = probeModelsData())
+            .scriptReply(
+                "get_available_thinking_levels",
+                data = probeLevelsData("off", "minimal", "low", "medium", "high"),
+            )
+            .scriptReply("get_state", data = probeStateData("mock-2", "Mock Model 2", "off"))
+        composeRule.onNodeWithTag(ChatTags.MODEL_CHIP).performClick()
+        engine.deliverScripted()
+        composeRule.waitForIdle()
+
+        // 五个档位都来自白名单，第 4 项（high）点下去就是那条 set_thinking_level
+        composeRule.onNodeWithTag(ChatTags.thinkingItem(4)).performClick()
+        composeRule.waitForIdle()
+        assertEquals(RpcCommand.SetThinkingLevel("high"), engine.sent.last().command)
+
+        // 「换档」与「轮换模型」是两条不同的命令，且都不关框（档位还要连点）
+        composeRule.onNodeWithTag(ChatTags.THINKING_CYCLE).performClick()
+        composeRule.waitForIdle()
+        assertEquals(RpcCommand.CycleThinkingLevel, engine.sent.last().command)
+        composeRule.onNodeWithTag(ChatTags.MODEL_DIALOG).assertIsDisplayed()
+
+        // 轮换模型会关掉对话框：pi 自己挑下一条，用户要看结果而不是接着点
+        composeRule.onNodeWithTag(ChatTags.MODEL_CYCLE).performClick()
+        composeRule.waitForIdle()
+        assertEquals(RpcCommand.CycleModel, engine.sent.last().command)
+        composeRule.onNodeWithTag(ChatTags.MODEL_DIALOG).assertDoesNotExist()
+
+        // 「刷新」= 再问一次列表而不关框（关再开等于把同一串请求发两遍）
+        composeRule.onNodeWithTag(ChatTags.MODEL_CHIP).performClick()
+        composeRule.waitForIdle()
+        val before = engine.sent.count { it.command == RpcCommand.GetAvailableModels }
+        composeRule.onNodeWithTag(ChatTags.MODEL_REFRESH).performClick()
+        composeRule.waitForIdle()
+        assertEquals(before + 1, engine.sent.count { it.command == RpcCommand.GetAvailableModels })
+        composeRule.onNodeWithTag(ChatTags.MODEL_DIALOG).assertIsDisplayed()
+    }
+
+    @Test
+    fun anEmptyCatalogTurnsTheChipIntoALabelInsteadOfAnInvisibleButton() {
+        showReadyScreen()
+        engine.scriptReply("get_available_models", data = probeEmptyModelsData())
+        engine.scriptReply("get_available_thinking_levels", data = probeLevelsData())
+        composeRule.onNodeWithTag(ChatTags.MODEL_CHIP).performClick()
+        engine.deliverScripted()
+        composeRule.waitForIdle()
+
+        // 「拉过了但空」与「还没拉」必须分得开：前者点名去看认证，后者只是再等一拍
+        composeRule.onNodeWithTag(ChatTags.MODEL_CHIP).assertTextEquals(CHIP_NO_MODELS)
+        composeRule.onNodeWithTag(ChatTags.modelItem(0)).assertDoesNotExist()
+        // chip 与对话框讲同一句话（两处措辞一致），所以这里数的是「两处都有」
+        composeRule.onAllNodesWithText(CHIP_NO_MODELS).assertCountEquals(2)
+
+        composeRule.onNodeWithText("关闭").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.MODEL_DIALOG).assertDoesNotExist()
+    }
     private companion object {
         const val PLACEHOLDER_PENDING = "等待权限确认…"
 
         /** §3.2：流式档的占位文案——输入框可用了，提示语也必须换成「能做事」的口吻。 */
         const val PLACEHOLDER_STREAMING = "插一句，或排队追问"
+
+        /**
+         * §3.3 一次点开应当发出的三条命令（线名，顺序即 [works.earendil.pihost.feature.chat.ChatViewModel.refreshModels] 的发出顺序）。
+         *
+         * 断言按这张表**过滤**，不是比对整条 `sent` 流水：Ready 时回填还会发 `get_messages`，
+         * 把它一起比进去就等于把 §3.1 的用例绑到 §3.3 上——一边改一边红，看不出是谁坏了。
+         */
+        val MODEL_REFRESH_WIRES = listOf(
+            "get_available_models",
+            "get_available_thinking_levels",
+            "get_state",
+        )
+
+        /** 当前项的高亮标记（ModelChip 里非当前项用的是全角空格，不会撞车）。 */
+        const val MARK_CURRENT = "● "
 
         fun uiRequest(id: String, method: String): PiEvent.ExtensionUiRequest =
             PiEvent.ExtensionUiRequest(

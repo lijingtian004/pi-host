@@ -21,6 +21,15 @@ object ChatTags {
     /** §3.2：点徽标展开的队列明细（steering 在前、followUp 在后，逐条一个 tag）。 */
     const val QUEUE_DETAILS = "chat-queue-details"
     const val QUEUE_ITEM_PREFIX = "chat-queue-item"
+
+    /** §3.3：顶栏模型 chip 与它的选择器对话框（列表 + 轮换 + 思考档白名单）。 */
+    const val MODEL_CHIP = "chat-model-chip"
+    const val MODEL_DIALOG = "chat-model-dialog"
+    const val MODEL_ITEM_PREFIX = "chat-model-item"
+    const val MODEL_CYCLE = "chat-model-cycle"
+    const val MODEL_REFRESH = "chat-model-refresh"
+    const val THINKING_ITEM_PREFIX = "chat-thinking-item"
+    const val THINKING_CYCLE = "chat-thinking-cycle"
     const val TRANSCRIPT = "chat-transcript"
     const val INPUT = "chat-input"
     const val SEND = "chat-send"
@@ -53,6 +62,10 @@ object ChatTags {
     fun markdown(id: Int) = "$ASSISTANT_PREFIX-$id$MARKDOWN_SUFFIX"
     fun note(id: Int) = "$NOTE_PREFIX-$id"
     fun queueItem(index: Int) = "$QUEUE_ITEM_PREFIX-$index"
+
+    /** §3.3：选择器里逐条模型 / 逐条思考档（下标即列表顺序，测试按同一顺序定位）。 */
+    fun modelItem(index: Int) = "$MODEL_ITEM_PREFIX-$index"
+    fun thinkingItem(index: Int) = "$THINKING_ITEM_PREFIX-$index"
 
     fun tool(callId: String) = "$TOOL_PREFIX-$callId"
     fun toolOutput(callId: String) = "$TOOL_PREFIX-$callId$TOOL_OUTPUT_SUFFIX"

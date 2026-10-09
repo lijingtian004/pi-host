@@ -402,6 +402,172 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    // ── 运行时模型切换（P3B §3.3）─────────────────────────────────────────────────
+
+    private val _modelPicker = MutableStateFlow(ModelPickerState())
+
+    /**
+     * 顶栏模型 chip 与选择器对话框的唯一数据源（§3.3）。
+     *
+     * 写入点只有三类，全部是**pi 已经说出来的事实**：
+     * 1. 自己那条命令的回执（[onCommandResponse] → [applyTrackedResponse]）；
+     * 2. `thinking_level_changed` 事件（[onUnknownEvent]）；
+     * 3. 会话滚了 → 整面清空（[onSessionRolled]，上一条会话的模型不是这一条的）。
+     *
+     * 没有任何「用户按了就先高亮」的乐观更新：探测 p08 证明 `set_model` 会被 provider 拒
+     * （`Model not found: mock/no-such-model`），按 §13 偏差里同一条纪律——chip 说的必须是
+     * 「pi 此刻在用什么」，否则失败之后界面会长期挂着一个假模型名。
+     */
+    val modelPicker: StateFlow<ModelPickerState> = _modelPicker.asStateFlow()
+
+    /** 点 chip / 会话滚了之后的列表拉取（`get_available_models` + 思考档白名单 + 当前态）。 */
+    fun refreshModels() {
+        sendTracked(RpcCommand.GetAvailableModels)
+        refreshThinkingLevels()
+        refreshModelState()
+    }
+
+    /**
+     * 当前模型与思考档（`get_state`）。
+     *
+     * **为什么必须走 `get_state` 而不是 `set_model` 的回执**：探测显示 `set_model` 的 data 只有
+     * 新模型本身，**不带** `thinkingLevel`——换模型会重置思考档（p03→p05 实测 levels 从 `["off"]`
+     * 变成五档），只看回执就会留着一个上一条模型的档位。[probeState] 发的是同一条命令，
+     * 但它不登记 [trackedCommands]，所以它的回执只进探针面板、不改 chip。
+     */
+    fun refreshModelState() = sendTracked(RpcCommand.GetState)
+
+    /** 思考档白名单（`get_available_thinking_levels`）：选择器只列这几档，非法值不给入口。 */
+    fun refreshThinkingLevels() = sendTracked(RpcCommand.GetAvailableThinkingLevels)
+
+    /** 切到指定模型（`set_model`，两个线字段都来自 [ModelCatalog.parseAvailableModels] 的那一条）。 */
+    fun setModel(provider: String, modelId: String) = sendTracked(RpcCommand.SetModel(provider, modelId))
+
+    /** 选中的是哪条就发哪条：UI 只把 [ProviderModel] 递进来，参数拼装不在 UI 里。 */
+    fun setModel(model: ProviderModel) = setModel(model.provider, model.id)
+
+    /** 轮换下一个（`cycle_model`）——顺序由 pi 决定，App 不复制它的模型表来自己排。 */
+    fun cycleModel() = sendTracked(RpcCommand.CycleModel)
+
+    /** 设思考档（`set_thinking_level`）。服务端不校验（protocol.md §3.1），白名单是 UI 侧唯一的闸。 */
+    fun setThinkingLevel(level: String) = sendTracked(RpcCommand.SetThinkingLevel(level))
+
+    /** 轮换思考档（`cycle_thinking_level`，回执 `{level}`）。 */
+    fun cycleThinkingLevel() = sendTracked(RpcCommand.CycleThinkingLevel)
+
+    /**
+     * 「这条命令的回执要落进某个可视面」的登记表：requestId → 线名。
+     *
+     * 为什么不像 [backfillRequestId] 那样一个命令一个字段：§3.3/§3.4 一共八条命令有回执语义
+     * （models / set_model / cycle_model / thinking levels / cycle level / get_state / stats / compact），
+     * 八个字段既容易在新增时漏掉一处清理，也没法回答「这个 id 到底是不是我发的」——
+     * 而 [pendingCommandIds] 只说「是 VM 发的」，不说「发它的是为了落哪个面」。
+     * 一张表把这两件事一起记住，回执分发就是一个 `remove(id)` + 一次 `when`。
+     */
+    private val trackedCommands = mutableMapOf<String, String>()
+
+    /** §3.3/§3.4 的共用出站：登记线名，等 [applyTrackedResponse] 落地。 */
+    private fun sendTracked(command: RpcCommand) {
+        val id = sessionId
+        if (id == null) {
+            _notice.value = "${wireNameOf(command)} 失败：引擎尚未就绪"
+            return
+        }
+        val wire = wireNameOf(command)
+        viewModelScope.launch(Dispatchers.Unconfined) {
+            val requestId = nextCommandId()
+            pendingCommandIds.add(requestId)
+            trackedCommands[requestId] = wire
+            val sent = runCatching { engine.send(id, command, requestId) }
+            if (sent.isFailure) {
+                pendingCommandIds -= requestId
+                trackedCommands -= requestId
+                _commandResult.value = failureAsResponse(wire, sent.exceptionOrNull()?.message)
+            }
+        }
+    }
+
+    /**
+     * 回执 → 可视面（§3.3 五格状态的唯一写入口之一）。
+     *
+     * `success=false` 一律**不改状态**：chip 保留上一条真实值，错误由 [commandResult] 面板与
+     * [notice] 承担。探测里这条有实例——p08 的 `Model not found` 之后，pi 的当前模型没变，
+     * 跟着回执清空 chip 就是把「失败的点击」记成「模型没了」。
+     */
+    private fun applyTrackedResponse(wire: String, event: PiEvent.Response) {
+        val data = event.data
+        // 分支键一律从 RpcCommand 现取，不在本地抄一张字符串表：命令改线名时这里跟着漂，
+        // 用例立刻红，而不是「回执到了但没人认领」那种查半天的静默失聪。
+        // （带参命令取名字要喂一对占位实参——@SerialName 挂在类上，与字段值无关。）
+        val getModels = wireNameOf(RpcCommand.GetAvailableModels)
+        val getLevels = wireNameOf(RpcCommand.GetAvailableThinkingLevels)
+        val getState = wireNameOf(RpcCommand.GetState)
+        val setModel = wireNameOf(RpcCommand.SetModel("", ""))
+        val cycleModel = wireNameOf(RpcCommand.CycleModel)
+        val setThinkingLevel = wireNameOf(RpcCommand.SetThinkingLevel(""))
+        val cycleThinkingLevel = wireNameOf(RpcCommand.CycleThinkingLevel)
+        if (!event.success) {
+            // 失败**只报错、不改状态**：chip 留上一条真实值（探测 p08 之后 pi 的当前模型没变）
+            if (wire == setModel || wire == cycleModel) {
+                _notice.value = "模型切换失败：${event.error ?: "pi 回了 success=false"}"
+            }
+            return
+        }
+        when (wire) {
+            getModels -> {
+                val models = ModelCatalog.parseAvailableModels(data)
+                if (models == null) {
+                    _notice.value = "模型列表形状不对，未能刷新"
+                } else {
+                    _modelPicker.update { it.copy(models = models, fetched = true) }
+                }
+            }
+
+            // set_model 的 data **就是那条 model 对象本身**（探测 p03），没有外层键
+            setModel -> ModelCatalog.parseModel(data)?.let { model ->
+                _modelPicker.update { it.copy(current = model) }
+                // 换模型会重置思考档（探测 p03→p05），档位与白名单都得重问一次
+                refreshThinkingLevels()
+                refreshModelState()
+            }
+
+            // cycle_model 的 data 是 {model, thinkingLevel, isScoped}（探测 p07）
+            cycleModel -> {
+                val model = ModelCatalog.parseModelField(data)
+                val level = ModelCatalog.parseThinkingLevelField(data)
+                if (model != null) {
+                    _modelPicker.update { it.copy(current = model, thinkingLevel = level ?: it.thinkingLevel) }
+                    refreshThinkingLevels()
+                }
+            }
+
+            getLevels ->
+                ModelCatalog.parseThinkingLevels(data)?.let { levels ->
+                    _modelPicker.update { it.copy(thinkingLevels = levels) }
+                }
+
+            cycleThinkingLevel ->
+                ModelCatalog.parseLevel(data)?.let { level ->
+                    _modelPicker.update { it.copy(thinkingLevel = level) }
+                }
+
+            // 只有 [refreshModelState] 发的那条 get_state 会走到这里（[probeState] 不登记，
+            // 它的回执继续只进探针面板，两条消费者互不打扰）
+            getState -> {
+                val model = ModelCatalog.parseModelField(data)
+                val level = ModelCatalog.parseThinkingLevelField(data)
+                _modelPicker.update {
+                    it.copy(current = model ?: it.current, thinkingLevel = level ?: it.thinkingLevel)
+                }
+            }
+
+            // set_thinking_level 的回执探测显示**没有 data**（p05：success=true、无 data），
+            // 新档位由 thinking_level_changed 事件说；非法值（p09）连事件都不发，
+            // 所以这里什么都不做才是照实——chip 维持 pi 真正生效的那一档。
+            setThinkingLevel -> Unit
+        }
+    }
+
     /** 中止当前轮（Idle 时按钮本就禁用，这里再兜一层）。 */
     fun abort() {
         val id = sessionId ?: return
@@ -541,6 +707,12 @@ class ChatViewModel @Inject constructor(
         _queueState.value = QueueState.EMPTY
         _commandResult.value = null
         _retryNote.value = null
+        // §3.3：上一条会话的模型快照对这一条毫无意义（pi 换的是 SessionManager，模型跟着
+        // session 文件走），所以整面回到「什么都没听过」——chip 重新变成「选择模型」，
+        // 等用户点它时再拉一次。这里**不发任何命令**：切换已经够忙了，而且 §3.3 的
+        // 「未配置认证时不主动拉」这条约束在会话切换上同样成立。
+        trackedCommands.clear()
+        _modelPicker.value = ModelPickerState()
         showLoadingNote()
         backfillTranscript()
     }
@@ -831,7 +1003,10 @@ class ChatViewModel @Inject constructor(
 
             is PiEvent.SessionInfoChanged -> _retryNote.value = event.name?.let { "会话名：$it" }
 
-            is PiEvent.AgentStart, is PiEvent.EntryAppended, is PiEvent.Unknown -> Unit
+            is PiEvent.AgentStart, is PiEvent.EntryAppended -> Unit
+
+            // §3.3：冻结区没建模的类型（thinking_level_changed 等）在 feature/chat 这一层认
+            is PiEvent.Unknown -> onUnknownEvent(event)
         }
     }
 
@@ -972,6 +1147,8 @@ class ChatViewModel @Inject constructor(
                 "${(event.data?.get("disposition") as? JsonPrimitive)?.contentOrNull ?: "无"} " +
                 "success=${event.success}")
         }
+        // §3.3/§3.4：登记过的回执先落自己的可视面，再照旧进 commandResult
+        trackedCommands.remove(id)?.let { wire -> applyTrackedResponse(wire, event) }
         // §3.1：回填那条走专属通道（历史落进 transcript），但它仍然是 VM 自己发的命令，
         // 所以 commandResult 也照记——探针面板看到的形状对所有命令保持一致。
         if (id == backfillRequestId) {
@@ -979,6 +1156,25 @@ class ChatViewModel @Inject constructor(
             applyBackfill(event)
         }
         _commandResult.value = event
+    }
+
+    /**
+     * 冻结区没建模的事件类型（[PiEvent.Unknown]）里，本页只认一条（§3.3 探测决策）。
+     *
+     * **为什么必须走 Unknown 这条路**：探测实录（REPORT-P3B §2）显示 pi 1.0.4 的运行时事件流里
+     * 有 `thinking_level_changed{level}`，但 `docs/protocol.md` §4 的事件表**没有**它，
+     * 而 §2 红线 2 禁止为了新增事件去改 `core/rpc`。[RpcWire.parsePiEvent] 对「不在已知集合里的
+     * type」的官方出路就是 `Unknown(raw)` 保留原文（`PiEvent.kt` KDoc 明写「pi 前向演进的新事件
+     * 只能走这条兜底路径」），所以本页在 feature/chat 里读 `raw` 是**用现成的口子，不是绕过冻结**。
+     *
+     * 其余未知类型一律忽略（`Unit`）：猜不出语义的事件上屏比不上屏更糟。
+     */
+    private fun onUnknownEvent(event: PiEvent.Unknown) {
+        val type = (event.raw["type"] as? JsonPrimitive)?.contentOrNull
+        if (type != EVENT_THINKING_LEVEL_CHANGED) return
+        ModelCatalog.parseLevel(event.raw)?.let { level ->
+            _modelPicker.update { it.copy(thinkingLevel = level) }
+        }
     }
 
     // ── transcript 写入 helper（全部「整表替换」）───────────────────────────────
@@ -1128,6 +1324,15 @@ class ChatViewModel @Inject constructor(
 
         /** §3.2：steer/follow_up 回执的唯一可见面（无 UI 动作，但必须可查）。 */
         const val QUEUE_LOG_TAG = "PiHost/Queue"
+
+        /**
+         * §3.3 探测实录里唯一被本页认领的「冻结区未建模事件」（REPORT-P3B §2 决策）。
+         *
+         * 线名是 `thinking_level_changed`（**不是** protocol.md §5.3 里那条 session entry 的
+         * `thinking_level_change`）——一个字母的差别就是两个东西：前者是运行时事件，
+         * 后者是 session 文件的条目类型。按实跑的形状写，不按文档的邻近词猜。
+         */
+        const val EVENT_THINKING_LEVEL_CHANGED = "thinking_level_changed"
     }
 }
 

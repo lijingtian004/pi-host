@@ -1596,6 +1596,263 @@ class ChatViewModelTest {
         assertEquals("失败不许把队列写出内容", QueueState.EMPTY, rig.vm.queueState.value)
     }
 
+    // ── §3.3 运行时模型切换（case49 起，形状逐条照 REPORT-P3B §2 探测实录）─────────
+
+    /**
+     * 点 chip → 三条命令一起发（列表 + 思考档白名单 + 当前态）。
+     *
+     * 钉「三条」而不是「一条」：探测 p03 证明 `set_model` 的回执**不带** thinkingLevel，
+     * 而换模型会重置档位（p02→p04：`["off"]` 变五档）。只发 `get_available_models`
+     * 的选择器会在切完模型后摆着一列非法档位。
+     */
+    @Test
+    fun `case49 refreshModels asks for the catalog the whitelist and the current state`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        rig.vm.refreshModels()
+        runCurrent()
+
+        val wire = rig.engine.sent.map { wireName(it.command) }
+        assertEquals(
+            listOf("get_available_models", "get_available_thinking_levels", "get_state"),
+            wire.takeLast(3),
+        )
+        assertEquals("首点之前一条都没发过（§3.3：不主动拉列表）", 3, wire.size)
+        assertEquals("列表拉取不碰转录", emptyList<TranscriptItem>(), rig.vm.transcript.value)
+    }
+
+    @Test
+    fun `case50 the probed catalog lands as two selectable models and the chip says so`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine
+            .scriptReply("get_available_models", data = modelsEnvelope())
+            .scriptReply("get_state", data = stateEnvelope("mock-1", "Mock Model 1", thinkingLevel = "off"))
+        rig.vm.refreshModels()
+        pumpScripted(rig)
+
+        val state = rig.vm.modelPicker.value
+        assertEquals(listOf("mock/mock-1", "mock/mock-2"), state.models.map { it.wireKey })
+        assertTrue("拉到过就要置位，chip 才不会把「没拉」说成「没有」", state.fetched)
+        assertEquals(
+            "当前模型只能来自 get_state 的 model 键（列表里没有 current 标记）",
+            "mock/mock-1",
+            state.current?.wireKey,
+        )
+        assertEquals("Mock Model 1 · 思考 off", state.chipText())
+    }
+
+    @Test
+    fun `case51 a shape-drift catalog keeps the chip honest and reports why`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.scriptReply("get_available_models", data = buildJsonObject { put("model", "拼错了") })
+        rig.vm.refreshModels()
+        pumpScripted(rig)
+
+        val state = rig.vm.modelPicker.value
+        assertTrue("形状不对不能假装「拉到了空列表」", state.models.isEmpty())
+        assertEquals("列表形状不对不该把 fetched 置位", CHIP_PICK, state.chipText())
+        assertTrue("但必须说一句为什么：${rig.vm.notice.value}", rig.vm.notice.value?.contains("形状不对") == true)
+    }
+
+    @Test
+    fun `case52 setModel sends both wire fields and adopts the bare model payload`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine
+            .scriptReply("set_model", data = modelObject("mock-2", "Mock Model 2", reasoning = true, contextWindow = 200_000))
+            .scriptReply("get_available_thinking_levels", data = levelsEnvelope("off", "minimal", "low", "medium", "high"))
+            .scriptReply("get_state", data = stateEnvelope("mock-2", "Mock Model 2", thinkingLevel = "off"))
+
+        rig.vm.setModel("mock", "mock-2")
+        pumpScripted(rig)
+
+        assertEquals(
+            "provider 与 modelId 都是线字段，少一个 pi 就回 Model not found",
+            RpcCommand.SetModel("mock", "mock-2"),
+            rig.engine.sent.first { it.command is RpcCommand.SetModel }.command,
+        )
+        val state = rig.vm.modelPicker.value
+        assertEquals("mock/mock-2", state.current?.wireKey)
+        assertEquals(
+            "换模型后必须重问白名单与当前态（探测 p03→p05）",
+            listOf("off", "minimal", "low", "medium", "high"),
+            state.thinkingLevels,
+        )
+        assertEquals("off", state.thinkingLevel)
+    }
+
+    @Test
+    fun `case53 a rejected set_model leaves the chip on the model pi is still using`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.scriptReply("get_state", data = stateEnvelope("mock-1", "Mock Model 1", thinkingLevel = "off"))
+        rig.vm.refreshModels()
+        pumpScripted(rig)
+        val before = rig.vm.modelPicker.value
+
+        rig.engine.scriptReply("set_model", success = false, error = "Model not found: mock/no-such-model")
+        rig.vm.setModel("mock", "no-such-model")
+        pumpScripted(rig)
+
+        assertEquals("失败不许改高亮（探测 p08）", before.current, rig.vm.modelPicker.value.current)
+        assertTrue("但要说清是哪一步失败：${rig.vm.notice.value}", rig.vm.notice.value?.contains("模型切换失败") == true)
+        assertEquals(
+            "失败之后不再追发刷新命令",
+            1,
+            rig.engine.sent.count { it.command == RpcCommand.GetAvailableThinkingLevels },
+        )
+    }
+
+    @Test
+    fun `case54 cycleModel adopts the wrapped model and its thinking level in one shot`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine
+            .scriptReply("cycle_model", data = cycleEnvelope("mock-2", "Mock Model 2", thinkingLevel = "medium"))
+            .scriptReply("get_available_thinking_levels", data = levelsEnvelope("off", "minimal", "low", "medium", "high"))
+
+        rig.vm.cycleModel()
+        pumpScripted(rig)
+
+        val state = rig.vm.modelPicker.value
+        assertEquals(RpcCommand.CycleModel, rig.engine.sent.first { it.command is RpcCommand.CycleModel }.command)
+        assertEquals("mock/mock-2", state.current?.wireKey)
+        assertEquals(
+            "cycle_model 的回执自带 thinkingLevel（探测 p07），不必再发 get_state",
+            "medium",
+            state.thinkingLevel,
+        )
+        assertEquals("但白名单跟着模型走，仍要重问一次", 1, rig.engine.sent.count { it.command == RpcCommand.GetAvailableThinkingLevels })
+    }
+
+    @Test
+    fun `case55 thinking level commands carry the whitelist value and a bare response changes nothing`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.scriptReply("get_available_thinking_levels", data = levelsEnvelope("off", "high"))
+        rig.vm.refreshThinkingLevels()
+        pumpScripted(rig)
+        assertEquals(listOf("off", "high"), rig.vm.modelPicker.value.thinkingLevels)
+
+        // 探测 p09：对 reasoning:false 的模型设 "high" 也回 success，且**没有 data、没有事件**
+        rig.engine.scriptReply("set_thinking_level")
+        rig.vm.setThinkingLevel("high")
+        pumpScripted(rig)
+        assertNull("无回执载荷又没有事件时，chip 不许编一个档位出来", rig.vm.modelPicker.value.thinkingLevel)
+        assertEquals(RpcCommand.SetThinkingLevel("high"), rig.engine.sent.last().command)
+
+        // 探测 p06：cycle_thinking_level 回 {level}
+        rig.engine.scriptReply("cycle_thinking_level", data = buildJsonObject { put("level", "high") })
+        rig.vm.cycleThinkingLevel()
+        pumpScripted(rig)
+        assertEquals("high", rig.vm.modelPicker.value.thinkingLevel)
+    }
+
+    /**
+     * §3.3 的 `model_change` 决策落点：模型切换**没有**运行时事件（探测里 set_model/cycle_model
+     * 成功之后事件流一条都没有），所以 chip 只靠回执；而思考档**有**事件
+     * （`thinking_level_changed`），它不在 protocol.md §4 的事件表里 → 冻结区给的是
+     * [PiEvent.Unknown]，本页在 feature/chat 里认领（[ChatViewModel.onUnknownEvent]）。
+     */
+    @Test
+    fun `case56 the thinking level event arrives through the unknown channel`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        rig.engine.emit(
+            PiEvent.Unknown(
+                buildJsonObject {
+                    put("type", "thinking_level_changed")
+                    put("level", "medium")
+                },
+            ),
+        )
+        runCurrent()
+        assertEquals("medium", rig.vm.modelPicker.value.thinkingLevel)
+
+        rig.engine.emit(
+            PiEvent.Unknown(
+                buildJsonObject {
+                    put("type", "some_future_event")
+                    put("level", "不要认")
+                },
+            ),
+        )
+        runCurrent()
+        assertEquals("未知类型一律忽略：猜不出语义的事件上屏比不上屏更糟", "medium", rig.vm.modelPicker.value.thinkingLevel)
+    }
+
+    @Test
+    fun `case57 the probe panel get_state does not hijack the model chip`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.scriptReply("get_state", data = stateEnvelope("mock-2", "Mock Model 2", thinkingLevel = "high"))
+
+        rig.vm.probeState()
+        pumpScripted(rig)
+
+        assertEquals("探针那条 get_state 只进 commandResult", ModelPickerState(), rig.vm.modelPicker.value)
+        assertEquals("get_state", rig.vm.commandResult.value?.command)
+        assertTrue(rig.vm.commandResult.value!!.success)
+    }
+
+    @Test
+    fun `case58 a session roll drops the previous session model snapshot`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine
+            .scriptReply("get_available_models", data = modelsEnvelope())
+            .scriptReply("get_available_thinking_levels", data = levelsEnvelope("off"))
+            .scriptReply("get_state", data = stateEnvelope("mock-1", "Mock Model 1", thinkingLevel = "off"))
+        rig.vm.refreshModels()
+        pumpScripted(rig)
+        assertEquals("Mock Model 1 · 思考 off", rig.vm.modelPicker.value.chipText())
+
+        rig.engine.scriptReply("switch_session")
+        rig.engine.scriptReply("get_messages", data = buildJsonObject { put("messages", JsonArray(emptyList())) })
+        rig.vm.switchSession("/files/home/.pi/agent/sessions/--p--/other.jsonl")
+        pumpScripted(rig)
+
+        assertEquals("上一条会话的模型不是这一条的", ModelPickerState(), rig.vm.modelPicker.value)
+        assertEquals(
+            "清场不额外发命令（chip 等用户点）",
+            1,
+            rig.engine.sent.count { it.command is RpcCommand.SwitchSession },
+        )
+    }
+
+    @Test
+    fun `case59 an untracked response never touches the picker`() = runTest {
+        val rig = rig()
+        ready(rig)
+        // 别的消费者（sessions 屏 / 扩展）发的命令，id 不在 VM 的账上
+        rig.engine.emit(
+            PiEvent.Response(
+                id = "someone-else-1",
+                command = "get_available_models",
+                success = true,
+                data = modelsEnvelope(),
+            ),
+        )
+        runCurrent()
+        assertEquals("只认自己发出去的 id（§5.1 同一条纪律）", ModelPickerState(), rig.vm.modelPicker.value)
+    }
+
+    @Test
+    fun `case60 model commands before Ready say the engine is not up and send nothing`() = runTest {
+        val rig = rig()
+        rig.vm.refreshModels()
+        rig.vm.setModel("mock", "mock-1")
+        rig.vm.cycleModel()
+        rig.vm.setThinkingLevel("high")
+        runCurrent()
+        assertEquals(0, rig.engine.sent.size)
+        assertTrue("提示要说清原因：${rig.vm.notice.value}", rig.vm.notice.value?.contains("引擎尚未就绪") == true)
+    }
+
     private companion object {
         fun update(event: AssistantMessageEvent): PiEvent =
             PiEvent.MessageUpdate(assistantMessageEvent = event)
@@ -1647,5 +1904,29 @@ class ChatViewModelTest {
                 },
             )
         }
+        /**
+         * 探测形状的回执：本体一律转发到 [ProbeFixtures.kt]。
+         *
+         * 这里保留一层同名转发而不是让用例直接叫 `probeModelsData()`，是为了让 case49–case60
+         * 读起来仍然像「这条用例自己的夹具」，同时**只有一份**线协议形状表——UI 侧
+         * （ChatScreenUiTest §3.3）吃的是同一份，改一处两边一起红，不会出现「VM 绿、UI 绿、
+         * 而真表早就漂了」那种最贵的假绿。
+         */
+        fun modelsEnvelope(): JsonObject = probeModelsData()
+
+        /** 一条 model 对象：`models[]` 的元素、`set_model` 的整个 data、`cycle_model.model`、`get_state.model` 同形。 */
+        fun modelObject(id: String, name: String, reasoning: Boolean, contextWindow: Int = 128_000): JsonObject =
+            probeModelObject(id, name, reasoning, contextWindow)
+
+        /** 探测 p02/p04 的 `get_available_thinking_levels` data。 */
+        fun levelsEnvelope(vararg levels: String): JsonObject = probeLevelsData(*levels)
+
+        /** 探测 p11 的 `get_state` data（`model` + `thinkingLevel`，其余键照探测留着）。 */
+        fun stateEnvelope(id: String, name: String, thinkingLevel: String): JsonObject =
+            probeStateData(id, name, thinkingLevel)
+
+        /** 探测 p07 的 `cycle_model` data（外层 `model` + `thinkingLevel` + `isScoped`）。 */
+        fun cycleEnvelope(id: String, name: String, thinkingLevel: String): JsonObject =
+            probeCycleData(id, name, thinkingLevel)
     }
 }

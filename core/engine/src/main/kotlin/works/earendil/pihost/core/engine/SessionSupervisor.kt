@@ -78,13 +78,22 @@ sealed interface SessionState {
  * P2C 标 `open` 的唯一理由是这个工程不引 Mockito、`PiEngineService`/MainActivity 的测试
  * 只能靠继承塞 stub 监督者（规格书 §6.1 的原话）。现在测试改绑 [ChatEngine] 的假体
  * （`FakeChatEngine`），`open` 就成了纯粹的暴露面，按 P2C 报告预告清掉。
+ *
+ * **工作目录在 [start] 里采样一次、之后不变**（P3C §3.3）。这不是风格问题：
+ * pi 的 `--session-id` 查找是按 cwd 分域的（`main.ts:435-448` 的 `findLocalSessionByExactId(id, cwd, …)`），
+ * **未命中时它只打一句 stderr 警告就 `SessionManager.create(cwd, …, {id})` 新建一个同 id 的空会话**。
+ * 所以若 [workingDirFor] 在每次 spawn 时重取，「用户切了项目 → 旧会话崩溃重启」会把
+ * 项目 A 的 session UUID 拿到项目 B 的目录下去找，找不到就凭空造一个空会话——
+ * 历史从 UI 上消失，而且没有任何错误可看。P2F 那套 mkdirs 也因此固定在同一目录。
+ *
+ * 副作用是明确的：**切活动项目不影响在跑的会话**，只对下一次 [start] 生效。
  */
 class SessionSupervisor(
     private val scope: CoroutineScope,
     private val starter: ProcessStarter,
     private val commandFor: (sessionId: String) -> List<String>,
     private val envFor: () -> Map<String, String>,
-    private val workingDir: String?,
+    private val workingDirFor: () -> String?,
     private val backoffMs: List<Long> = DEFAULT_BACKOFF_MS,
     private val handshakeTimeoutMs: Long = DEFAULT_HANDSHAKE_TIMEOUT_MS,
     private val gracefulCloseTimeoutMs: Long = PiSession.DEFAULT_GRACEFUL_TIMEOUT_MS,
@@ -109,7 +118,9 @@ class SessionSupervisor(
      */
     override suspend fun start(): String {
         val sessionId = UUID.randomUUID().toString()
-        val entry = Entry(sessionId)
+        // P3C §3.3：这一行是本类唯一一次调用 [workingDirFor]。之后四次 spawn 全部沿用 entry 里的值，
+        // 于是「同 id 会话永远落在同一个 cwd」——见类头那条 `main.ts:435-448` 的理由。
+        val entry = Entry(sessionId, workingDirFor())
         entries[sessionId] = entry
         setState(sessionId, SessionState.Spawning)
         val watcher = scope.launch { watchSession(entry) }
@@ -220,8 +231,8 @@ class SessionSupervisor(
                 // 见 RECON-P2F §2.1）。spawn 前 mkdirs 把这条歧义从根上消掉。
                 // runCatching = **失败不抛**：权限问题让后续 exec 的真实 errno 说话；
                 // mkdirs 幂等，所以重启循环（每次 setState(Spawning) 之后）天然重复覆盖，无需额外状态。
-                workingDir?.let { w -> runCatching { java.io.File(w).mkdirs() } }
-                val process = starter.start(commandFor(id), envFor(), workingDir)
+                entry.workingDir?.let { w -> runCatching { java.io.File(w).mkdirs() } }
+                val process = starter.start(commandFor(id), envFor(), entry.workingDir)
                 val s = PiSession(process, scope)
                 session = s
                 entry.session = s
@@ -378,8 +389,14 @@ class SessionSupervisor(
         _sessionStates.update { current -> current + (sessionId to state) }
     }
 
-    /** 一条会话的运行期材料。 */
-    private class Entry(val sessionId: String) {
+    /**
+     * 一条会话的运行期材料。
+     *
+     * [workingDir] 是 `val`：它在 [start] 里随 entry 一起出生，之后不再变。
+     * 这条不可变性同时免掉了跨线程可见性问题——它由调用 [start] 的协程写、由监视协程读，
+     * 若做成 `var` 就得挂 `@Volatile`（下面 [session]/[watcher] 那两个正是这种形态）。
+     */
+    private class Entry(val sessionId: String, val workingDir: String?) {
         /** 转发 [PiSession.events] 的稳定总线：进程重启后订阅者无需重订阅。 */
         val bus = MutableSharedFlow<PiEvent>(
             extraBufferCapacity = BUS_BUFFER,

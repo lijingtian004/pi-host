@@ -9,6 +9,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
+import works.earendil.pihost.core.engine.git.GitIdentity
+import works.earendil.pihost.core.environment.PathLayout
 
 /**
  * 运行时安装面的可注入形态（规格书 §4.4）。
@@ -59,8 +61,12 @@ class RuntimeInstallImpl @Inject constructor(
             return false
         }
         return when (result) {
-            is InstallResult.UpToDate -> true
-            is InstallResult.Installed -> true
+            // P3C §3.4：两条成功支都要补一次 git 身份。
+            // UpToDate 尤其关键——你这台设备早就装好了 runtime，升级后走的就是这条支，
+            // 若只在 Installed 分支播种，`.gitconfig` 永远不会出现，pi 的 commit 继续死在
+            // "unable to auto-detect email address"。ensureConfigured 幂等且只 exists() 一次。
+            is InstallResult.UpToDate -> seedGitIdentity().let { true }
+            is InstallResult.Installed -> seedGitIdentity().let { true }
             is InstallResult.Failed -> {
                 // AssetInstaller 自己已把同一个 message 写进它的 progress；这里再写一次是幂等的
                 // （StateFlow conflate），只为保证「镜像一定见过 Failed」。
@@ -69,4 +75,11 @@ class RuntimeInstallImpl @Inject constructor(
             }
         }
     }
+
+    /**
+     * 只当事实记录，不改本方法的返回值：git 身份写不成 = pi 暂时不能 commit，
+     * 不等于「运行时没装好」，更不该让首启 UI 卡在 Failed 上——
+     * 真正的失败原因由 [GitIdentity] 放进返回值，`新建项目` 那条路会把它显示出来。
+     */
+    private fun seedGitIdentity(): GitIdentity.Outcome = GitIdentity.ensureConfigured(PathLayout.homeDir(ctx))
 }

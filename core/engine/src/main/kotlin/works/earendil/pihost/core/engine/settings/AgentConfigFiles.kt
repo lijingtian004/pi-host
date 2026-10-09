@@ -20,7 +20,8 @@ import kotlinx.serialization.json.buildJsonObject
  * ## 三条纪律（逐字继承 P2G §4.1）
  * 1. **读-改-写**：[readObject] 交回的是 `JsonObject` 本身（`Map<String, JsonElement>`），不做类型化 decode，
  *    所以别人的条目与未知字段天然留住；
- * 2. **原子替换**：[writeAtomic] 同目录 tmp + `renameTo`，任何异常路径都清 tmp；
+ * 2. **原子替换**：[writeTextAtomic] 是同一条 tmp+`renameTo` 纪律的唯一实现，
+ *    [writeAtomic] 只是它的 JSON 薄封装；任何异常路径都清 tmp；
  * 3. **失败要响**：[ensureDirectory] 建不成目录就抛 [IOException]，宁可一个字节都不写。
  *
  * 本类**不含任何字段名语义**（`providers` / `apiKey` / `defaultProvider` 都留在各自 store 的 companion 里），
@@ -88,11 +89,28 @@ object AgentConfigFiles {
      *
      * tmp 名由 [target] 自己的文件名派生（[tmpPrefix]），调用方不需要再传一遍——
      * 少一个参数就等于少一处「前缀与目标文件不匹配」的可能。
+     *
+     * P3C §3.4 起本方法是 [writeTextAtomic] 的一层薄封装：JSON 表与非 JSON 文件走**同一条**
+     * tmp→rename→清残骸 纪律。原来这段 body 直接写在下面，抽出来时逐字未改
+     * （`:104-105`/`:489`/`:562-565` 那三条「无 tmp 残留」断言仍归 [writeAtomic] 管）。
      */
-    fun writeAtomic(dir: File, target: File, content: JsonObject) {
+    fun writeAtomic(dir: File, target: File, content: JsonObject) =
+        writeTextAtomic(dir, target, content.toString())
+
+    /**
+     * 纯文本的原子替换（P3C §3.4 为 `$HOME/.gitconfig` 加）。
+     *
+     * 为什么不再开一个 helper：本类的立身之本就是「原子写纪律只许有一份实现」（见类头）。
+     * `.gitconfig` 不是 JSON，但不是**另一种原子性**——tmp 名、rename 覆盖语义、失败路径清残骸
+     * 全部与 json 三张表一致，所以它是同一条纪律的第二个载荷类型。
+     *
+     * tmp 前缀同样按 [target] 的文件名派生：`.gitconfig.tmp<nanoTime>`，
+     * 于是 `homeDir` 的单测可以断言「本文件的写入没留残骸」而不把邻居的算进来。
+     */
+    fun writeTextAtomic(dir: File, target: File, content: String) {
         val tmp = File(dir, tmpPrefix(target.name) + System.nanoTime())
         try {
-            tmp.outputStream().use { out -> out.write(content.toString().toByteArray(Charsets.UTF_8)) }
+            tmp.outputStream().use { out -> out.write(content.toByteArray(Charsets.UTF_8)) }
             if (!tmp.renameTo(target)) {
                 if (target.exists() && !target.delete()) throw IOException("无法替换 ${target.path}：旧文件删不掉")
                 if (!tmp.renameTo(target)) throw IOException("无法原子替换 ${target.path}")

@@ -23,11 +23,13 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
+import works.earendil.pihost.core.engine.projects.ProjectNames
 import works.earendil.pihost.core.environment.MemTier
 
 /**
  * `SettingsRepository` 的持久化与宽松解析（规格书 §4.5「SettingsRepositoryTest（Robolectric + TempDir
- * DataStore）：默认值、写读回、memTier 枚举映射 ≥3 条」，实交 6 条）。
+ * DataStore）：默认值、写读回、memTier 枚举映射 ≥3 条」，P2E 实交 6 条，P3C §3.2 起 11 条：
+ * r07–r10 覆盖第四键 `active_project` 的写读回、缺键回落、脏盘回落、setter 不落脏值）。
  *
  * **测试配方直接抄 `DataStoreProbeTest`（RECON-P2E §3 实测结论）**，三条硬约束逐条落到 helper 里：
  * 1. `PreferenceDataStoreFactory.create` **必须显式给 scope**，且这条 scope 与仓库的收集 scope
@@ -218,15 +220,75 @@ class SettingsRepositoryTest {
         assertEquals(expected, SettingsRepository.settingsFile(RuntimeEnvironment.getApplication()))
         assertFalse("settingsFile 只拼路径，不许顺手建目录", expected.parentFile!!.exists())
         assertEquals(
-            "键名是磁盘格式的一部分，改动要带数据迁移：钉住 §3.4 原文的三个键",
-            setOf("mem_tier", "max_parallel_sessions", "default_model"),
+            "键名是磁盘格式的一部分，改动要带数据迁移：§3.4 原文三键 + P3C §3.2 的 active_project",
+            setOf("mem_tier", "max_parallel_sessions", "default_model", "active_project"),
             setOf(
                 SettingsRepository.KEY_MEM_TIER.name,
                 SettingsRepository.KEY_MAX_PARALLEL_SESSIONS.name,
                 SettingsRepository.KEY_DEFAULT_MODEL.name,
+                SettingsRepository.KEY_ACTIVE_PROJECT.name,
             ),
         )
         // 键的**类型**由 r02 的落盘读回证明：那里用 String/Int 两种类型分别取到了值，
         // 取错类型会拿到 null 而不是抛，所以那条用例已经把「mem_tier 是字符串键」钉死。
+    }
+
+    // ── r07 active_project：写读回 + 同步取值口（P3C §3.2 的第四键）────────────────
+
+    @Test
+    fun `r07 the active project lands in the snapshot and on disk`() = runBlocking {
+        val file = File(tmp.root, "project.preferences_pb")
+        withRepository(file) { _, repository ->
+            repository.setActiveProject("my-proj")
+
+            assertEquals("my-proj", repository.settings.value.activeProject)
+            assertEquals("同步取值口与快照是同一个值（spawn 的 workingDirFor 靠它，不能挂起）",
+                "my-proj", repository.activeProject)
+        }
+
+        assertEquals("my-proj", prefsOf(file)[SettingsRepository.KEY_ACTIVE_PROJECT])
+    }
+
+    /** r01 的第四键半边：键不存在时不能是 null —— 它的下游是 `File(projectsDir, name)`。 */
+    @Test
+    fun `r08 a missing active project key falls back to the default project name`() {
+        assertEquals("default", preferencesOf().toAppSettings().activeProject)
+        assertEquals(
+            "空白值同样回落，不给下游留空目录名",
+            ProjectNames.DEFAULT_NAME,
+            preferencesOf(SettingsRepository.KEY_ACTIVE_PROJECT to "   ").toAppSettings().activeProject,
+        )
+    }
+
+    /**
+     * 磁盘是外部输入：`active_project` 里可能是手改的、也可能是旧版本写的穿越值。
+     * 读口的回落就是 P3C 的第三道门 —— 这条断言的是「穿越值进不了 spawn lambda」。
+     */
+    @Test
+    fun `r09 a traversal value already on disk is read back as the default project`() {
+        listOf("../../x", "/abs", "a/b", ".hidden", "I".repeat(49), null).forEach { dirty ->
+            val read = if (dirty == null) {
+                preferencesOf().toAppSettings().activeProject
+            } else {
+                preferencesOf(SettingsRepository.KEY_ACTIVE_PROJECT to dirty).toAppSettings().activeProject
+            }
+            assertEquals("脏值「$dirty」读回来必须是 default", ProjectNames.DEFAULT_NAME, read)
+        }
+    }
+
+    /** setter 侧那道门与读口那道门是两道：写进去的就必须是洗过的形状（否则读口永远在兜底）。 */
+    @Test
+    fun `r10 the setter never persists a dirty project name`() = runBlocking {
+        val file = File(tmp.root, "project-write.preferences_pb")
+        withRepository(file) { _, repository ->
+            repository.setActiveProject(" foo ")
+            assertEquals("trim 后的形状才进快照", "foo", repository.settings.value.activeProject)
+
+            repository.setActiveProject("../../escape")
+            assertEquals("非法输入当场回落，不写穿越值", ProjectNames.DEFAULT_NAME, repository.activeProject)
+        }
+
+        val persisted = prefsOf(file)
+        assertEquals("落盘的也是洗过的", ProjectNames.DEFAULT_NAME, persisted[SettingsRepository.KEY_ACTIVE_PROJECT])
     }
 }

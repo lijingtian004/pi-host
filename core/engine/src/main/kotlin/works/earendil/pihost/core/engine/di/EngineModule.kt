@@ -24,9 +24,16 @@ import works.earendil.pihost.core.engine.audit.AuditPaths
 import works.earendil.pihost.core.engine.audit.AuditScope
 import works.earendil.pihost.core.engine.audit.AuditSink
 import works.earendil.pihost.core.engine.audit.FileAuditSink
+import works.earendil.pihost.core.engine.git.GitInitializer
+import works.earendil.pihost.core.engine.git.GitProbe
+import works.earendil.pihost.core.engine.git.GitSpawn
+import works.earendil.pihost.core.engine.git.ProcessGitInitializer
+import works.earendil.pihost.core.engine.git.ProcessGitProbe
+import works.earendil.pihost.core.engine.projects.ProjectStore
 import works.earendil.pihost.core.engine.settings.DataStoreSettingsRepository
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore
+import works.earendil.pihost.core.engine.projects.ProjectNames
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.EnvFactory
 import works.earendil.pihost.core.environment.PathLayout
@@ -44,8 +51,9 @@ import javax.inject.Singleton
  * - env = `EnvFactory.build(ctx, settings.memTier)`（P2E §3.4 起改动态取；P2C/P2D 写死
  *   `MemTier.MID`，与 `MemTier.DEFAULT` 同值 192MB，**默认行为一字未变**，
  *   只是磁盘上真写了 LOW/HIGH 时下次 spawn 跟着变，§13 偏差 4）；
- * - 工作目录 = [PathLayout.projectDir]`("default")`（P3 才有项目切换）。**P2F 修正**：`PathLayout` 只构造路径
- *   不建目录，全仓此前无一处 mkdir `projects/`（RECON-P2F §2.1）→ 该目录在真机上不存在，
+ * - 工作目录 = [PathLayout.projectDir]`(ctx, settings.activeProject)`（P3C §3.3 起可切换；P2F–P3B 期间
+ *   恒为 `"default"`）。**P2F 修正**：`PathLayout` 只构造路径不建目录，全仓此前无一处 mkdir `projects/`
+ *   （RECON-P2F §2.1）→ 该目录在真机上不存在，
  *   而子进程 chdir 先于 execve，于是 spawn 直接 `error=2`；现由 [SessionSupervisor] spawn 前 mkdirs 兜底；
  * - starter = [ExecFallbackStarter]([JvmProcessFactory], [SpawnDiagnosticsSink])（P2F §4.1(b)(c)：
  *   诊断上屏 + 落盘，`error=13` 时走 linker64 装载降级）。
@@ -137,8 +145,14 @@ object EngineModule {
     fun relayEndpointStore(@ApplicationContext ctx: Context): RelayEndpointStore =
         RelayEndpointStore(PathLayout.homeDir(ctx))
 
-    /** 唯一项目目录名（P2C 的 `EngineRuntime.DEFAULT_PROJECT` 随静态桥一起迁到这里）。 */
-    const val DEFAULT_PROJECT: String = "default"
+    /**
+     * 唯一项目目录名（P2C 的 `EngineRuntime.DEFAULT_PROJECT` 随静态桥一起迁到这里）。
+     *
+     * P3C §3.1 起它不再是「定义」而是「转发」：真相在 [ProjectNames.DEFAULT_NAME]，
+     * 校验、回落、DataStore 缺省值全部读那一处，这里只保住既有引用点的编译与 `ManifestPermissionTest`
+     * 之类的旧断言不破。留两个字符串字面量意味着「default 到底归谁」有两个答案。
+     */
+    const val DEFAULT_PROJECT: String = ProjectNames.DEFAULT_NAME
 
     /**
      * 审计写入侧的 scope（P3A §3.1）：`SupervisorJob + Dispatchers.IO`，与进程同寿。
@@ -213,7 +227,11 @@ object EngineModule {
         // 内存快照 —— 快照由 DataStore 收集器维护，setter 落盘后立刻乐观改写，
         // 所以这里既不挂起也不碰磁盘（RECON-P2E §3 / §7.6：repository 必须在 core 侧）。
         envFor = { EnvFactory.build(ctx, settings.memTier) },
-        workingDir = PathLayout.projectDir(ctx, DEFAULT_PROJECT).absolutePath,
+        // P3C §3.3：项目切换与 memTier 走的是同一条「热更新只影响后续 spawn」语义，但这里
+        // 必须比 envFor 更保守 —— Supervisor 只在 start() 里取一次（见 SessionSupervisor 类头），
+        // 所以「切活动项目」不会打断在跑的会话，也只可能改变新会话的落点目录。
+        // activeProject 已经是 SettingsRepository 洗过的形状（r09/r10），可以直拼 File。
+        workingDirFor = { PathLayout.projectDir(ctx, settings.activeProject).absolutePath },
     )
 
     /** §4.4：聊天核心链/服务拿到的引擎面（同一个 [SessionSupervisor] 实例）。 */
@@ -225,4 +243,55 @@ object EngineModule {
     @Provides
     @Singleton
     fun runtimeInstall(impl: RuntimeInstallImpl): RuntimeInstall = impl
+
+    // ── P3C §3.5/§3.6：git 三面（探针 / init / 项目账本）──────────────────────────
+    //
+    // **新增这四条 binding 之后，`:app` 与 `:core:engine` 的 Hilt 测试图必须同步补假体**：
+    // 两边都用 `@UninstallModules(EngineModule::class)` 整块换装配，少一条 provider
+    // 就是 KSP 阶段的 MissingBinding（P2G §8 第 4 条同一课，也记在 `AppTestDoubles` 类头）。
+    // `ProjectsSource` 的绑定**不在这里**——它的实现属于 `:feature:sessions`，
+    // 绑进 core 会造成 `core:engine → feature` 的反向依赖（§2 红线，RECON-P2E §7.6）。
+
+    /**
+     * git 的 argv 工厂。与 [piSpawn] 取同一个 `nativeLibraryDir`：
+     * 两条通路都走 jniLibs 通道，谁都不许退回 `filesDir`（方案 §2.1）。
+     */
+    @Provides
+    @Singleton
+    fun gitSpawn(@ApplicationContext ctx: Context): GitSpawn =
+        GitSpawn(ctx.applicationInfo.nativeLibraryDir.orEmpty())
+
+    /** git 写面（红线 12 只许 `init` 一条）。env 与 node 侧同源，故同样动态取 memTier。 */
+    @Provides
+    @Singleton
+    fun gitInitializer(
+        starter: ProcessStarter,
+        spawn: GitSpawn,
+        settings: SettingsRepository,
+        @ApplicationContext ctx: Context,
+    ): GitInitializer = ProcessGitInitializer(starter, { EnvFactory.build(ctx, settings.memTier) }, spawn)
+
+    /** git 读面（红线 12 只许 `status --porcelain=v1 --branch` 一条）。 */
+    @Provides
+    @Singleton
+    fun processGitProbe(
+        starter: ProcessStarter,
+        spawn: GitSpawn,
+        settings: SettingsRepository,
+        @ApplicationContext ctx: Context,
+    ): ProcessGitProbe = ProcessGitProbe(starter, { EnvFactory.build(ctx, settings.memTier) }, spawn)
+
+    /** 接口 → 实现转发边：注入点要 [GitProbe]，不是 [ProcessGitProbe]（照 [auditSink] 的先例）。 */
+    @Provides
+    @Singleton
+    fun gitProbe(impl: ProcessGitProbe): GitProbe = impl
+
+    /**
+     * 项目账本。两个目录都经 [PathLayout] 取，与其它 store 共用同一条路径出口；
+     * `homeDir` 是 `.gitconfig` 的落点，`projectsDir` 是项目目录的根。
+     */
+    @Provides
+    @Singleton
+    fun projectStore(@ApplicationContext ctx: Context, git: GitInitializer): ProjectStore =
+        ProjectStore(PathLayout.projectsDir(ctx), PathLayout.homeDir(ctx), git)
 }

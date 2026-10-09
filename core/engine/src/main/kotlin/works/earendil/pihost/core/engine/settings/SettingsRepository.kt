@@ -20,27 +20,32 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
+import works.earendil.pihost.core.engine.projects.ProjectNames
 import works.earendil.pihost.core.environment.MemTier
 
 /**
- * 设置项的内存快照（规格书 §3.4 的三键）。
+ * 设置项的内存快照（规格书 §3.4 的三键 + P3C §3.2 的第四键）。
  *
- * 三个字段都有**默认值**：DataStore 的语义是「键缺失 → 读不到」，而 UI 与 `envFor`
+ * 每个字段都有**默认值**：DataStore 的语义是「键缺失 → 读不到」，而 UI 与 `envFor`
  * 需要一个永不为 null 的快照（RECON-P2E §3 结论 3：磁盘上还没有 preferences 文件时
  * 首读直接给空 `Preferences`，所以默认值属于仓库、不属于磁盘）。
  *
  * @param memTier             node 堆内存三档，默认 [MemTier.DEFAULT]（MID=192MB）
  * @param maxParallelSessions 并行会话上限，默认 2，合法区间 [SettingsRepository.PARALLEL_RANGE]
  * @param defaultModel        默认模型显示串；null/空 = 用 pi 内置默认（P2E 不做模型切换，与 §13 偏差 7 同源）
+ * @param activeProject       活动项目名，默认 [ProjectNames.DEFAULT_NAME]。P3C §3.1 起它是**外部输入**
+ *                            （磁盘上的值可能是旧版本写的、或被手改过），所以读口一律过
+ *                            [ProjectNames.sanitizeOrFallback]，快照里的值保证已经是合法形状
  */
 data class AppSettings(
     val memTier: MemTier = MemTier.DEFAULT,
     val maxParallelSessions: Int = SettingsRepository.DEFAULT_MAX_PARALLEL,
     val defaultModel: String? = null,
+    val activeProject: String = ProjectNames.DEFAULT_NAME,
 )
 
 /**
- * 设置持久化（规格书 §4.2）：DataStore Preferences 三键 + StateFlow 暴露 + suspend 写。
+ * 设置持久化（规格书 §4.2）：DataStore Preferences 四键 + StateFlow 暴露 + suspend 写。
  *
  * **为什么在 `:core:engine` 而不是 feature**：`EngineModule` 的 `envFor` lambda 是
  * `() -> Map<String,String>`（SessionSupervisor 每次 spawn 同步调用），它要读 memTier；
@@ -73,6 +78,15 @@ interface SettingsRepository {
     val maxParallelSessions: Int
         get() = settings.value.maxParallelSessions
 
+    /**
+     * 同步读活动项目名 —— 专给 `EngineModule` 的 `workingDirFor` lambda（P3C §3.3）。
+     *
+     * 与 [memTier] 同一条理由：spawn 侧的 lambda 是 `() -> …`，不是 suspend，不能等磁盘。
+     * 返回的已经是 [ProjectNames.sanitizeOrFallback] 洗过的形状，调用方可直接拼 `File`。
+     */
+    val activeProject: String
+        get() = settings.value.activeProject
+
     /** 写 memTier（下次 spawn 生效）。 */
     suspend fun setMemTier(tier: MemTier)
 
@@ -82,6 +96,16 @@ interface SettingsRepository {
     /** 写默认模型显示串；传 null 或空白 = 删除该键（回落 pi 内置默认）。 */
     suspend fun setDefaultModel(model: String?)
 
+    /**
+     * 写活动项目名（P3C §3.2）。
+     *
+     * 这里**不做拒绝**：拒绝是 `ProjectStore.create` 的职责（非法名根本不该先建出目录）。
+     * 本方法的职责是「不让非法值落盘」——非法输入（含 null/空白/穿越）回落
+     * [ProjectNames.DEFAULT_NAME] 写入。宁可切回 default，也不要把 `../../x` 留在磁盘上，
+     * 因为下一个读它的是 spawn lambda，而它会直接进 `File(...)`。
+     */
+    suspend fun setActiveProject(name: String?)
+
     companion object {
         const val TAG: String = "PiHostSettings"
 
@@ -89,6 +113,9 @@ interface SettingsRepository {
         val KEY_MEM_TIER: Preferences.Key<String> = stringPreferencesKey("mem_tier")
         val KEY_MAX_PARALLEL_SESSIONS: Preferences.Key<Int> = intPreferencesKey("max_parallel_sessions")
         val KEY_DEFAULT_MODEL: Preferences.Key<String> = stringPreferencesKey("default_model")
+
+        /** P3C §3.2 第四键：活动项目名。 */
+        val KEY_ACTIVE_PROJECT: Preferences.Key<String> = stringPreferencesKey("active_project")
 
         const val DEFAULT_MAX_PARALLEL: Int = 2
 
@@ -111,7 +138,7 @@ interface SettingsRepository {
  *
  * **快照与磁盘的关系**：磁盘是唯一事实源，[snapshot] 是它的镜像 + 乐观写。
  * - 镜像：构造时用传入的 [scope] 立刻开始收集 `data.data`，进程内任何一次落盘变更都会回流；
- * - 乐观写：三个 setter 在 `edit` **成功返回后**再改内存快照，于是 `envFor`/VM 门在写完的
+ * - 乐观写：setter 在 `edit` **成功返回后**再改内存快照，于是 `envFor`/VM 门在写完的
  *   下一刻就读到新值，不必等 DataStore 的收集器被真线程调度
  *   （那一步正是 RECON-P2E §3 结论 1 测出来的不确定性来源）。
  * 两者最终一致：收集器随后会把同样的值再写进快照一次，`StateFlow` 去重 → 不多一次重组。
@@ -167,6 +194,12 @@ class DataStoreSettingsRepository(
         snapshot.update { it.copy(defaultModel = value) }
     }
 
+    override suspend fun setActiveProject(name: String?) {
+        val value = ProjectNames.sanitizeOrFallback(name)
+        data.edit { prefs -> prefs[SettingsRepository.KEY_ACTIVE_PROJECT] = value }
+        snapshot.update { it.copy(activeProject = value) }
+    }
+
     companion object {
 
         /**
@@ -192,13 +225,15 @@ class DataStoreSettingsRepository(
 }
 
 /**
- * 磁盘 [Preferences] → 内存快照：三键全部**宽松解析**（磁盘内容按不可信输入对待）。
- * 脏值（`mem_tier="BOGUS"`、`max_parallel_sessions=99`）不抛，回落默认或夹紧。
+ * 磁盘 [Preferences] → 内存快照：四键全部**宽松解析**（磁盘内容按不可信输入对待）。
+ * 脏值（`mem_tier="BOGUS"`、`max_parallel_sessions=99`、`active_project="../../x"`）不抛，
+ * 回落默认或夹紧。
  */
 internal fun Preferences.toAppSettings(): AppSettings = AppSettings(
     memTier = memTierOf(this[SettingsRepository.KEY_MEM_TIER]),
     maxParallelSessions = maxParallelOf(this[SettingsRepository.KEY_MAX_PARALLEL_SESSIONS]),
     defaultModel = this[SettingsRepository.KEY_DEFAULT_MODEL]?.trim()?.ifBlank { null },
+    activeProject = ProjectNames.sanitizeOrFallback(this[SettingsRepository.KEY_ACTIVE_PROJECT]),
 )
 
 /** 枚举映射：大小写/空白宽容（`"mid"`、`" MID "`、`"MID"` 都算 MID）；认不出 → 默认档 MID。 */

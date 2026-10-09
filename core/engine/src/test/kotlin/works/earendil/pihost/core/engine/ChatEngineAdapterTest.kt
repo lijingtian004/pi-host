@@ -67,7 +67,7 @@ class ChatEngineAdapterTest {
             starter = starter,
             commandFor = { listOf(NODE, CLI, "--mode", "rpc", "--session-id", it) },
             envFor = { ENV },
-            workingDir = WORKING_DIR,
+            workingDirFor = { WORKING_DIR },
         )
         // 这一行本身就是「SessionSupervisor : ChatEngine」的编译期证据
         return Harness(supervisor, supervisor as ChatEngine, starter)

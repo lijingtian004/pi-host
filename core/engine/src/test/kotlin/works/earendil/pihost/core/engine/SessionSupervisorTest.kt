@@ -19,6 +19,7 @@ import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * SessionSupervisor 状态机（规格书 §5.4 的 10 条用例 + 第 11 条纯虚拟超时路径）。
@@ -70,7 +71,9 @@ class SessionSupervisorTest {
             starter = starter,
             commandFor = spawn::command,
             envFor = { ENV },
-            workingDir = workingDir,
+            // P3C §3.3：这个 helper 的 workingDir 参数是「静态值」，包成 lambda 之后
+            // 语义与旧的一字面量构造完全一致（case15 才用会变的 supplier 测出生钉死）。
+            workingDirFor = { workingDir },
         )
         return supervisor to starter
     }
@@ -568,6 +571,140 @@ class SessionSupervisorTest {
         assertTrue(workingDir.isDirectory)
         pump("第二次握手完成") { started.isCompleted }
         assertEquals(SessionState.Ready, supervisor.stateOf(sessionId))
+    }
+
+    // ── P3C §3.3：工作目录出生钉死（supplier 只在 start() 取一次）──────────────────
+
+    /**
+     * 与 [supervisorIn] 同一条装配，唯一区别是 cwd 来自一个**会变的** supplier。
+     *
+     * 单独开一个 helper 而不是给 [supervisorIn] 加参数：那 14 条既有用例断的是
+     * 「mkdirs 时机」与「状态机」，让它们都改走 lambda 形态就再也测不出「静态值」这一档
+     * （静态 supplier 与出生钉死在断言上不可区分，等于把新语义摊进旧用例里稀释掉）。
+     */
+    private fun supervisorWithSupplier(
+        scope: CoroutineScope,
+        modes: List<PiMode>,
+        supplier: () -> String?,
+    ): Pair<SessionSupervisor, FakeStarter> {
+        val starter = FakeStarter(modes)
+        starters.add(starter)
+        val spawn = PiSpawn(LIB_DIR, RUNTIME_DIR)
+        val supervisor = SessionSupervisor(
+            scope = scope,
+            starter = starter,
+            commandFor = spawn::command,
+            envFor = { ENV },
+            workingDirFor = supplier,
+        )
+        return supervisor to starter
+    }
+
+    /**
+     * 这条用例存在的唯一理由：pi 的 `--session-id` 查找按 cwd 分域，
+     * **未命中不报错，而是新建一个同 id 的空会话**（`main.ts:435-448`）。
+     * 所以 supplier 若在每次 spawn 重取，「切了项目 + 旧会话崩溃重启」会把旧 UUID
+     * 拿到新目录里找 → 找不到 → 造一个空会话 → 用户的历史从 UI 消失且没有任何错误可看。
+     *
+     * 断法：supplier 第一次返回 A、之后每次返回 B；四次 spawn 全部必须是 A，
+     * 且 supplier 的调用次数恰好为 1（多一次就是语义破了）。
+     */
+    @Test
+    fun `case15 the cwd supplier is sampled exactly once at start and reused by every respawn`() = runTest {
+        val dirA = tmp.newFolder("pin-a")
+        val dirB = tmp.newFolder("pin-b")
+        val calls = AtomicInteger(0)
+        val (supervisor, starter) = supervisorWithSupplier(
+            backgroundScope,
+            listOf(PiMode.SilentDie, PiMode.SilentDie, PiMode.SilentDie, PiMode.HandshakeThenHang),
+        ) {
+            if (calls.getAndIncrement() == 0) dirA.absolutePath else dirB.absolutePath
+        }
+
+        val started = launchStart(supervisor)
+        pump("第一次 spawn") { starter.invocationCount() == 1 }
+        val sessionId = sessionIdArg(starter.commands[0])!!
+
+        repeat(3) { round ->
+            pump("第 ${round + 1} 次退避已挂上") {
+                supervisor.stateOf(sessionId) is SessionState.Restarting
+            }
+            skipBackoff(supervisor.stateOf(sessionId) as SessionState.Restarting)
+            pump("第 ${round + 2} 次 spawn") { starter.invocationCount() == round + 2 }
+        }
+        pump("最后一次握手完成") { started.isCompleted }
+
+        assertEquals(
+            "supplier 只能被调一次：出生时那一次。之后任何一次重取都可能把旧 UUID 落到新目录",
+            1, calls.get(),
+        )
+        assertEquals(
+            "四次 spawn 的 cwd 必须全是出生那个",
+            listOf(dirA.absolutePath, dirA.absolutePath, dirA.absolutePath, dirA.absolutePath),
+            starter.workingDirs.toList(),
+        )
+        assertNotEquals("反证：若实现走的是活 supplier，第 2 次起会拿到 B —— 这条断言就是那台警报器",
+            dirB.absolutePath, starter.workingDirs[1])
+    }
+
+    /** 切活动项目只影响**之后新开的**会话；已经在跑的会话不动其落点（与 memTier 同一档语义）。 */
+    @Test
+    fun `case16 two sessions started around a project switch each keep their own cwd`() = runTest {
+        val dirA = tmp.newFolder("own-a")
+        val dirB = tmp.newFolder("own-b")
+        var current: String = dirA.absolutePath
+        val (supervisor, starter) = supervisorWithSupplier(
+            backgroundScope,
+            listOf(PiMode.HandshakeThenHang),
+            supplier = { current },
+        )
+
+        val first = launchStart(supervisor)
+        pump("第一个会话 start 返回") { first.isCompleted }
+        current = dirB.absolutePath
+        val second = CompletableDeferred<String>()
+        backgroundScope.launch { second.complete(supervisor.start()) }
+        pump("第二个会话 spawn") { starter.invocationCount() == 2 }
+        pump("第二个会话 start 返回") { second.isCompleted }
+
+        assertEquals(listOf(dirA.absolutePath, dirB.absolutePath), starter.workingDirs.toList())
+        assertEquals(SessionState.Ready, supervisor.stateOf(first.await()))
+        assertEquals(SessionState.Ready, supervisor.stateOf(second.await()))
+    }
+
+    /**
+     * 比 case15 更接近事故现场的一条：切项目发生在「崩溃」与「重启」之间。
+     *
+     * 除了 spawn 不能落到 B，还有一条同样重要：**不能把 B 建出来**。
+     * `spawn 前 mkdirs` 是 P2F 定的，它建的是 entry 出生时那个目录；若这里跟着 supplier 走，
+     * 宿主就会在用户没同意的情况下凭空多出一个项目目录（P3C §2 红线的落点纪律）。
+     */
+    @Test
+    fun `case17 a respawn after a project switch neither spawns into nor creates the new project dir`() = runTest {
+        val dirA = tmp.newFolder("stale-a")
+        val dirB = File(tmp.root, "stale-b")
+        assertFalse("前置条件：B 此刻还不存在（它只可能被供应商路径误建出来）", dirB.exists())
+
+        var current: String = dirA.absolutePath
+        val (supervisor, starter) = supervisorWithSupplier(
+            backgroundScope,
+            listOf(PiMode.SilentDie, PiMode.HandshakeThenHang),
+            supplier = { current },
+        )
+        val started = launchStart(supervisor)
+        pump("第一次 spawn") { starter.invocationCount() == 1 }
+        val sessionId = sessionIdArg(starter.commands[0])!!
+
+        // 事故顺序：会话崩了 → 用户在这段退避里切了项目 → 重启
+        pump("判失败 → Restarting") { supervisor.stateOf(sessionId) is SessionState.Restarting }
+        current = "$dirB/never"
+        skipBackoff(supervisor.stateOf(sessionId) as SessionState.Restarting)
+        pump("第二次 spawn") { starter.invocationCount() == 2 }
+        pump("握手完成") { started.isCompleted }
+
+        assertEquals("重启必须回到出生目录", dirA.absolutePath, starter.workingDirs[1])
+        assertTrue("出生目录照常 mkdirs（P2F 那条纪律不受影响）", starter.workingDirExistedAtStart[1])
+        assertFalse("切项目不得在旧会话的重启路径上顺手建出新项目目录", dirB.exists())
     }
 
     private companion object {

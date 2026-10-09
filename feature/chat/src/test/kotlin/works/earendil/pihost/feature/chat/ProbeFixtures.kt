@@ -96,3 +96,83 @@ internal fun probeThinkingLevelChanged(level: String): JsonObject = buildJsonObj
     put("type", "thinking_level_changed")
     put("level", level)
 }
+
+// ── §3.4 会话统计：逐键照 rpc33.jsonl 的 p13/p19、message_update 与 compaction_* ──────
+
+/**
+ * `get_session_stats` 的 data（探测 p13 原文，`sessionFile`/`sessionId` 留着：
+ * [SessionStatsParser] 必须能无视它俩，只数出来的那几个键才是统计条要的东西）。
+ */
+internal fun probeStatsData(
+    totalTokens: Int = 240,
+    contextTokens: Int = 120,
+    contextWindow: Int = 128_000,
+    percent: Double? = 0.09375,
+): JsonObject = buildJsonObject {
+    put("sessionFile", "/root/.pi/agent/sessions/2026-10-09T05-03-15-088Z_01a11f0b.jsonl")
+    put("sessionId", "01a11f0b-468f-712a-90d4-aa4fa5772d31")
+    put("userMessages", 1)
+    put("assistantMessages", 2)
+    put("toolCalls", 1)
+    put("toolResults", 1)
+    put("totalMessages", 5)
+    put("tokens", buildJsonObject {
+        put("input", 200)
+        put("output", 40)
+        put("cacheRead", 0)
+        put("cacheWrite", 0)
+        put("total", totalTokens)
+    })
+    put("cost", 0)
+    put("contextUsage", buildJsonObject {
+        put("tokens", contextTokens)
+        put("contextWindow", contextWindow)
+        percent?.let { put("percent", it) }
+    })
+}
+
+/** `message_update.usage` / `message_end.message.usage`（探测：`cost` 是**对象**，`reasoning` 可缺）。 */
+internal fun probeUsageData(
+    input: Int = 100,
+    output: Int = 20,
+    totalTokens: Int = 120,
+    costTotal: Double = 0.0,
+    withReasoning: Boolean = true,
+): JsonObject = buildJsonObject {
+    put("input", input)
+    put("output", output)
+    put("cacheRead", 0)
+    put("cacheWrite", 0)
+    if (withReasoning) put("reasoning", 0)
+    put("totalTokens", totalTokens)
+    put("cost", buildJsonObject {
+        put("input", 0)
+        put("output", 0)
+        put("cacheRead", 0)
+        put("cacheWrite", 0)
+        put("total", costTotal)
+    })
+}
+
+/** `get_state` 里统计条要吃的两个键（探测 p11：`autoCompactionEnabled` / `isCompacting`）。 */
+internal fun probeStateFlags(autoCompaction: Boolean? = null, compacting: Boolean? = null): JsonObject =
+    buildJsonObject {
+        autoCompaction?.let { put("autoCompactionEnabled", JsonPrimitive(it)) }
+        compacting?.let { put("isCompacting", JsonPrimitive(it)) }
+    }
+
+/** `compaction_start`（协议未列，走 PiEvent.Unknown）：`{"type":…,"reason":"manual"}`。 */
+internal fun probeCompactionStart(reason: String = "manual"): JsonObject =
+    buildJsonObject {
+        put("type", "compaction_start")
+        put("reason", reason)
+    }
+
+/** `compaction_end`：`{reason,aborted,willRetry,errorMessage?}`（探测 p15 那句失败原文）。 */
+internal fun probeCompactionEnd(errorMessage: String? = null): JsonObject = buildJsonObject {
+    put("type", "compaction_end")
+    put("reason", "manual")
+    put("aborted", false)
+    put("willRetry", false)
+    errorMessage?.let { put("errorMessage", it) }
+}

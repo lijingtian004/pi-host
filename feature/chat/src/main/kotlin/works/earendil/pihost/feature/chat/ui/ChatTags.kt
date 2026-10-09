@@ -30,6 +30,16 @@ object ChatTags {
     const val MODEL_REFRESH = "chat-model-refresh"
     const val THINKING_ITEM_PREFIX = "chat-thinking-item"
     const val THINKING_CYCLE = "chat-thinking-cycle"
+
+    /** §3.4：一行式统计条 + 展开明细 + 压缩入口 + 自动压缩开关。 */
+    const val STATS_BAR = "chat-stats-bar"
+    const val STATS_REFRESH = "chat-stats-refresh"
+    const val STATS_DETAILS = "chat-stats-details"
+    const val COMPACT_BUTTON = "chat-compact-button"
+    const val COMPACT_DIALOG = "chat-compact-dialog"
+    const val COMPACT_CONFIRM = "chat-compact-confirm"
+    const val COMPACT_CANCEL = "chat-compact-cancel"
+    const val AUTO_COMPACT_SWITCH = "chat-auto-compact-switch"
     const val TRANSCRIPT = "chat-transcript"
     const val INPUT = "chat-input"
     const val SEND = "chat-send"

@@ -1853,6 +1853,285 @@ class ChatViewModelTest {
         assertTrue("提示要说清原因：${rig.vm.notice.value}", rig.vm.notice.value?.contains("引擎尚未就绪") == true)
     }
 
+    // ── §3.4 会话统计条（P3B）───────────────────────────────────────────────────────
+
+    /**
+     * `refreshStats()` → 一条 `get_session_stats`，回执落进统计面。
+     *
+     * 「统计未加载」这句必须在第一次成功回执之前就在：§3.4 的验收看的是「有没有那一行」，
+     * 而一行 0 tok / 0% 会让用户以为会话真的没花钱。
+     */
+    @Test
+    fun `case61 refreshStats asks once and lands the probed payload`() = runTest {
+        val rig = rig()
+        ready(rig)
+        assertEquals("统计未加载", rig.vm.stats.value.barText())
+        assertNull(rig.vm.stats.value.stats)
+
+        rig.engine.scriptReply("get_session_stats", data = probeStatsData())
+        rig.vm.refreshStats()
+        pumpScripted(rig)
+
+        assertEquals("get_session_stats", wireName(rig.engine.sent.last().command))
+        assertEquals(
+            "240 tok｜${money(0.0)}｜120/128000 (0.09%)",
+            rig.vm.stats.value.barText(),
+        )
+        assertEquals(5, rig.vm.stats.value.stats?.totalMessages)
+    }
+
+    @Test
+    fun `case62 a malformed stats reply keeps the previous numbers and says why`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.scriptReply("get_session_stats", data = probeStatsData())
+        rig.vm.refreshStats()
+        pumpScripted(rig)
+        val first = rig.vm.stats.value.stats
+        assertNotNull(first)
+
+        rig.engine.scriptReply("get_session_stats", data = buildJsonObject { put("tokens", "不是对象") })
+        rig.vm.refreshStats()
+        pumpScripted(rig)
+
+        assertEquals("形状不对就留着上一版：统计条宁可旧，不可假", first, rig.vm.stats.value.stats)
+        assertTrue("但要有一句为什么：${rig.vm.notice.value}", rig.vm.notice.value?.contains("形状不对") == true)
+    }
+
+    /**
+     * 自动刷新的触发点：规格书写「TurnEnd **或** AgentSettled」，这里取 AgentSettled。
+     *
+     * 探测实录里一次运行有 2 条 `turn_end` 而只有 1 条 `agent_settled`——挂在 TurnEnd 上
+     * 等于每轮多问一次同一个数；pi 说「settled」的时候这一轮的 token 才算真花完。
+     */
+    @Test
+    fun `case63 agent_settled refreshes stats exactly once while turn_end does not`() = runTest {
+        val rig = rig()
+        ready(rig)
+        val statsWire = "get_session_stats"
+
+        rig.engine.emit(PiEvent.TurnEnd(message = PiMessage(role = "assistant", content = textBlocks("一轮完了"))))
+        runCurrent()
+        rig.engine.emit(PiEvent.TurnEnd(message = PiMessage(role = "assistant", content = textBlocks("又一轮"))))
+        runCurrent()
+        assertEquals("TurnEnd 不问统计", 0, rig.engine.sent.count { wireName(it.command) == statsWire })
+
+        rig.engine.emit(PiEvent.AgentSettled)
+        runCurrent()
+        assertEquals(1, rig.engine.sent.count { wireName(it.command) == statsWire })
+    }
+
+    /**
+     * `message_update.usage` 是**累计快照**，不是增量。
+     *
+     * 探测：一条回答吐了 21 次 message_update，21 次的 usage 一模一样（`{100,20,…,120}`）。
+     * 逐条相加会显示 2520 tok——这条用例就是钉住那个错误的。
+     */
+    @Test
+    fun `case64 streaming usage replaces the live number instead of summing snapshots`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        repeat(3) {
+            rig.engine.emit(
+                PiEvent.MessageUpdate(
+                    usage = probeUsageData(),
+                    assistantMessageEvent = AssistantMessageEvent.TextDelta(0, "正文"),
+                ),
+            )
+        }
+        runCurrent()
+
+        assertEquals(120L, rig.vm.stats.value.live.totalTokens)
+        assertEquals(100L, rig.vm.stats.value.live.input)
+        assertEquals("本轮 120 tok｜${money(0.0)}", rig.vm.stats.value.liveText())
+    }
+
+    /** 定稿的消息进「本轮之和」，同时把 in-flight 那份快照丢掉（同一条消息不许算两遍）。 */
+    @Test
+    fun `case65 a finalized message joins the sum and drops the in-flight snapshot`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        rig.engine.emit(PiEvent.MessageUpdate(usage = probeUsageData(), assistantMessageEvent = null))
+        runCurrent()
+        assertEquals(120L, rig.vm.stats.value.live.totalTokens)
+
+        rig.engine.emit(PiEvent.MessageEnd(PiMessage(role = "assistant", usage = probeUsageData())))
+        runCurrent()
+        assertEquals("定稿之后还是 120，不是 240", 120L, rig.vm.stats.value.live.totalTokens)
+
+        // 第二条消息（工具回路里 pi 会连发多条 assistant）
+        rig.engine.emit(PiEvent.MessageUpdate(usage = probeUsageData(totalTokens = 60), assistantMessageEvent = null))
+        runCurrent()
+        assertEquals(180L, rig.vm.stats.value.live.totalTokens)
+
+        rig.engine.emit(
+            PiEvent.MessageEnd(
+                PiMessage(role = "assistant", usage = probeUsageData(totalTokens = 60)),
+            ),
+        )
+        runCurrent()
+        assertEquals(180L, rig.vm.stats.value.live.totalTokens)
+
+        // 非 assistant 的消息（toolResult/user）没有 usage，不进和
+        rig.engine.emit(PiEvent.MessageEnd(PiMessage(role = "toolResult", content = textBlocks("输出"))))
+        runCurrent()
+        assertEquals(180L, rig.vm.stats.value.live.totalTokens)
+    }
+
+    /** `agent_start` 是一次新回答的边界：上一条的 token 不能挂在这一条上。 */
+    @Test
+    fun `case66 agent_start resets the live usage of the previous run`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.scriptReply("get_session_stats", data = probeStatsData())
+        rig.vm.refreshStats()
+        pumpScripted(rig)
+        rig.engine.emit(PiEvent.MessageEnd(PiMessage(role = "assistant", usage = probeUsageData())))
+        runCurrent()
+        assertEquals(120L, rig.vm.stats.value.live.totalTokens)
+
+        rig.engine.emit(PiEvent.AgentStart)
+        runCurrent()
+        assertEquals(TurnUsage.EMPTY, rig.vm.stats.value.live)
+        assertEquals(
+            "清的是本轮之和，已经拿到的会话快照一个键都不动",
+            240L,
+            rig.vm.stats.value.stats?.totalTokens,
+        )
+    }
+
+    /**
+     * 压缩的两条运行时事件（协议未列 → [PiEvent.Unknown]）驱动「正在压缩」，
+     * 且 `compaction_end` 之后**重问一次统计**——ctx% 的真相只在 `get_session_stats` 里。
+     */
+    @Test
+    fun `case67 compaction events flip the flag and the end asks for fresh stats`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        rig.engine.emit(PiEvent.Unknown(probeCompactionStart()))
+        runCurrent()
+        assertTrue(rig.vm.stats.value.compacting)
+
+        rig.engine.emit(PiEvent.Unknown(probeCompactionEnd()))
+        runCurrent()
+        assertFalse(rig.vm.stats.value.compacting)
+        assertEquals(
+            "压缩结束要重问统计（§3.7 验收第 4 条靠这一步）",
+            1,
+            rig.engine.sent.count { wireName(it.command) == "get_session_stats" },
+        )
+    }
+
+    /** 压缩失败的那句话由 pi 写好（探测 p15），本页原样上屏、不动任何数字。 */
+    @Test
+    fun `case68 a rejected compact reports pi's own words and mutates nothing`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.scriptReply("get_session_stats", data = probeStatsData())
+        rig.vm.refreshStats()
+        pumpScripted(rig)
+        val before = rig.vm.stats.value
+
+        rig.engine.scriptReply("compact", success = false, error = "Nothing to compact (session too small)")
+        rig.vm.compactContext()
+        pumpScripted(rig)
+
+        assertEquals("compact", wireName(rig.engine.sent.last().command))
+        assertTrue("提示要带 pi 的原话：${rig.vm.notice.value}", rig.vm.notice.value?.contains("Nothing to compact") == true)
+        assertEquals("失败不改统计面任何一个字段", before, rig.vm.stats.value)
+    }
+
+    /**
+     * 开关的两个动作：`set_auto_compaction(enabled)` + 紧跟一条 `get_state`。
+     *
+     * 探测 p16/p18：`set_auto_compaction` 的回执**没有 data**，真值只在
+     * `get_state.autoCompactionEnabled` 里 → 按下不等于生效，状态必须由 get_state 落地。
+     */
+    @Test
+    fun `case69 the auto-compaction switch is written by get_state not by the press`() = runTest {
+        val rig = rig()
+        ready(rig)
+        assertNull(rig.vm.stats.value.autoCompaction)
+
+        rig.engine.scriptReply("get_state", data = probeStateFlags(autoCompaction = true))
+        rig.vm.setAutoCompaction(true)
+        pumpScripted(rig)
+
+        assertEquals(
+            listOf("set_auto_compaction", "get_state"),
+            rig.engine.sent.map { wireName(it.command) }.takeLast(2),
+        )
+        assertEquals(true, rig.vm.stats.value.autoCompaction)
+
+        // 再点一次但不给回执：开关必须还停在 pi 上次说的那个值上
+        rig.vm.setAutoCompaction(false)
+        runCurrent()
+        assertEquals(
+            "回执没到之前不许把「按过」当成「已生效」",
+            true,
+            rig.vm.stats.value.autoCompaction,
+        )
+        assertEquals(
+            "两次点击都照原值发出去了（最后一次是 false，与 get_state 的落点无关）",
+            listOf(true, false),
+            rig.engine.sent.mapNotNull { (it.command as? RpcCommand.SetAutoCompaction)?.enabled },
+        )
+    }
+
+    /** `get_state.isCompacting` 是事件之外的兜底（漏一条事件也不该永远挂着「正在压缩」）。 */
+    @Test
+    fun `case70 get_state can correct the compacting flag too`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.emit(PiEvent.Unknown(probeCompactionStart()))
+        runCurrent()
+        assertTrue(rig.vm.stats.value.compacting)
+
+        rig.engine.scriptReply("get_state", data = probeStateFlags(compacting = false))
+        rig.vm.refreshModelState()
+        pumpScripted(rig)
+        assertFalse(rig.vm.stats.value.compacting)
+    }
+
+    /** 会话滚了：统计与本轮用量一起归零（上一条会话的 token 对这一条是错数据）。 */
+    @Test
+    fun `case71 rolling the session wipes stats and the accumulated live usage`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.scriptReply("get_session_stats", data = probeStatsData())
+        rig.vm.refreshStats()
+        pumpScripted(rig)
+        rig.engine.emit(PiEvent.MessageEnd(PiMessage(role = "assistant", usage = probeUsageData())))
+        runCurrent()
+        assertNotNull(rig.vm.stats.value.stats)
+        assertEquals(120L, rig.vm.stats.value.live.totalTokens)
+
+        rig.vm.newSession()
+        runCurrent()
+        val rollId = rig.engine.sent.last().id
+        rig.engine.emit(PiEvent.Response(id = rollId, command = "new_session", success = true))
+        runCurrent()
+
+        assertEquals(StatsUiState(), rig.vm.stats.value)
+        assertEquals("统计未加载", rig.vm.stats.value.barText())
+    }
+
+    /** 引擎还没起来时的三条统计命令：一句「引擎尚未就绪」，一条都不许发。 */
+    @Test
+    fun `case72 stats commands before Ready complain once and send nothing`() = runTest {
+        val rig = rig()
+
+        rig.vm.refreshStats()
+        rig.vm.compactContext()
+        rig.vm.setAutoCompaction(true)
+        runCurrent()
+
+        assertEquals(0, rig.engine.sent.size)
+        assertTrue("提示要说清原因：${rig.vm.notice.value}", rig.vm.notice.value?.contains("引擎尚未就绪") == true)
+    }
     private companion object {
         fun update(event: AssistantMessageEvent): PiEvent =
             PiEvent.MessageUpdate(assistantMessageEvent = event)

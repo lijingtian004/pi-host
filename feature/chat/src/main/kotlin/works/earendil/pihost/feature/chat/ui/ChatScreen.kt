@@ -52,6 +52,7 @@ fun ChatScreen(
     val transcript by viewModel.transcript.collectAsState()
     val queueState by viewModel.queueState.collectAsState()
     val modelPicker by viewModel.modelPicker.collectAsState()
+    val stats by viewModel.stats.collectAsState()
     val permission by viewModel.permissionRequest.collectAsState()
     val engineStatus by viewModel.engineStatus.collectAsState()
     val retryNote by viewModel.retryNote.collectAsState()
@@ -118,6 +119,13 @@ fun ChatScreen(
                         items = transcript,
                         markwon = viewModel.markwon,
                         modifier = Modifier.weight(1f),
+                    )
+                    // §3.4：统计条紧贴输入区（读完了才看的东西，摆在那里回答「还要不要继续问」）
+                    StatsBar(
+                        state = stats,
+                        onRefresh = viewModel::refreshStats,
+                        onCompact = viewModel::compactContext,
+                        onAutoCompactionChange = viewModel::setAutoCompaction,
                     )
                     InputBar(
                         turnState = turnState,

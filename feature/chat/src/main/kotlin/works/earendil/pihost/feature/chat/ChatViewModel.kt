@@ -506,10 +506,17 @@ class ChatViewModel @Inject constructor(
         val cycleModel = wireNameOf(RpcCommand.CycleModel)
         val setThinkingLevel = wireNameOf(RpcCommand.SetThinkingLevel(""))
         val cycleThinkingLevel = wireNameOf(RpcCommand.CycleThinkingLevel)
+        val getSessionStats = wireNameOf(RpcCommand.GetSessionStats)
+        val compactWire = wireNameOf(RpcCommand.Compact(null))
+        val setAutoCompactionWire = wireNameOf(RpcCommand.SetAutoCompaction(true))
         if (!event.success) {
             // 失败**只报错、不改状态**：chip 留上一条真实值（探测 p08 之后 pi 的当前模型没变）
-            if (wire == setModel || wire == cycleModel) {
-                _notice.value = "模型切换失败：${event.error ?: "pi 回了 success=false"}"
+            when (wire) {
+                setModel, cycleModel -> _notice.value = "模型切换失败：${event.error ?: "pi 回了 success=false"}"
+                // 压缩失败的那句话 pi 已经写好了（探测 p15：`Nothing to compact (session too small)`），
+                // 原样上屏，不翻译成「请稍后再试」那种没信息量的话
+                compactWire -> _notice.value = "压缩失败：${event.error ?: "pi 回了 success=false"}"
+                else -> Unit
             }
             return
         }
@@ -559,7 +566,32 @@ class ChatViewModel @Inject constructor(
                 _modelPicker.update {
                     it.copy(current = model ?: it.current, thinkingLevel = level ?: it.thinkingLevel)
                 }
+                // §3.4：同一条 get_state 也是 autoCompactionEnabled / isCompacting 的唯一真相来源
+                // （开关点下去之后回的那句是它，压缩进行中/结束的兜底也是它）
+                _stats.update {
+                    it.copy(
+                        autoCompaction = SessionStatsParser.parseAutoCompaction(data) ?: it.autoCompaction,
+                        compacting = SessionStatsParser.parseIsCompacting(data) ?: it.compacting,
+                    )
+                }
             }
+
+            getSessionStats -> {
+                val parsed = SessionStatsParser.parse(data)
+                if (parsed == null) {
+                    // 形状不对就保留上一版数字：统计条宁可旧，不可假
+                    _notice.value = "会话统计形状不对，未能刷新"
+                } else {
+                    _stats.update { it.copy(stats = parsed) }
+                }
+            }
+
+            // compact 的成功回执**不带 data**（探测 p15 那条失败的回执也只有 error），
+            // 进度与结果都由 compaction_start/compaction_end 事件说 → 这里无事可做
+            compactWire -> Unit
+
+            // set_auto_compaction 同理：回执没有 data，真值由上面那条 getState 落地
+            setAutoCompactionWire -> Unit
 
             // set_thinking_level 的回执探测显示**没有 data**（p05：success=true、无 data），
             // 新档位由 thinking_level_changed 事件说；非法值（p09）连事件都不发，
@@ -568,7 +600,61 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    /** 中止当前轮（Idle 时按钮本就禁用，这里再兜一层）。 */
+    // ── 会话统计条（P3B §3.4）─────────────────────────────────────────────────────
+
+    private val _stats = MutableStateFlow(StatsUiState())
+
+    /**
+     * 统计条的唯一数据源（§3.4）。
+     *
+     * 四个字段各自只有一个写入口，全部是 pi 已经吐出的事实：
+     * [SessionStats] 来自 `get_session_stats` 回执，`live` 来自 `message_update`/`message_end`，
+     * `autoCompaction`/`compacting` 来自 `get_state` 与 `compaction_start`/`compaction_end` 事件。
+     *
+     * 刻意**没有**的字段：「用户按了压缩」这种本地意图。压缩是 pi 在做的事，
+     * 本页只负责把它看到的写下来；把按钮按下就写成 `compacting=true`，
+     * 一旦那条命令根本没送到（引擎死了、会话切了）就会永远挂着个假进度。
+     */
+    val stats: StateFlow<StatsUiState> = _stats.asStateFlow()
+
+    /** 本轮**已定稿**消息的用量之和（只有 `message_end` 能加进来）。 */
+    private var closedUsage = TurnUsage.EMPTY
+
+    /** 当前这条 assistant 消息的最新累计快照（`message_update` 给的是整条消息的累计，不是增量）。 */
+    private var inFlightUsage: TurnUsage? = null
+
+    /** 手动刷新（顶栏那个 ⟳），也是 §3.7 验收第 4 条「compact 后 ctx% 下降」的读数入口。 */
+    fun refreshStats() = sendTracked(RpcCommand.GetSessionStats)
+
+    /** 手动压缩：确认对话框点「压缩」之后才走到这里（§3.4）。 */
+    fun compactContext(customInstructions: String? = null) = sendTracked(RpcCommand.Compact(customInstructions))
+
+    /**
+     * 自动压缩开关。
+     *
+     * `set_auto_compaction` 的回执**没有 data**（探测 p16/p18：只有 `success=true`），
+     * 真值只写在 `get_state.autoCompactionEnabled` 里，所以这里把用户按的那个值
+     * 当作**要送出去的参数**而不是「已经生效的事实」——落点仍是紧跟着的一次 `get_state`。
+     */
+    fun setAutoCompaction(enabled: Boolean) {
+        sendTracked(RpcCommand.SetAutoCompaction(enabled))
+        refreshModelState()
+    }
+
+    /** live 用量的唯一写入口：closed + in-flight 合成「本轮已用」。 */
+    private fun publishLiveUsage() {
+        _stats.update { it.copy(live = closedUsage + (inFlightUsage ?: TurnUsage.EMPTY)) }
+    }
+
+    /** 一次 agent 运行的边界：`agent_start` 一到就把本轮用量清零（上一条回答的 token 不算这一条）。 */
+    private fun startAgentRun() {
+        closedUsage = TurnUsage.EMPTY
+        inFlightUsage = null
+        publishLiveUsage()
+    }
+
+    /** 中止当前轮（Idle 时按钮本就禁用，这里再兜一层）。
+     */
     fun abort() {
         val id = sessionId ?: return
         if (_turnState.value == TurnState.Idle) return
@@ -713,6 +799,11 @@ class ChatViewModel @Inject constructor(
         // 「未配置认证时不主动拉」这条约束在会话切换上同样成立。
         trackedCommands.clear()
         _modelPicker.value = ModelPickerState()
+        // §3.4：统计条与本轮用量跟着会话一起归零。上一条会话的 token 数对这一条不是
+        // 「旧数据」，是**错数据**——它会让用户以为这一轮才跑了 240 tok。
+        _stats.value = StatsUiState()
+        closedUsage = TurnUsage.EMPTY
+        inFlightUsage = null
         showLoadingNote()
         backfillTranscript()
     }
@@ -927,7 +1018,15 @@ class ChatViewModel @Inject constructor(
         when (event) {
             is PiEvent.MessageStart -> onMessageStart(event.message)
             is PiEvent.MessageEnd -> onMessageEnd(event.message)
-            is PiEvent.MessageUpdate -> event.assistantMessageEvent?.let { onAssistantEvent(it) }
+            is PiEvent.MessageUpdate -> {
+                // §3.4：usage 是这条消息的**累计快照**（探测：21 次 message_update 的 usage 一模一样），
+                // 所以是「替换最后一次观测值」，逐条相加会按 delta 条数把数字抬到天上
+                SessionStatsParser.parseUsage(event.usage)?.let { observed ->
+                    inFlightUsage = observed
+                    publishLiveUsage()
+                }
+                event.assistantMessageEvent?.let { onAssistantEvent(it) }
+            }
 
             is PiEvent.ToolExecutionStart -> {
                 // §3.2 挂点一：args **原样**入审计（不解析、不美化、不截断——§2 红线）
@@ -984,6 +1083,11 @@ class ChatViewModel @Inject constructor(
             is PiEvent.AgentSettled -> {
                 settleLastAssistant()
                 if (_turnState.value != TurnState.PermissionPending) _turnState.value = TurnState.Idle
+                // §3.4：跑完一轮就把会话统计问一次。规格书写的是「TurnEnd 或 AgentSettled」，
+                // 这里取 AgentSettled——一次运行只到一条（探测里 turn_end 有 2 条，
+                // 挂在 TurnEnd 上等于每轮多问一次同样的数），且 pi 自己说「settled」的时候
+                // 这一轮的 token 才算真的花完
+                refreshStats()
             }
 
             is PiEvent.QueueUpdate -> {
@@ -1003,7 +1107,9 @@ class ChatViewModel @Inject constructor(
 
             is PiEvent.SessionInfoChanged -> _retryNote.value = event.name?.let { "会话名：$it" }
 
-            is PiEvent.AgentStart, is PiEvent.EntryAppended -> Unit
+            is PiEvent.AgentStart -> startAgentRun()
+
+            is PiEvent.EntryAppended -> Unit
 
             // §3.3：冻结区没建模的类型（thinking_level_changed 等）在 feature/chat 这一层认
             is PiEvent.Unknown -> onUnknownEvent(event)
@@ -1019,6 +1125,15 @@ class ChatViewModel @Inject constructor(
     }
 
     private fun onMessageEnd(message: PiMessage) {
+        // §3.4：定稿的这条才进「本轮已用」之和；同时把 in-flight 那份快照扔掉，
+        // 否则同一条消息会被算两遍（message_update 的最后一次观测值 == message_end 的 usage）
+        if (message.role == ROLE_ASSISTANT) {
+            SessionStatsParser.parseUsage(message.usage)?.let { finalized ->
+                closedUsage = closedUsage + finalized
+                inFlightUsage = null
+                publishLiveUsage()
+            }
+        }
         when (message.role) {
             ROLE_ASSISTANT -> mutateTranscript { list ->
                 list.indexOfLast { it is TranscriptItem.AssistantItem }.takeIf { it >= 0 }?.let { index ->
@@ -1171,9 +1286,24 @@ class ChatViewModel @Inject constructor(
      */
     private fun onUnknownEvent(event: PiEvent.Unknown) {
         val type = (event.raw["type"] as? JsonPrimitive)?.contentOrNull
-        if (type != EVENT_THINKING_LEVEL_CHANGED) return
-        ModelCatalog.parseLevel(event.raw)?.let { level ->
-            _modelPicker.update { it.copy(thinkingLevel = level) }
+        when (type) {
+            EVENT_THINKING_LEVEL_CHANGED -> ModelCatalog.parseLevel(event.raw)?.let { level ->
+                _modelPicker.update { it.copy(thinkingLevel = level) }
+            }
+
+            // §3.4：压缩的两条事件同样不在 protocol.md 的事件表里（探测 rpc33.jsonl p15 前后）。
+            // start 只点亮「正在压缩」，end 除了熄灯还要**重问一次统计**——
+            // ctx% 的真相只在 get_session_stats 里，事件本身不带新的计数
+            EVENT_COMPACTION_START -> _stats.update { it.copy(compacting = true) }
+
+            EVENT_COMPACTION_END -> {
+                _stats.update { it.copy(compacting = false) }
+                refreshStats()
+            }
+
+            // 其余未建模类型一律不认：没有探测过的形状就没有解析器，猜一个键名回来
+            // 只会让「将来 pi 加了同名事件」变成静默的错误渲染
+            else -> Unit
         }
     }
 
@@ -1333,6 +1463,17 @@ class ChatViewModel @Inject constructor(
          * 后者是 session 文件的条目类型。按实跑的形状写，不按文档的邻近词猜。
          */
         const val EVENT_THINKING_LEVEL_CHANGED = "thinking_level_changed"
+
+        /**
+         * §3.4 认领的另外两条「冻结区没建模」的运行时事件（同一条决策：走 [PiEvent.Unknown]，
+         * 不在 core/rpc 加事件模型）。
+         *
+         * 线名照探测实录：`{"type":"compaction_start","reason":"manual"}` /
+         * `{"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false,
+         * "errorMessage":"Compaction failed: …"}`。
+         */
+        const val EVENT_COMPACTION_START = "compaction_start"
+        const val EVENT_COMPACTION_END = "compaction_end"
     }
 }
 

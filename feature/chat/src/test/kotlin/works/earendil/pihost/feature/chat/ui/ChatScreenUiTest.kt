@@ -50,9 +50,13 @@ import works.earendil.pihost.feature.chat.ToolCallRecord
 import works.earendil.pihost.feature.chat.ToolStatus
 import works.earendil.pihost.feature.chat.TranscriptItem
 import works.earendil.pihost.feature.chat.TurnState
+import works.earendil.pihost.feature.chat.probeCompactionEnd
+import works.earendil.pihost.feature.chat.probeCompactionStart
 import works.earendil.pihost.feature.chat.probeEmptyModelsData
 import works.earendil.pihost.feature.chat.probeLevelsData
 import works.earendil.pihost.feature.chat.probeModelsData
+import works.earendil.pihost.feature.chat.probeStateFlags
+import works.earendil.pihost.feature.chat.probeStatsData
 import works.earendil.pihost.feature.chat.probeStateData
 import works.earendil.pihost.feature.chat.wireName
 
@@ -527,6 +531,111 @@ class ChatScreenUiTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithTag(ChatTags.MODEL_DIALOG).assertDoesNotExist()
     }
+    // ── §3.4 统计条：未加载态、展开明细、压缩确认、自动压缩开关 ────────────────────
+
+    @Test
+    fun statsBarSaysUnloadedUntilTheRefreshButtonGetsAnAnswer() {
+        showReadyScreen()
+        // 一行数字都没问过就摆出来 = 用户以为这条会话真的没花钱；这里必须先说实话
+        composeRule.onNodeWithTag(ChatTags.STATS_BAR).assertTextEquals(STATS_UNLOADED)
+        assertEquals(0, engine.sent.count { wireName(it.command) == "get_session_stats" })
+
+        engine.scriptReply("get_session_stats", data = probeStatsData())
+        composeRule.onNodeWithTag(ChatTags.STATS_REFRESH).performClick()
+        composeRule.waitForIdle()
+        engine.deliverScripted()
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithTag(ChatTags.STATS_BAR).assertTextEquals("240 tok｜\$0.0000｜120/128000 (0.09%)")
+        // 没展开之前不给明细：那一行是「扫一眼」的东西，明细要点开才给
+        composeRule.onNodeWithTag(ChatTags.STATS_DETAILS).assertDoesNotExist()
+    }
+
+    @Test
+    fun expandingTheStatsBarRevealsCountsAndCompactingStillNeedsAConfirmation() {
+        showReadyScreen()
+        engine.scriptReply("get_session_stats", data = probeStatsData())
+        composeRule.onNodeWithTag(ChatTags.STATS_REFRESH).performClick()
+        composeRule.waitForIdle()
+        engine.deliverScripted()
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithTag(ChatTags.STATS_BAR).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.STATS_DETAILS).assertIsDisplayed()
+        composeRule.onNodeWithText("user 1｜assistant 2｜toolCalls 1｜toolResults 1｜total 5").assertIsDisplayed()
+        composeRule.onNodeWithText("in 200｜out 40｜cacheR 0｜cacheW 0｜合计 240").assertIsDisplayed()
+
+        // 「压缩上下文」不是即时动作：先弹确认，取消就一条命令都不发
+        composeRule.onNodeWithTag(ChatTags.COMPACT_BUTTON).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.COMPACT_DIALOG).assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.COMPACT_CANCEL).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.COMPACT_DIALOG).assertDoesNotExist()
+        assertEquals("取消就是取消", 0, engine.sent.count { wireName(it.command) == "compact" })
+
+        composeRule.onNodeWithTag(ChatTags.COMPACT_BUTTON).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.COMPACT_CONFIRM).performClick()
+        composeRule.waitForIdle()
+        assertEquals("compact", wireName(engine.sent.last().command))
+        composeRule.onNodeWithTag(ChatTags.COMPACT_DIALOG).assertDoesNotExist()
+    }
+
+    @Test
+    fun theAutoCompactionSwitchStaysUnknownUntilGetStateAnswers() {
+        showReadyScreen()
+        composeRule.onNodeWithTag(ChatTags.STATS_BAR).performClick()
+        composeRule.waitForIdle()
+
+        // get_state 没问过 → 措辞说「未知」，而不是把开关画成「关」让用户以为不用管
+        composeRule.onNodeWithText("自动压缩（未知）").assertIsDisplayed()
+
+        engine.scriptReply("get_state", data = probeStateFlags(autoCompaction = true))
+        composeRule.onNodeWithTag(ChatTags.AUTO_COMPACT_SWITCH).performClick()
+        composeRule.waitForIdle()
+        assertEquals(
+            listOf("set_auto_compaction", "get_state"),
+            engine.sent.map { wireName(it.command) }.takeLast(2),
+        )
+        // 回执没到之前按下去的那一下不算数
+        composeRule.onNodeWithText("自动压缩（未知）").assertIsDisplayed()
+
+        engine.deliverScripted()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("自动压缩（开）").assertIsDisplayed()
+    }
+
+    @Test
+    fun compactionInFlightMarksTheBarAndGreysOutTheCompactButton() {
+        showReadyScreen()
+        composeRule.onNodeWithTag(ChatTags.STATS_BAR).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.COMPACT_BUTTON).assertIsEnabled()
+
+        engine.emit(PiEvent.Unknown(probeCompactionStart()))
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.STATS_BAR).assertTextEquals("$STATS_UNLOADED｜正在压缩…")
+        composeRule.onNodeWithTag(ChatTags.COMPACT_BUTTON).assertIsNotEnabled()
+
+        // 压缩结束会自己重问一次统计（§3.7 验收第 4 条靠这一步：ctx 那一格要换成新数）
+        engine.scriptReply(
+            "get_session_stats",
+            data = probeStatsData(totalTokens = 90, contextTokens = 40, percent = 0.03125),
+        )
+        engine.emit(PiEvent.Unknown(probeCompactionEnd()))
+        composeRule.waitForIdle()
+        assertEquals(
+            "压缩结束的那一条重问是唯一的一次",
+            1,
+            engine.sent.count { wireName(it.command) == "get_session_stats" },
+        )
+        composeRule.onNodeWithTag(ChatTags.COMPACT_BUTTON).assertIsEnabled()
+        engine.deliverScripted()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.STATS_BAR).assertTextEquals("90 tok｜\$0.0000｜40/128000 (0.03%)")
+    }
     private companion object {
         const val PLACEHOLDER_PENDING = "等待权限确认…"
 
@@ -547,6 +656,9 @@ class ChatScreenUiTest {
 
         /** 当前项的高亮标记（ModelChip 里非当前项用的是全角空格，不会撞车）。 */
         const val MARK_CURRENT = "● "
+
+        /** §3.4：一行式统计条在「还没问过 pi」时的那句实话。 */
+        const val STATS_UNLOADED = "统计未加载"
 
         fun uiRequest(id: String, method: String): PiEvent.ExtensionUiRequest =
             PiEvent.ExtensionUiRequest(

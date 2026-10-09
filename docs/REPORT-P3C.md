@@ -163,8 +163,9 @@ feature/sessions/.../ProjectsSource.kt                 UI 侧接缝（接口 + F
 | sha256 | `86cd5e1799cea4cd3646940e8f58a04df22ffc0ba4951fcd2b0638bb59c4a7ac`（**双端逐字节一致**） |
 | 清单 | `package=works.earendil.pihost` `versionCode=8` `versionName=0.1.7` `minSdk=26` `targetSdk=35`（`.tools/p3b-axml.py` 解析二进制 AXML） |
 
-装机后 `dist/pi-host-full-debug.apk`（0.1.6，与机上 `base.apk` 同 sha256 `7e5de17a…`）**保留不动**，
-它是「P3B-FIX1 已装机」的证据。
+装机后旧的 `dist/pi-host-full-debug.apk`（0.1.6，sha256 `7e5de17a…`，曾与机上 `base.apk` 逐字节一致）**保留不动**，
+它是「P3B-FIX1 已装机」的证据。本期 0.1.7 已实际装到设备（见 §8.1），
+所以机上 `base.apk` 现在对应的是新产物；旧文件留着只为对照，别当现状读。
 
 ---
 
@@ -247,26 +248,43 @@ bash .tools/p3c-device-smoke.sh files
 
 ## 8. 偏差、遗留与未执行
 
-### 8.1 真机工具通路仍未触发（本期**最大**的未闭环项）
+### 8.1 真机部分执行：装机已做，工具通路仍未触发
 
-装机前的磁盘事实（`bash .tools/p3c-device-smoke.sh files` 的真实回显）：
+**已执行**：`pm install -r` 把设备从 0.1.6 升到 0.1.7（`dumpsys package` 实测
+`versionCode=7 → 8`、`versionName=0.1.6 → 0.1.7`，Success）。
+执行前用 `am force-stop` 清场，**打断了一次正在使用的会话**——会话本体在 jsonl 里，重开可续，
+但这是本轮对用户设备造成的一次实际干扰，记在这里。
+后续 UI 驱动（点「新建项目」）**主动停止**：dump 出来的屏幕上出现了一轮新的
+`你好` → 回复（带 `思考（展开）`、1605 tok），文本与既有 session 里的三条回复都不同，
+说明设备此刻有人在用；不再往里戳。
+
+装机后的磁盘事实（`bash .tools/p3c-device-smoke.sh files` 的真实回显）：
 
 ```
-files/projects/            → 只有 default（19:37），无一个子目录新增
-files/home/.gitconfig      → No such file or directory
+files/projects/            → 仍然只有 default（19:37 建），无一个新项目目录
+files/home/.gitconfig      → 存在，-rw------- u0_a401:u0_a401 80 字节，mtime 23:42（装在 0.1.7 之后）
+                              内容与 GitIdentity.DEFAULT_CONTENT 逐字一致（python 比对「逐字一致」）
 files/projects/default/.git→ GIT无
 files/audit/               → No such file or directory
+logcat -d | grep PiHostGit → 无输出
 ```
 
-即：0.1.6 上 `.gitconfig` 从未写过（§3.2 那条 `UpToDate` 分支正是为它补的路径），
-`projects/<新项目>` 也从没建过。**592 条单测全绿不等于设备上是好的**——
-本期新代码里 `git init`、`.gitconfig` 被 git 认领、项目目录在设备上可建这三件事
-一条都没有真机证据，见 §8.2。
+**这一条把 §8.2 的第 2 条 closes 掉一半**：`.gitconfig` 确实由 **app 自己的 uid**（非 root）
+在设备上写出且字节正确——`RuntimeInstallImpl` 走 `UpToDate` 分支播种这条路径**实机成立**
+（若只挂 `Installed` 分支，这个文件永远不会出现，正是 §3.2 特意补两条成功支的原因）。
+剩下的一半是「git 2.56 读不读这份配置」，那要一次真 `git commit` 才算证。
 
-装机 + 建项目 + 让 pi 真跑一次 `git commit` 的冒烟脚本已就位
-（`.tools/p3c-device-smoke.sh`，`am`/`pm`/`input`/`uiautomator`/`logcat` 全部实测可用，
-只需 `PATH=/system/bin`——不这么做 `uiautomator` 会报 `app_process: inaccessible or not found`），
-但**装机与 force-stop 会打断正在用的会话，未擅自执行**，待用户点头。
+仍然**没有**证据的三件事：`projects/<新项目>` 能否在设备上建出来（§8.2 第 1、5 条）、
+`git init` 能否成功、以及**工具通路本身在设备上跑过没有**
+（`audit/` 不存在与 `toolCall` 计数为 0 是同一个事实的两面）。
+**592 条单测全绿不等于设备上是好的**——本期新代码里最要紧的那一步仍然空白。
+
+冒烟脚本已就位并可用（`.tools/p3c-device-smoke.sh`，子命令 `install|projects|files|logcat|all`）；
+`am`/`pm`/`input`/`uiautomator`/`dumpsys`/`logcat` 全部实测可达，只需 `PATH=/system/bin`
+——不这么做 `uiautomator` 会报 `app_process: inaccessible or not found`。
+另有一条**新发现的限制**：Compose 的 `testTag` 在真机 uiautomator 树里**不出现**
+（要 `testTagsAsResourceId` 才映射成 `resource-id`），所以脚本与人工都只能按 `text=` 定位；
+本期所有 UI 断言因此只存在于 JVM 侧，真机侧的可定位性要单开一小步才能补上。
 
 ### 8.2 只有真机可验（五条，不许拿单测冒充）
 
@@ -358,15 +376,17 @@ spawn lambda 需要正是**同步、不挂起、不碰磁盘**的读——这条
 
 ---
 
-## 9. 真机验收清单（待用户点头后执行 `p3c-device-smoke.sh`）
+## 9. 真机验收清单（五条，本期实交 1 条）
 
-| # | 步骤 | 判据 | 观测点 |
+| # | 步骤 | 判据 | 本期状态 |
 |---|---|---|---|
-| ① | `pm install -r` 0.1.7 | `dumpsys package` 的 versionCode 从 7 → 8 | `p3c-device-smoke.sh install` |
-| ② | 会话页点「新建项目」→ 输入名 → 创建 | `files/projects/<名>/` 出现且**内有 `.git/`** | `… files` 的第 4 段 |
-| ③ | 建项目后 | `files/home/.gitconfig` 出现，内容逐字等于 `GitIdentity.DEFAULT_CONTENT` | `… files` |
-| ④ | 进聊天页 | 顶栏出现分支 chip，文本为 `main`（新仓库无提交时 `ProcessGitProbe` 走 `No commits yet on main` 分支） | logcat `PiHostGitChip` |
-| ⑤ | 让 pi「新建一个文件并 git commit」 | 会话 jsonl 里出现 `toolCall`；`audit/` 目录首次出现 jsonl；`git log` 有署名 `pi host` 的提交 | 回读 jsonl + `… logcat` |
+| ① | `pm install -r` 0.1.7 | `dumpsys package` 的 versionCode 7 → 8 | **已执行 ✓**（`Success`，装后 `versionCode=8 / versionName=0.1.7`；执行中 `am force-stop` 打断了一次正在使用的会话） |
+| ② | 会话页点「新建项目」→ 输入名 → 创建 | `files/projects/<名>/` 出现且**内有 `.git/`** | **未执行**（屏幕此刻有人在用，主动停手；见 §8.1） |
+| ③ | 建项目后 | `files/home/.gitconfig` 出现且内容逐字等于 `GitIdentity.DEFAULT_CONTENT` | **已执行 ✓（非经②）**：文件由 app 自身 uid `u0_a401` 在 23:42 写出，80 字节，python 逐字比对「逐字一致」——走的是 `RuntimeInstallImpl` 的 `UpToDate` 分支，不是 `ProjectStore.create` |
+| ④ | 进聊天页 | 顶栏出现分支 chip | **未观测到，且这是正确行为**：`projects/default` 里没有 `.git`（②未做），`status` 判 `NotARepo` → 按设计不渲染节点；logcat 里 `PiHostGit*` 无输出 |
+| ⑤ | 让 pi「新建一个文件并 git commit」 | 会话 jsonl 出现 `toolCall`；`files/audit/` 首次出现 jsonl；`git log` 里有署名 `pi host` 的提交 | **未执行**。这条是本期真正的目的：**第一次**让工具通路在设备上跑起来，顺带覆盖 §8.2 的第 1、2、3 条 |
 
-第 ⑤ 条是本期真正的目的：**第一次**让工具通路在设备上跑起来，
-顺带一次性覆盖 §8.2 的第 1、2、3 条。
+②⑤ 两步需要动屏幕，而真机上 Compose 的 `testTag` 不映射进 uiautomator 树（§8.1 末），
+只能按 `text=` 定位——脚本 `p3c-device-smoke.sh projects` 已按此写好，
+在设备空闲时一条命令即可跑完。③ 之所以能「不经②」拿到，
+是因为本期特意把身份播种也挂在运行时安装的成功支上（§3.2）。

@@ -13,9 +13,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -25,6 +27,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -69,6 +74,13 @@ fun SessionsScreen(
     val navigation by viewModel.navigation.collectAsState()
     val pendingDelete by viewModel.pendingDelete.collectAsState()
 
+    // 「新建项目」卡的开合是**纯 UI 态**，不进 VM：它不携带任何事实（磁盘上有没有这个项目
+    // 由 VM 的 Content 说），进 VM 只会多一条与磁盘无关的状态。
+    // 与 pendingDelete 相反——那个必须进 VM，因为「确认前绝不删文件」要在单测里钉死。
+    var creatingProject by remember { mutableStateOf(false) }
+    var draftName by remember(creatingProject) { mutableStateOf("") }
+    var draftWithGit by remember(creatingProject) { mutableStateOf(true) }
+
     // 进屏重扫（规格书 §4.1「下拉刷新（LaunchedEffect 重扫）」的进入时机）
     LaunchedEffect(Unit) { viewModel.refresh() }
 
@@ -92,6 +104,7 @@ fun SessionsScreen(
             TopBar(
                 onRefresh = viewModel::refresh,
                 onSettings = onOpenSettings,
+                onNewProject = { creatingProject = true },
             )
 
             notice?.let { text ->
@@ -102,6 +115,27 @@ fun SessionsScreen(
                         .fillMaxWidth()
                         .testTag(SessionsTags.NOTICE)
                         .padding(horizontal = 12.dp, vertical = 6.dp),
+                )
+            }
+
+            // P3C §3.7：项目条 + 「新建项目」卡。放在 notice 之后、列表之前——
+            // 它是「这一屏在哪个项目里看」的上下文，必须早于列表被读到；
+            // 也保证 notice（含创建失败的原因原文）不被卡片挤到屏幕外。
+            val snapshot = uiState
+            if (snapshot is SessionsUiState.Content) {
+                ProjectsSection(
+                    content = snapshot,
+                    creating = creatingProject,
+                    draft = draftName,
+                    withGit = draftWithGit,
+                    onDraftChange = { draftName = it },
+                    onWithGitChange = { draftWithGit = it },
+                    onCreate = {
+                        viewModel.createProject(draftName, draftWithGit)
+                        creatingProject = false
+                    },
+                    onCancel = { creatingProject = false },
+                    onPick = { viewModel.useProject(it) },
                 )
             }
 
@@ -135,7 +169,7 @@ fun SessionsScreen(
 }
 
 @Composable
-private fun TopBar(onRefresh: () -> Unit, onSettings: () -> Unit) {
+private fun TopBar(onRefresh: () -> Unit, onSettings: () -> Unit, onNewProject: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -143,11 +177,109 @@ private fun TopBar(onRefresh: () -> Unit, onSettings: () -> Unit) {
     ) {
         Text(text = SessionsStrings.TITLE, style = MaterialTheme.typography.titleMedium)
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            TextButton(onClick = onNewProject, modifier = Modifier.testTag(SessionsTags.BUTTON_NEW_PROJECT)) {
+                Text(SessionsStrings.BUTTON_NEW_PROJECT_LABEL)
+            }
             TextButton(onClick = onRefresh, modifier = Modifier.testTag(SessionsTags.BUTTON_REFRESH)) {
                 Text(SessionsStrings.ACTION_REFRESH)
             }
             TextButton(onClick = onSettings, modifier = Modifier.testTag(SessionsTags.BUTTON_SETTINGS)) {
                 Text(SessionsStrings.ENTRY_SETTINGS)
+            }
+        }
+    }
+}
+
+/**
+ * 项目条与「新建项目」内联卡（P3C §3.7）。
+ *
+ * **为什么是内联卡而不是 AlertDialog**：本屏的删除确认已经是内联卡形态
+ * （[SessionsScreen] 类头 §4.1 那条理由：Dialog 是独立 window，Compose UI 测试定位不稳），
+ * 同一个屏幕里两种确认形态只会让人不知道该学哪一个。
+ * 需要说明的是仓库里**确有**可用的 Dialog 先例（`ModelChip` 的 material3 AlertDialog，
+ * `ChatScreenUiTest` 里能点到里面节点）——本期仍然选内联，是为了与本屏一致，
+ * 不是因为 Dialog 测不了。
+ *
+ * **创建按钮的门是 `draft.isNotBlank()`**（`SettingsScreen.kt:302` 同一条先例）：
+ * 这只是手感上的第一道门，真正的拒绝在 `ProjectStore.create`（第二道）与读盘回落（第三道）。
+ * 空白输入点不到按钮，但 `../x` 这种「看着不像空白」的输入一定会走到第二道门——
+ * 那道门是必须的，也是本期唯一的安全边界。
+ */
+@Composable
+private fun ProjectsSection(
+    content: SessionsUiState.Content,
+    creating: Boolean,
+    draft: String,
+    withGit: Boolean,
+    onDraftChange: (String) -> Unit,
+    onWithGitChange: (Boolean) -> Unit,
+    onCreate: () -> Unit,
+    onCancel: () -> Unit,
+    onPick: (String) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "${SessionsStrings.PROJECTS_TITLE}：${content.activeProject}",
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.testTag(SessionsTags.LABEL_ACTIVE_PROJECT),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (content.projects.isEmpty()) {
+            Text(
+                text = SessionsStrings.PROJECTS_EMPTY,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.testTag(SessionsTags.ROW_PROJECT),
+            )
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                content.projects.forEach { name ->
+                    val active = name == content.activeProject
+                    OutlinedButton(
+                        onClick = { if (!active) onPick(name) },
+                        modifier = Modifier.testTag(SessionsTags.project(name)),
+                        enabled = !active,
+                    ) { Text(if (active) "$name（${SessionsStrings.PROJECT_ACTIVE}）" else name) }
+                }
+            }
+        }
+
+        if (creating) {
+            Column(
+                modifier = Modifier.fillMaxWidth().testTag(SessionsTags.CARD_NEW_PROJECT),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = onDraftChange,
+                    label = { Text(SessionsStrings.PROJECT_FIELD_LABEL) },
+                    supportingText = { Text(SessionsStrings.PROJECT_FIELD_HINT) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().testTag(SessionsTags.FIELD_PROJECT_NAME),
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = withGit, onCheckedChange = onWithGitChange,
+                        modifier = Modifier.testTag(SessionsTags.CHECK_PROJECT_GIT))
+                    Text(SessionsStrings.PROJECT_CHECK_GIT, style = MaterialTheme.typography.bodySmall)
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onCreate, enabled = draft.isNotBlank(),
+                        modifier = Modifier.testTag(SessionsTags.BUTTON_PROJECT_CREATE)) {
+                        Text(SessionsStrings.PROJECT_CREATE)
+                    }
+                    TextButton(onClick = onCancel, modifier = Modifier.testTag(SessionsTags.BUTTON_PROJECT_CANCEL)) {
+                        Text(SessionsStrings.PROJECT_CANCEL)
+                    }
+                }
             }
         }
     }

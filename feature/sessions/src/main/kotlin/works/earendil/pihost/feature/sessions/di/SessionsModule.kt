@@ -7,7 +7,9 @@ import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import javax.inject.Singleton
+import works.earendil.pihost.feature.sessions.FileProjectsSource
 import works.earendil.pihost.feature.sessions.PiSessionScanner
+import works.earendil.pihost.feature.sessions.ProjectsSource
 import works.earendil.pihost.feature.sessions.SessionScanner
 
 /**
@@ -25,4 +27,12 @@ object SessionsModule {
     @Singleton
     fun sessionScanner(@ApplicationContext ctx: Context): SessionScanner =
         PiSessionScanner(SessionScanner.sessionsRoot(ctx))
+
+    /**
+     * 接口 → 实现转发边（P3C §3.7，照 [sessionScanner] 与本模块的先例）：
+     * 注入点要 [ProjectsSource]，不是 `FileProjectsSource`，假体才能顶掉它。
+     */
+    @Provides
+    @Singleton
+    fun projectsSource(impl: FileProjectsSource): ProjectsSource = impl
 }

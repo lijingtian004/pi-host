@@ -6,7 +6,11 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextInput
 import java.util.concurrent.CopyOnWriteArrayList
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -19,6 +23,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import works.earendil.pihost.feature.sessions.FakeEngine
+import works.earendil.pihost.feature.sessions.FakeProjectsSource
 import works.earendil.pihost.feature.sessions.FakeScanner
 import works.earendil.pihost.feature.sessions.ScannedSession
 import works.earendil.pihost.feature.sessions.SessionNavRequest
@@ -52,12 +57,18 @@ class SessionsScreenTest {
         composeRule.waitForIdle()
     }
 
-    private class Rig(val vm: SessionsViewModel, val scanner: FakeScanner, val engine: FakeEngine)
+    private class Rig(
+        val vm: SessionsViewModel,
+        val scanner: FakeScanner,
+        val engine: FakeEngine,
+        val projects: FakeProjectsSource,
+    )
 
     private fun rig(vararg rows: ScannedSession): Rig {
         val scanner = FakeScanner(rows.toList())
         val engine = FakeEngine()
-        val vm = SessionsViewModel(RuntimeEnvironment.getApplication(), scanner, engine)
+        val projects = FakeProjectsSource()
+        val vm = SessionsViewModel(RuntimeEnvironment.getApplication(), scanner, engine, projects)
         composeRule.setContent {
             SessionsScreen(
                 viewModel = vm,
@@ -66,7 +77,7 @@ class SessionsScreenTest {
             )
         }
         pump()
-        return Rig(vm, scanner, engine)
+        return Rig(vm, scanner, engine, projects)
     }
 
     /**
@@ -165,5 +176,78 @@ class SessionsScreenTest {
         assertNull("确认后确认态收起", rig.vm.pendingDelete.value)
         composeRule.onNodeWithText(SessionsStrings.EMPTY_TITLE).assertIsDisplayed()
         assertEquals("顶栏设置入口没被点过", 0, settingsClicks.get())
+    }
+
+    // ── P3C §3.7：项目条与新建项目卡（u04–u08）────────────────────────────────
+
+    @Test
+    fun `u04 the new-project button opens the inline card`() {
+        val rig = rig(session("s1"))
+
+        composeRule.onNodeWithTag(SessionsTags.BUTTON_NEW_PROJECT).performClick()
+        pump()
+
+        composeRule.onNodeWithTag(SessionsTags.CARD_NEW_PROJECT).assertIsDisplayed()
+        composeRule.onNodeWithTag(SessionsTags.FIELD_PROJECT_NAME).assertIsDisplayed()
+    }
+
+    /** 第一道门：空白输入点不到「创建」。安全边界不在这（在 ProjectStore），这条只管手感。 */
+    @Test
+    fun `u05 the create button stays disabled while the name field is blank`() {
+        rig(session("s1"))
+        composeRule.onNodeWithTag(SessionsTags.BUTTON_NEW_PROJECT).performClick()
+        pump()
+
+        composeRule.onNodeWithTag(SessionsTags.BUTTON_PROJECT_CREATE).assertIsNotEnabled()
+
+        composeRule.onNodeWithTag(SessionsTags.FIELD_PROJECT_NAME).performTextInput("shop")
+        pump()
+        composeRule.onNodeWithTag(SessionsTags.BUTTON_PROJECT_CREATE).assertIsEnabled()
+    }
+
+    @Test
+    fun `u06 typing a name and creating reaches the view model and closes the card`() {
+        val rig = rig(session("s1"))
+        composeRule.onNodeWithTag(SessionsTags.BUTTON_NEW_PROJECT).performClick()
+        pump()
+        composeRule.onNodeWithTag(SessionsTags.FIELD_PROJECT_NAME).performTextInput("shop")
+        pump()
+
+        composeRule.onNodeWithTag(SessionsTags.BUTTON_PROJECT_CREATE).performClick()
+        pump()
+
+        assertEquals(listOf("shop" to true), rig.projects.created)
+        composeRule.onNodeWithTag(SessionsTags.CARD_NEW_PROJECT).assertIsNotDisplayed()
+    }
+
+    @Test
+    fun `u07 cancel closes the card without creating anything`() {
+        val rig = rig(session("s1"))
+        composeRule.onNodeWithTag(SessionsTags.BUTTON_NEW_PROJECT).performClick()
+        pump()
+        composeRule.onNodeWithTag(SessionsTags.FIELD_PROJECT_NAME).performTextInput("shop")
+        pump()
+
+        composeRule.onNodeWithTag(SessionsTags.BUTTON_PROJECT_CANCEL).performClick()
+        pump()
+
+        assertTrue("取消不该建目录", rig.projects.created.isEmpty())
+        composeRule.onNodeWithTag(SessionsTags.CARD_NEW_PROJECT).assertIsNotDisplayed()
+    }
+
+    /** 项目条必须早于会话列表被读到，且活动项要带「活动」标记（用户得知道新会话落哪儿）。 */
+    @Test
+    fun `u08 the project bar names the active project and lists the others as pickable`() {
+        val rig = rig(session("s1"))
+        rig.projects.names.addAll(listOf("alpha", "shop"))
+        rig.projects.activeValue = "shop"
+
+        rig.vm.refresh()
+        pump()
+
+        composeRule.onNodeWithTag(SessionsTags.LABEL_ACTIVE_PROJECT).assertIsDisplayed()
+        composeRule.onNodeWithText("${SessionsStrings.PROJECTS_TITLE}：shop").assertIsDisplayed()
+        composeRule.onNodeWithTag(SessionsTags.project("alpha")).assertIsDisplayed()
+        composeRule.onNodeWithTag(SessionsTags.project("shop")).assertIsNotEnabled()
     }
 }

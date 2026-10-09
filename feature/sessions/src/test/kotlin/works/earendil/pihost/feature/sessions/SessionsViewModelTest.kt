@@ -24,6 +24,10 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import works.earendil.pihost.core.engine.SessionState
+import works.earendil.pihost.core.engine.git.GitIdentity
+import works.earendil.pihost.core.engine.git.GitInitOutcome
+import works.earendil.pihost.core.engine.projects.ProjectOutcome
+import works.earendil.pihost.feature.sessions.ui.SessionsStrings
 import works.earendil.pihost.core.rpc.RpcCommand
 
 /**
@@ -46,6 +50,7 @@ class SessionsViewModelTest {
         val vm: SessionsViewModel,
         val scanner: FakeScanner,
         val engine: FakeEngine,
+        val projects: FakeProjectsSource,
     )
 
     private fun TestScope.rig(
@@ -54,7 +59,8 @@ class SessionsViewModelTest {
     ): Rig {
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         val app = RuntimeEnvironment.getApplication()
-        return Rig(SessionsViewModel(app, scanner, engine), scanner, engine)
+        val projects = FakeProjectsSource()
+        return Rig(SessionsViewModel(app, scanner, engine, projects), scanner, engine, projects)
     }
 
     private fun <T> TestScope.record(flow: StateFlow<T>): CopyOnWriteArrayList<T> {
@@ -256,5 +262,130 @@ class SessionsViewModelTest {
         assertEquals("刷新中→刷新完的两档都要被看见", listOf(false, true, false), flags)
         assertEquals("刷新不许清空列表（不闪白）", 1, (rig.vm.uiState.value as SessionsUiState.Content).sessions.size)
         assertEquals(2, rig.scanner.scanCalls.get())
+    }
+
+    // ── P3C §3.7：项目面（v13–v20）──────────────────────────────────────────────
+
+    @Test
+    fun `v13 createProject activates the new project and never sends an engine command`() = runTest {
+        val rig = rig()
+
+        rig.vm.createProject("shop", initGit = true)
+        runCurrent()
+
+        assertEquals(listOf("shop" to true), rig.projects.created)
+        assertEquals("建成即设为活动项目", listOf("shop"), rig.projects.activated)
+        assertTrue("sessions 屏不启动引擎（纪律 1）", rig.engine.sent.isEmpty())
+        assertEquals("shop", (rig.vm.uiState.value as SessionsUiState.Content).activeProject)
+    }
+
+    /** 三种 init 结局必须说三句不同的话——「用户没要」与「要了没成」混在一起就是在骗用户。 */
+    @Test
+    fun `v14 the notice differs for not-requested and failed git init`() = runTest {
+        val rig = rig()
+
+        rig.vm.createProject("plain", initGit = false)
+        runCurrent()
+        val plain = rig.vm.notice.value
+        assertTrue("没勾 git 就不该说有仓库：$plain", plain != null && plain.contains("未初始化 git"))
+
+        rig.projects.responder = { raw, _ ->
+            ProjectOutcome.Created(raw, GitInitOutcome.Failed("exit=128 nope"), GitIdentity.Outcome.Written)
+        }
+        rig.vm.createProject("half", initGit = true)
+        runCurrent()
+        val half = rig.vm.notice.value
+        assertTrue("失败原因要原样说得出：$half", half != null && half.contains("exit=128 nope"))
+        assertTrue("目录建成了就得设活动（这是既成事实）", rig.projects.activated.contains("half"))
+    }
+
+    @Test
+    fun `v15 an invalid name lands as a notice without touching the active project`() = runTest {
+        val rig = rig()
+        rig.projects.responder = { _, _ -> ProjectOutcome.Invalid("../../escape") }
+
+        rig.vm.createProject("../../escape", initGit = true)
+        runCurrent()
+
+        assertEquals("default", rig.projects.activeValue)
+        assertTrue(rig.projects.activated.isEmpty())
+        assertEquals(SessionsStrings.PROJECT_INVALID_NAME, rig.vm.notice.value)
+    }
+
+    @Test
+    fun `v16 duplicate and case-collided names each get their own wording`() = runTest {
+        val rig = rig()
+
+        rig.projects.responder = { _, _ -> ProjectOutcome.AlreadyExists("dup") }
+        rig.vm.createProject("dup", initGit = false)
+        runCurrent()
+        assertEquals("项目「dup」已存在", rig.vm.notice.value)
+
+        rig.projects.responder = { _, _ -> ProjectOutcome.CaseCollision("Foo", "foo") }
+        rig.vm.createProject("Foo", initGit = false)
+        runCurrent()
+        assertEquals("已有同名项目「foo」（只差大小写）", rig.vm.notice.value)
+    }
+
+    @Test
+    fun `v17 a throwing source is caught into a notice, not a crash`() = runTest {
+        val rig = rig()
+        rig.projects.boom = IllegalStateException("disk busy")
+
+        rig.vm.createProject("x", initGit = false)
+        runCurrent()
+
+        assertTrue("来源异常必须兜住并说给人话", rig.vm.notice.value!!.contains("disk busy"))
+    }
+
+    @Test
+    fun `v18 a listing failure still shows the session list and only blanks the project bar`() = runTest {
+        val rig = rig(scanner = FakeScanner(sessions("a", "b")))
+        rig.projects.boom = IllegalStateException("cannot read projects")
+
+        rig.vm.refresh()
+        runCurrent()
+
+        val content = rig.vm.uiState.value as SessionsUiState.Content
+        assertEquals(2, content.sessions.size)
+        assertEquals("列项目失败不炸整屏", emptyList<String>(), content.projects)
+        assertEquals("活动项回落 default", "default", content.activeProject)
+    }
+
+    /**
+     * 跨项目续用是**放行 + 告知**，不是拦（P3C 修正）。
+     * 拦它是错的：`switch_session` 只带 sessionPath，pi 会按会话记录的 cwd 重建服务，
+     * 工具本来就在正确目录里跑；要提的是「之后在这条进程里新建会话会落在当前活动项目」。
+     */
+    @Test
+    fun `v19 opening a foreign-project session sends switch_session and only notes the mismatch`() = runTest {
+        val engine = FakeEngine()
+        val foreign = session("f", path = "/files/home/.pi/agent/sessions/--p2--/f.jsonl", cwd = "/files/projects/other")
+        val rig = rig(scanner = FakeScanner(listOf(foreign)), engine = engine)
+        rig.projects.owners = mapOf(foreign.cwd to "other")
+        engine.setState(FakeEngine.SESSION, SessionState.Ready)
+
+        rig.vm.openSession(foreign)
+        runCurrent()
+
+        assertEquals("仍要真的发切换命令", 1, engine.sent.size)
+        assertEquals("告知之后照常导航", SessionNavRequest(FakeEngine.SESSION), rig.vm.navigation.value)
+        assertTrue("告知要说清两边名字", rig.vm.notice.value!!.contains("other") && rig.vm.notice.value!!.contains("default"))
+    }
+
+    /** 反面：同项目的会话不该被多塞一条提示（噪声会教用户忽略所有提示）。 */
+    @Test
+    fun `v20 opening a session of the active project stays silent`() = runTest {
+        val engine = FakeEngine()
+        val own = session("o", cwd = "/files/projects/default")
+        val rig = rig(scanner = FakeScanner(listOf(own)), engine = engine)
+        rig.projects.owners = mapOf(own.cwd to "default")
+        engine.setState(FakeEngine.SESSION, SessionState.Ready)
+
+        rig.vm.openSession(own)
+        runCurrent()
+
+        assertNull(rig.vm.notice.value)
+        assertEquals(1, engine.sent.size)
     }
 }

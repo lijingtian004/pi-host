@@ -12,6 +12,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.SessionState
+import works.earendil.pihost.core.engine.git.GitIdentity
+import works.earendil.pihost.core.engine.git.GitInitOutcome
+import works.earendil.pihost.core.engine.projects.ProjectOutcome
+import works.earendil.pihost.feature.sessions.ProjectsSource
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
 import works.earendil.pihost.core.rpc.PiEvent
 import works.earendil.pihost.core.rpc.RpcCommand
@@ -124,6 +128,71 @@ class FakeScanner(
         if (deleteResult) source.removeAll { it.sessionPath == sessionPath }
         return deleteResult
     }
+}
+
+
+/**
+ * 项目面假体（P3C §3.7）。
+ *
+ * 三条纪律照本模块 [FakeEngine] 与 `:feature:sessions` 的既有套路：**捕获而非轮询**
+ * （出站动作进 [created]/[activated] 供用例直接断言）、不切线程、
+ * [boom] 非空即让每个方法抛它（验「VM 兜住来源异常」那条分支）。
+ *
+ * [responder] 默认模拟**成功**：默认值替用例省掉每次手拼 `ProjectOutcome.Created(...)`，
+ * 而失败形状由用例自己换掉 responder，读起来就是「这条用例在测哪种结局」。
+ */
+/**
+ * 默认 `names` 取**空**而不是 `listOf("default")`：[SessionsUiState.Content.projects] 的字段默认值
+ * 就是空表，两者一致才能让「只关心会话、不关心项目」的旧用例继续用
+ * `Content(sessions(...))` 这种短写法比对（v09 就是其一）。
+ * 需要项目条的用例自己填 names，读起来也更直白。
+ */
+class FakeProjectsSource(initialNames: List<String> = emptyList()) : ProjectsSource {
+
+    val names = initialNames.toMutableList()
+    var activeValue: String = "default"
+
+    /** (原名, initGit) 的调用序列。 */
+    val created = ArrayList<Pair<String, Boolean>>()
+    val activated = ArrayList<String>()
+
+    var responder: (String, Boolean) -> ProjectOutcome = { raw, git ->
+        ProjectOutcome.Created(
+            name = raw.trim(),
+            git = if (git) GitInitOutcome.Initialized else GitInitOutcome.Skipped,
+            identity = if (git) GitIdentity.Outcome.Written else GitIdentity.Outcome.Skipped,
+        )
+    }
+
+    /** `projectOf` 的裁决表：cwd → 项目名。用例按条会话摆它的归属。 */
+    var owners: Map<String, String?> = emptyMap()
+    var boom: Throwable? = null
+
+    override suspend fun list(): List<String> {
+        boom?.let { throw it }
+        return names.sorted()
+    }
+
+    override suspend fun activeName(): String {
+        boom?.let { throw it }
+        return activeValue
+    }
+
+    override suspend fun create(rawName: String, initGit: Boolean): ProjectOutcome {
+        boom?.let { throw it }
+        created += rawName to initGit
+        val outcome = responder(rawName, initGit)
+        if (outcome is ProjectOutcome.Created && !names.contains(outcome.name)) names.add(outcome.name)
+        return outcome
+    }
+
+    override suspend fun setActive(name: String) {
+        boom?.let { throw it }
+        activated += name
+        activeValue = name
+    }
+
+    override fun projectOf(cwd: String?): String? = cwd?.let { owners[it] }
 }
 
 /** 造一行数据，省掉每条用例都手拼 8 个字段。 */

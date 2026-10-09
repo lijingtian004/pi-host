@@ -11,7 +11,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.SessionState
+import works.earendil.pihost.core.engine.git.GitInitOutcome
+import works.earendil.pihost.core.engine.projects.ProjectNames
+import works.earendil.pihost.core.engine.projects.ProjectOutcome
 import works.earendil.pihost.core.rpc.RpcCommand
+import works.earendil.pihost.feature.sessions.ui.SessionsStrings
 
 /** 会话列表屏的界面状态（规格书 §4.1）。 */
 sealed interface SessionsUiState {
@@ -26,6 +30,10 @@ sealed interface SessionsUiState {
     data class Content(
         val sessions: List<ScannedSession>,
         val refreshing: Boolean = false,
+        /** 现有项目名（字典序）。空表是合法形状：`projects/` 还没被建过。 */
+        val projects: List<String> = emptyList(),
+        /** 活动项目（新会话将落在它的目录里）。已经过形状清洗，永不为 null。 */
+        val activeProject: String = ProjectNames.DEFAULT_NAME,
     ) : SessionsUiState
 
     /** 扫描本身出错（假体抛异常 / 未来换成远端来源时的失败面）。 */
@@ -57,6 +65,7 @@ class SessionsViewModel @Inject constructor(
     app: Application,
     private val scanner: SessionScanner,
     private val engine: ChatEngine,
+    private val projects: ProjectsSource,
 ) : AndroidViewModel(app) {
 
     private val _uiState = MutableStateFlow<SessionsUiState>(SessionsUiState.Loading)
@@ -96,8 +105,12 @@ class SessionsViewModel @Inject constructor(
                 SessionsUiState.Loading
             }
             val outcome = runCatching { scanner.scan() }
+            // 项目面单独兜：列目录失败不该把整屏说成 Failure（会话列表还在，只是顶部项目条空着），
+            // 也不该让一次 fs 抖动把「你的历史会话」显示成「读不出来」。
+            val names = runCatching { projects.list() }.getOrDefault(emptyList())
+            val active = runCatching { projects.activeName() }.getOrDefault(ProjectNames.DEFAULT_NAME)
             outcome.fold(
-                onSuccess = { list -> _uiState.value = SessionsUiState.Content(list) },
+                onSuccess = { list -> _uiState.value = SessionsUiState.Content(list, projects = names, activeProject = active) },
                 onFailure = { t ->
                     _uiState.value = SessionsUiState.Failure((t.message ?: t::class.java.simpleName).take(200))
                 },
@@ -112,6 +125,16 @@ class SessionsViewModel @Inject constructor(
             _notice.value = NO_LIVE_SESSION
             _navigation.value = SessionNavRequest(null)
             return
+        }
+        // 跨项目续用**照常放行**，只提一句（P3C §3.7）。
+        // 为什么不必拦：`switch_session` 只传 sessionPath（`rpc-mode.ts:603`），
+        // pi 会按会话文件里记录的 cwd 重建自己的服务（`agent-session-runtime.ts:210-215`），
+        // 所以工具本来就在正确的项目目录里跑；要提的是另一件事——
+        // **之后**在这条进程里点「新建会话」，新会话落在当前活动项目，不是这条会话的项目。
+        val owner = projects.projectOf(session.cwd)
+        val current = (_uiState.value as? SessionsUiState.Content)?.activeProject
+        if (owner != null && current != null && owner != current) {
+            _notice.value = "这条会话属于项目 $owner，当前活动项目是 $current：继续可用，但新建会话会落在 $current"
         }
         viewModelScope.launch {
             val sent = runCatching { engine.send(id, RpcCommand.SwitchSession(session.sessionPath)) }
@@ -140,6 +163,55 @@ class SessionsViewModel @Inject constructor(
                 return@launch
             }
             _navigation.value = SessionNavRequest(id)
+        }
+    }
+
+    /**
+     * 新建项目（P3C §3.7）：`projects/<name>/` + 可选 `git init`。
+     *
+     * **建成即设为活动项目**：让用户「建完还要再点一次才能用」是多余的摩擦，
+     * 而这条路径上没有任何需要用户二次确认的破坏性动作（建目录是可撤销的、init 是幂等的）。
+     * 名字非法/重名一律只出 notice，**不动任何磁盘状态**（拒绝发生在 [ProjectStore.create] 里）。
+     */
+    fun createProject(rawName: String, initGit: Boolean) {
+        viewModelScope.launch {
+            val outcome = runCatching { projects.create(rawName, initGit) }
+            outcome.fold(
+                onFailure = { t -> _notice.value = "创建失败：${t.message ?: t::class.java.simpleName}" },
+                onSuccess = { result ->
+                    when (result) {
+                        is ProjectOutcome.Created -> {
+                            projects.setActive(result.name)
+                            _notice.value = createdNotice(result, initGit)
+                        }
+
+                        is ProjectOutcome.AlreadyExists -> _notice.value = "项目「${result.name}」已存在"
+                        is ProjectOutcome.CaseCollision ->
+                            _notice.value = "已有同名项目「${result.existing}」（只差大小写）"
+
+                        is ProjectOutcome.Invalid -> _notice.value = SessionsStrings.PROJECT_INVALID_NAME
+                        is ProjectOutcome.NotCreated -> _notice.value = "创建失败：${result.cause}"
+                    }
+                    refresh()
+                },
+            )
+        }
+    }
+
+    /** 三种 init 结局要说三句话：用户没要 / 要了没成 / 成了，混在一起就是在骗用户。 */
+    private fun createdNotice(created: ProjectOutcome.Created, initGit: Boolean): String = when {
+        !initGit -> "已创建项目 ${created.name}（未初始化 git）"
+        created.git is GitInitOutcome.Initialized -> "已创建项目 ${created.name}（git 仓库已建）"
+        created.git is GitInitOutcome.AlreadyARepo -> "已创建项目 ${created.name}（目录里本来就有仓库）"
+        else -> "已创建项目 ${created.name}，但 git init 没成：${(created.git as GitInitOutcome.Failed).cause}"
+    }
+
+    /** 切活动项目：只影响下一次 `engine.start()`，在跑的会话不受影响（见 [SessionSupervisor] 出生钉死）。 */
+    fun useProject(name: String) {
+        viewModelScope.launch {
+            projects.setActive(name)
+            _notice.value = "活动项目：$name（新会话落在它里面；在跑的会话不受影响）"
+            refresh()
         }
     }
 

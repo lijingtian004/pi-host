@@ -1,5 +1,6 @@
 package works.earendil.pihost.feature.chat.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,6 +14,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -22,6 +26,7 @@ import kotlinx.coroutines.delay
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.feature.chat.ChatUiState
 import works.earendil.pihost.feature.chat.ChatViewModel
+import works.earendil.pihost.feature.chat.QueueState
 
 /**
  * 聊天主界面（规格书 §6）。
@@ -43,7 +48,7 @@ fun ChatScreen(
     val uiState by viewModel.uiState.collectAsState()
     val turnState by viewModel.turnState.collectAsState()
     val transcript by viewModel.transcript.collectAsState()
-    val queueDepth by viewModel.queueDepth.collectAsState()
+    val queueState by viewModel.queueState.collectAsState()
     val permission by viewModel.permissionRequest.collectAsState()
     val engineStatus by viewModel.engineStatus.collectAsState()
     val retryNote by viewModel.retryNote.collectAsState()
@@ -51,6 +56,11 @@ fun ChatScreen(
 
     val ready = uiState is ChatUiState.Ready
     notificationGate(ready)
+
+    // §3.2：队列明细默认收起（徽标一行字就够顶栏用），点开才列条目。
+    // 它是**纯视图状态**，不进 VM——VM 一持有「展开与否」，转成后台再回来就会带着这份
+    // 用户没表达过的意图回来（与 InputBar 的草稿同一判据）。
+    var queueExpanded by remember { mutableStateOf(false) }
 
     // §4.3 的 snackbar 语义用「banner + 4s 自动收起」实现：Robolectric 下 SnackbarHost
     // 的浮层不参与语义树（onNodeWithText 拿不到），banner 是普通节点，可测且与设置页同形。
@@ -87,9 +97,14 @@ fun ChatScreen(
                     EngineTopBar(
                         sessionId = (uiState as ChatUiState.Ready).sessionId,
                         engineStatus = engineStatus,
-                        queueDepth = queueDepth,
+                        queueState = queueState,
+                        queueExpanded = queueExpanded,
+                        onQueueToggle = { queueExpanded = !queueExpanded },
                         retryNote = retryNote,
                     )
+                    if (queueExpanded && !queueState.isEmpty) {
+                        QueueDetails(queueState = queueState)
+                    }
                     TranscriptList(
                         items = transcript,
                         markwon = viewModel.markwon,
@@ -97,7 +112,11 @@ fun ChatScreen(
                     )
                     InputBar(
                         turnState = turnState,
+                        queueState = queueState,
                         onSend = viewModel::sendPrompt,
+                        onSteer = viewModel::steer,
+                        onFollowUp = viewModel::followUp,
+                        onClearQueue = viewModel::clearQueue,
                         onAbort = viewModel::abort,
                     )
                 }
@@ -121,7 +140,9 @@ fun ChatScreen(
 private fun EngineTopBar(
     sessionId: String,
     engineStatus: SessionState?,
-    queueDepth: Int,
+    queueState: QueueState,
+    queueExpanded: Boolean,
+    onQueueToggle: () -> Unit,
     retryNote: String?,
 ) {
     Row(
@@ -143,14 +164,46 @@ private fun EngineTopBar(
             retryNote?.let {
                 Text(text = it, style = MaterialTheme.typography.labelMedium, maxLines = 1)
             }
-            if (queueDepth > 0) {
+            if (!queueState.isEmpty) {
+                // 徽标本身就是开关：§3.2 要的「点开看内容片段」不给它另找一处入口，
+                // 否则用户要在屏幕上找一个「看不见但存在」的展开按钮。
                 Text(
-                    text = "$queueDepth queued",
+                    text = queueState.badgeText() + if (queueExpanded) " ▾" else " ▸",
                     style = MaterialTheme.typography.labelMedium,
-                    modifier = Modifier.testTag(ChatTags.QUEUE_BADGE),
+                    modifier = Modifier
+                        .testTag(ChatTags.QUEUE_BADGE)
+                        .clickable(onClick = onQueueToggle),
                 )
             }
         }
+    }
+}
+
+/**
+ * 队列明细（§3.2）：steering 在前、followUp 在后，逐条一行小字。
+ *
+ * 内容**原样**来自 `queue_update`（pi 把文本放进事件里了），这里只做「截到 60 字 + 前缀标列」，
+ * 不改写、不归纳——用户要确认的是「我那句到底排进去了没有」，任何加工都会让这件事变得不可信。
+ */
+@Composable
+private fun QueueDetails(queueState: QueueState) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .testTag(ChatTags.QUEUE_DETAILS),
+    ) {
+        (queueState.steering.map { "插话 ▸ $it" to true } + queueState.followUp.map { "追问 ▸ $it" to false })
+            .forEachIndexed { index, (line, isSteering) ->
+                Text(
+                    text = line.take(60),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isSteering) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.testTag(ChatTags.queueItem(index)),
+                )
+            }
     }
 }
 

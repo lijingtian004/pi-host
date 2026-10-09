@@ -17,9 +17,17 @@ object ChatTags {
     const val TOP_BAR = "chat-top-bar"
     const val ENGINE_STATUS = "chat-engine-status"
     const val QUEUE_BADGE = "chat-queue-badge"
+
+    /** §3.2：点徽标展开的队列明细（steering 在前、followUp 在后，逐条一个 tag）。 */
+    const val QUEUE_DETAILS = "chat-queue-details"
+    const val QUEUE_ITEM_PREFIX = "chat-queue-item"
     const val TRANSCRIPT = "chat-transcript"
     const val INPUT = "chat-input"
     const val SEND = "chat-send"
+
+    /** §3.2：流式期间的主按钮换文案（「发送」↔「插入」）但**不换 tag**——tag 定位点击，文案定位档位。 */
+    const val FOLLOW_UP = "chat-follow-up"
+    const val CLEAR_QUEUE = "chat-clear-queue"
     const val ABORT = "chat-abort"
     const val PERMISSION_DIALOG = "chat-permission-dialog"
     const val PERMISSION_ALLOW_ONCE = "chat-allow-once"
@@ -44,6 +52,8 @@ object ChatTags {
     fun thinking(id: Int) = "$ASSISTANT_PREFIX-$id-thinking"
     fun markdown(id: Int) = "$ASSISTANT_PREFIX-$id$MARKDOWN_SUFFIX"
     fun note(id: Int) = "$NOTE_PREFIX-$id"
+    fun queueItem(index: Int) = "$QUEUE_ITEM_PREFIX-$index"
+
     fun tool(callId: String) = "$TOOL_PREFIX-$callId"
     fun toolOutput(callId: String) = "$TOOL_PREFIX-$callId$TOOL_OUTPUT_SUFFIX"
 }

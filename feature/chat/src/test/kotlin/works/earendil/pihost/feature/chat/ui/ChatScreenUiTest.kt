@@ -38,6 +38,7 @@ import works.earendil.pihost.feature.chat.ChatUiState
 import works.earendil.pihost.feature.chat.ChatViewModel
 import works.earendil.pihost.feature.chat.FakeChatEngine
 import works.earendil.pihost.feature.chat.FakeRuntimeInstall
+import works.earendil.pihost.feature.chat.QueueState
 import works.earendil.pihost.feature.chat.FakeSettingsRepository
 import works.earendil.pihost.feature.chat.ToolCallRecord
 import works.earendil.pihost.feature.chat.ToolStatus
@@ -123,10 +124,12 @@ class ChatScreenUiTest {
         // 会把 placeholder 一起聚合进来，实测拿到「给 pi 发一条消息」，不是本节点的 value）
         composeRule.onNodeWithTag(ChatTags.SEND).assertIsNotEnabled()
 
+        // §3.2 改的就是这一档：流式期间输入框**不再锁死**，主按钮换成「插入」走 steer。
         turn = TurnState.Streaming
         composeRule.waitForIdle()
-        composeRule.onNodeWithTag(ChatTags.INPUT).assertIsNotEnabled()
+        composeRule.onNodeWithTag(ChatTags.INPUT).assertIsEnabled()
         composeRule.onNodeWithTag(ChatTags.ABORT).assertIsEnabled()
+        composeRule.onNodeWithText(PLACEHOLDER_STREAMING).assertExists()
 
         turn = TurnState.PermissionPending
         composeRule.waitForIdle()
@@ -268,11 +271,95 @@ class ChatScreenUiTest {
         engine.emit(PiEvent.QueueUpdate(steering = listOf("a"), followUp = listOf("b")))
         composeRule.waitForIdle()
         composeRule.onNodeWithTag(ChatTags.QUEUE_BADGE).assertIsDisplayed()
-        composeRule.onNodeWithText("2 queued").assertIsDisplayed()
+        composeRule.onNodeWithText(QueueState(listOf("a"), listOf("b")).badgeText() + " ▸").assertIsDisplayed()
 
         engine.setState(SessionState.Restarting(attempt = 3, backoffMs = 16_000L))
         composeRule.waitForIdle()
         composeRule.onNodeWithTag(ChatTags.ENGINE_STATUS).assertTextEquals("重启第 3 次")
+    }
+
+    // ── ⑤b §3.2 流式插话的两颗按钮与徽标展开 ─────────────────────────────────────
+
+    @Test
+    fun streamingInputRoutesToSteerAndFollowUpAndTheBadgeExpands() {
+        val steered = CopyOnWriteArrayList<String>()
+        val followed = CopyOnWriteArrayList<String>()
+        var turn by mutableStateOf(TurnState.Streaming)
+        var queue by mutableStateOf(QueueState.EMPTY)
+        var clears by mutableIntStateOf(0)
+        composeRule.setContent {
+            PiHostTheme {
+                InputBar(
+                    turnState = turn,
+                    queueState = queue,
+                    onSend = { error("流式期间不该走 send") },
+                    onSteer = { steered.add(it) },
+                    onFollowUp = { followed.add(it) },
+                    onClearQueue = { clears++ },
+                    onAbort = {},
+                )
+            }
+        }
+
+        // 「清空」只在队列非空时出现
+        composeRule.onNodeWithTag(ChatTags.CLEAR_QUEUE).assertDoesNotExist()
+        queue = QueueState(listOf("插一句"), listOf("等这轮完"))
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.CLEAR_QUEUE).assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.CLEAR_QUEUE).performClick()
+        assertEquals(1, clears)
+
+        // 主按钮在流式档的文案是「插入」，点击路由到 steer（不是 send）；
+        // 「追问」同步在场，但两个按钮都受「空草稿不发」这一条管着。
+        composeRule.onNodeWithText("插入").assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.FOLLOW_UP).assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.FOLLOW_UP).assertIsNotEnabled()
+        composeRule.onNodeWithTag(ChatTags.INPUT).performTextInput("慢着，别动 main")
+        composeRule.onNodeWithTag(ChatTags.SEND).performClick()
+        assertEquals(listOf("慢着，别动 main"), steered.toList())
+
+        // 「追问」与「插入」共用同一格输入框，但落到不同的队列；
+        // steer 之后草稿已清空 → 这里再打字，追问键重新点亮
+        composeRule.onNodeWithTag(ChatTags.FOLLOW_UP).assertIsNotEnabled()
+        composeRule.onNodeWithTag(ChatTags.INPUT).performTextInput("这轮完了再看覆盖率")
+        composeRule.onNodeWithTag(ChatTags.FOLLOW_UP).assertIsEnabled()
+        composeRule.onNodeWithTag(ChatTags.FOLLOW_UP).performClick()
+        assertEquals(listOf("这轮完了再看覆盖率"), followed.toList())
+
+        // 回到 Idle：主按钮换回「发送」，追问键收起（避免两条几乎一样的路）
+        turn = TurnState.Idle
+        queue = QueueState.EMPTY
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("发送").assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.FOLLOW_UP).assertDoesNotExist()
+        composeRule.onNodeWithTag(ChatTags.CLEAR_QUEUE).assertDoesNotExist()
+    }
+
+    @Test
+    fun tappingTheQueueBadgeRevealsTheQueuedSnippetsInOrder() {
+        showReadyScreen()
+        engine.emit(PiEvent.QueueUpdate(steering = listOf("改成跑 test"), followUp = listOf("再看覆盖率")))
+        composeRule.waitForIdle()
+
+        // 默认收起：徽标在、明细不在
+        composeRule.onNodeWithTag(ChatTags.QUEUE_BADGE).assertIsDisplayed()
+        composeRule.onNodeWithTag(ChatTags.QUEUE_DETAILS).assertDoesNotExist()
+
+        composeRule.onNodeWithTag(ChatTags.QUEUE_BADGE).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.QUEUE_DETAILS).assertIsDisplayed()
+        // steering 在前、followUp 在后（两列的生效时机不同，顺序就是语义）
+        composeRule.onNodeWithTag(ChatTags.queueItem(0)).assertTextEquals("插话 ▸ 改成跑 test")
+        composeRule.onNodeWithTag(ChatTags.queueItem(1)).assertTextEquals("追问 ▸ 再看覆盖率")
+
+        // 队列空了：明细整块消失，不留一行空壳
+        composeRule.onNodeWithTag(ChatTags.QUEUE_BADGE).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.QUEUE_DETAILS).assertDoesNotExist()
+
+        engine.emit(PiEvent.QueueUpdate(steering = emptyList(), followUp = emptyList()))
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag(ChatTags.QUEUE_BADGE).assertDoesNotExist()
     }
 
     // ── ⑥ 并行上限门的 UI 反馈（§4.3：提示 + 不 spawn + 放宽后可重试）─────────────
@@ -307,6 +394,9 @@ class ChatScreenUiTest {
 
     private companion object {
         const val PLACEHOLDER_PENDING = "等待权限确认…"
+
+        /** §3.2：流式档的占位文案——输入框可用了，提示语也必须换成「能做事」的口吻。 */
+        const val PLACEHOLDER_STREAMING = "插一句，或排队追问"
 
         fun uiRequest(id: String, method: String): PiEvent.ExtensionUiRequest =
             PiEvent.ExtensionUiRequest(

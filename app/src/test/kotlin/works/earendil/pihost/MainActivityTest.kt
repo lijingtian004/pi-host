@@ -365,7 +365,9 @@ class MainActivityTest {
         assertEquals(RpcCommand.Prompt(message = "跑一下分支命令"), engine.sent.last().command)
         assertEquals("ui-1", engine.sent.last().id)
         composeRule.onNodeWithText("跑一下分支命令").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag(ChatTags.INPUT).assertIsNotEnabled()
+        // §3.2：流式期间输入框不再锁死（插话/追问的入口），锁的是「发送」语义而不是输入能力
+        composeRule.onNodeWithTag(ChatTags.INPUT).assertIsEnabled()
+        composeRule.onNodeWithText("插入").assertIsDisplayed()
 
         engine.emit(PiEvent.MessageStart(PiMessage(role = "assistant", content = JsonArray(emptyList()))))
         engine.emit(update(AssistantMessageEvent.TextDelta(0, "好的")))
@@ -464,7 +466,7 @@ class MainActivityTest {
         engine.emit(PiEvent.QueueUpdate(steering = listOf("a"), followUp = listOf("b", "c")))
         pump()
         composeRule.onNodeWithTag(ChatTags.QUEUE_BADGE).assertIsDisplayed()
-        composeRule.onNodeWithText("3 queued").assertIsDisplayed()
+        composeRule.onNodeWithText("排队中: steer×1 followUp×2 ▸").assertIsDisplayed()
     }
 
     private companion object {

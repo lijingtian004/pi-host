@@ -16,6 +16,7 @@ import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -532,15 +533,15 @@ class ChatViewModelTest {
     fun `case11 queue depth badge follows queue_update and engine status follows sessionStates`() = runTest {
         val rig = rig()
         val sessionId = ready(rig)
-        assertEquals(0, rig.vm.queueDepth.value)
+        assertEquals(0, rig.vm.queueState.value.depth)
         assertEquals(SessionState.Ready, rig.vm.engineStatus.value)
 
         rig.engine.emit(PiEvent.QueueUpdate(steering = listOf("a", "b"), followUp = listOf("c")))
         runCurrent()
-        assertEquals("queueDepth = steering + followUp", 3, rig.vm.queueDepth.value)
+        assertEquals("depth = steering + followUp", 3, rig.vm.queueState.value.depth)
         rig.engine.emit(PiEvent.QueueUpdate(steering = emptyList(), followUp = emptyList()))
         runCurrent()
-        assertEquals(0, rig.vm.queueDepth.value)
+        assertEquals(0, rig.vm.queueState.value.depth)
 
         rig.engine.setState(SessionState.Restarting(attempt = 2, backoffMs = 4_000L))
         runCurrent()
@@ -861,7 +862,7 @@ class ChatViewModelTest {
         assertTrue("占位必须是 NoteItem，实为 $note", note is TranscriptItem.NoteItem)
         assertEquals(SWITCHING_NOTE_TEXT, (note as TranscriptItem.NoteItem).text)
         assertEquals(TurnState.Idle, rig.vm.turnState.value)
-        assertEquals(0, rig.vm.queueDepth.value)
+        assertEquals(0, rig.vm.queueState.value.depth)
         assertNull(rig.vm.commandResult.value)
         assertNull("成功路径不该留提示", rig.vm.notice.value)
 
@@ -1384,6 +1385,215 @@ class ChatViewModelTest {
         )
         runCurrent()
         assertEquals(listOf("这一条才是当前的"), rig.vm.transcript.value.filterIsInstance<TranscriptItem.UserItem>().map { it.text })
+    }
+
+    // ── 用例 40–48：P3B §3.2 流式插话（steer / follow_up / 队列可视化）─────────────
+
+    /**
+     * 插话的出站形状 + 三条「不许做」：不改 turnState、不上用户气泡、不占切换闩。
+     *
+     * 这一条同时钉住 §2 红线 8 的实现边界：VM 里只有「把用户打好的字发出去」这一个动作，
+     * 没有任何一处看到事件就自动 steer 的路径。
+     */
+    @Test
+    fun `case40 steer sends the user text verbatim and leaves the turn state alone`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.vm.sendPrompt("先跑个构建")
+        runCurrent()
+        assertEquals(TurnState.Streaming, rig.vm.turnState.value)
+        val before = rig.vm.transcript.value
+
+        rig.vm.steer("改成跑 test 就行")
+        runCurrent()
+
+        assertEquals(
+            "插话必须带用户原话，一个字都不许改",
+            RpcCommand.Steer("改成跑 test 就行"),
+            rig.engine.sent.last().command,
+        )
+        assertEquals("插话不新开 turnState 档", TurnState.Streaming, rig.vm.turnState.value)
+        assertEquals("插话不上用户气泡（内容归 queue_update 说）", before, rig.vm.transcript.value)
+        assertEquals("插话恰好一条", 1, rig.engine.sent.count { it.command is RpcCommand.Steer })
+    }
+
+    @Test
+    fun `case41 followUp targets the follow_up queue`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        rig.vm.followUp("这轮完了再看覆盖率")
+        runCurrent()
+
+        assertEquals(RpcCommand.FollowUp("这轮完了再看覆盖率"), rig.engine.sent.last().command)
+        assertEquals("追问也不是新问题：turnState 停在 Idle", TurnState.Idle, rig.vm.turnState.value)
+        assertTrue(rig.vm.transcript.value.isEmpty())
+    }
+
+    @Test
+    fun `case42 blank interjections are dropped and an unready engine says why`() = runTest {
+        // ① 未 Ready：只给提示，一条都不发
+        val cold = rig()
+        cold.vm.steer("引擎还没起来")
+        cold.vm.followUp("同上")
+        runCurrent()
+        assertEquals("未就绪不许碰线路", 0, cold.engine.sent.size)
+        assertTrue(
+            "两次失败只留最后一条提示，但必须说清是同一个原因：${cold.vm.notice.value}",
+            cold.vm.notice.value?.contains("引擎尚未就绪") == true,
+        )
+
+        // ② Ready 之后空文本：静不吃（与 sendPrompt 的 isBlank 同一判据）
+        val rig = rig()
+        ready(rig)
+        rig.vm.steer("   ")
+        rig.vm.followUp("")
+        runCurrent()
+        assertEquals("空白插话一条都不许发", 0, rig.engine.sent.size)
+        assertNull("空白不是故障，不该留提示", rig.vm.notice.value)
+    }
+
+    /**
+     * `queue_update` → [QueueState]：两列各表各的，且**整表替换**。
+     *
+     * 钉「整表替换」的理由：pi 每次入队都发全量（protocol.md §4.1「内容=当前队列」），
+     * 本地做增量的话，一条漏收的事件就会让徽标永久漂着一条不存在的内容。
+     */
+    @Test
+    fun `case43 queue_update fills both columns and replaces them wholesale`() = runTest {
+        val rig = rig()
+        ready(rig)
+        assertEquals(QueueState.EMPTY, rig.vm.queueState.value)
+
+        rig.engine.emit(PiEvent.QueueUpdate(steering = listOf("改成跑 test", "别碰 main"), followUp = listOf("再看覆盖率")))
+        runCurrent()
+        val first = rig.vm.queueState.value
+        assertEquals(listOf("改成跑 test", "别碰 main"), first.steering)
+        assertEquals(listOf("再看覆盖率"), first.followUp)
+        assertEquals("深度是派生值，不是第二个真相源", 3, first.depth)
+
+        rig.engine.emit(PiEvent.QueueUpdate(steering = emptyList(), followUp = emptyList()))
+        runCurrent()
+        assertEquals("队列空了要整表换掉，不留上一条的残影", QueueState.EMPTY, rig.vm.queueState.value)
+    }
+
+    /**
+     * `clear_queue` 只发命令；队列面貌仍然只由 `queue_update` 决定。
+     *
+     * 这一条钉的是「不许拿回执当队列真相」：`clear_queue` 的 response 是
+     * `{steering:[],followUp:[]}`（§3.2：返回**清空后**剩余，可能已被消费），
+     * 把它直接当队列写进状态，就会与紧随其后的 queue_update 撞上——
+     * 两条都「对」，但界面上会出现一次闪烁的错值。
+     */
+    @Test
+    fun `case44 clearQueue sends the command and lets queue_update own the picture`() = runTest {
+        val engine = FakeChatEngine().scriptReply(
+            "clear_queue",
+            data = buildJsonObject {
+                put("steering", JsonArray(emptyList()))
+                put("followUp", JsonArray(emptyList()))
+            },
+        )
+        val rig = rig(engine = engine)
+        ready(rig)
+        rig.engine.emit(PiEvent.QueueUpdate(steering = listOf("a"), followUp = listOf("b", "c")))
+        runCurrent()
+
+        rig.vm.clearQueue()
+        pumpScripted(rig)
+
+        assertEquals(RpcCommand.ClearQueue, rig.engine.sent.last().command)
+        assertEquals(
+            "回执不改队列状态：还是 queue_update 那三条",
+            QueueState(listOf("a"), listOf("b", "c")),
+            rig.vm.queueState.value,
+        )
+        assertNotNull("回执仍然进 commandResult（探针面板看得见）", rig.vm.commandResult.value)
+        assertEquals("clear_queue", rig.vm.commandResult.value!!.command)
+
+        rig.engine.emit(PiEvent.QueueUpdate(steering = emptyList(), followUp = emptyList()))
+        runCurrent()
+        assertEquals("pi 说空了才真空", QueueState.EMPTY, rig.vm.queueState.value)
+    }
+
+    @Test
+    fun `case45 both mode switches carry the frozen wire values`() = runTest {
+        val rig = rig()
+        ready(rig)
+
+        rig.vm.setSteeringMode(MODE_ALL)
+        rig.vm.setFollowUpMode(MODE_ONE_AT_A_TIME)
+        runCurrent()
+
+        assertEquals(
+            listOf(RpcCommand.SetSteeringMode("all"), RpcCommand.SetFollowUpMode("one-at-a-time")),
+            rig.engine.sent.map { it.command },
+        )
+    }
+
+    /**
+     * 插话与正在流式的那一条**互不打扰**：steer 之后 delta 照常往同一个气泡里续。
+     *
+     * 这是 §3.2 最贴近真机使用的一条动作：构建跑到一半看到方向错了，插一句之后
+     * 屏幕上那半截回答不能消失、不能重复、不能被换成队列内容。
+     */
+    @Test
+    fun `case46 steering does not disturb the assistant that is still streaming`() = runTest {
+        val engine = FakeChatEngine().scriptReply("steer", data = buildJsonObject { put("disposition", "queued") })
+        val rig = rig(engine = engine)
+        ready(rig)
+        rig.vm.sendPrompt("跑长任务")
+        runCurrent()
+        engine.emit(update(AssistantMessageEvent.TextStart(0)))
+        engine.emit(update(AssistantMessageEvent.TextDelta(0, "已经跑了一半")))
+        runCurrent()
+
+        rig.vm.steer("慢着，别动 main")
+        pumpScripted(rig)
+        engine.emit(update(AssistantMessageEvent.TextDelta(0, "，接着流")))
+        advanceTimeBy(DELTA_DEBOUNCE_MS + 10)
+        runCurrent()
+
+        assertEquals("已经跑了一半，接着流", rig.assistant().text)
+        assertEquals(TurnState.Streaming, rig.vm.turnState.value)
+        assertEquals(
+            "disposition 回执只进 commandResult，不上转录",
+            "queued",
+            (rig.vm.commandResult.value?.data?.get("disposition") as? JsonPrimitive)?.content,
+        )
+        assertTrue(
+            "插话内容不冒充用户气泡",
+            rig.vm.transcript.value.none { it is TranscriptItem.UserItem && it.text == "慢着，别动 main" },
+        )
+    }
+
+    @Test
+    fun `case47 a session roll empties the queue view`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.emit(PiEvent.QueueUpdate(steering = listOf("留在旧会话的插话"), followUp = emptyList()))
+        runCurrent()
+        assertEquals(1, rig.vm.queueState.value.depth)
+
+        rig.vm.onExternalSessionRoll()
+        runCurrent()
+        assertEquals("队列属于上一条会话，清场必须一起清", QueueState.EMPTY, rig.vm.queueState.value)
+    }
+
+    @Test
+    fun `case48 a steering send failure surfaces as a failed command result`() = runTest {
+        val rig = rig()
+        ready(rig)
+        rig.engine.sendError = IllegalStateException("没有活动的 pi 进程")
+
+        rig.vm.steer("插不进去了")
+        runCurrent()
+
+        val failure = rig.vm.commandResult.value
+        assertNotNull("发送失败必须看得见", failure)
+        assertFalse(failure!!.success)
+        assertEquals("线名要对得上（探针面板按它归类）", "steer", failure.command)
+        assertEquals("失败不许把队列写出内容", QueueState.EMPTY, rig.vm.queueState.value)
     }
 
     private companion object {

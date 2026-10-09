@@ -18,6 +18,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.InstallProgress
 import works.earendil.pihost.core.engine.InstalledRuntime
@@ -102,10 +104,15 @@ class ChatViewModel @Inject constructor(
     private val _transcript = MutableStateFlow<List<TranscriptItem>>(emptyList())
     val transcript: StateFlow<List<TranscriptItem>> = _transcript.asStateFlow()
 
-    private val _queueDepth = MutableStateFlow(0)
+    private val _queueState = MutableStateFlow(QueueState.EMPTY)
 
-    /** `queue_update` 的 steering+followUp 合计（§6 队列徽标）。 */
-    val queueDepth: StateFlow<Int> = _queueDepth.asStateFlow()
+    /**
+     * 两列队列快照（§3.2）。取代 P2C 起的 `queueDepth: Int`：
+     * 一个数字说不出「哪条插到当前轮、哪条要等整轮结束」，而 InputBar 在流式期间
+     * 必须让用户看清自己排了什么才敢按「清空队列」。深度现在是它的派生值
+     * （[QueueState.depth]），顶栏与列表页因此不可能显示两个不同的数。
+     */
+    val queueState: StateFlow<QueueState> = _queueState.asStateFlow()
 
     private val _permissionRequest = MutableStateFlow<PendingPermission?>(null)
     val permissionRequest: StateFlow<PendingPermission?> = _permissionRequest.asStateFlow()
@@ -317,6 +324,84 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    // ── 流式插话（P3B §3.2）───────────────────────────────────────────────────────
+
+    /**
+     * 插话：把用户**原话**塞进 steering 队列（在当前这一轮的下一个工具边界生效）。
+     *
+     * 与 [sendPrompt] 的三点差别：
+     * 1. **不改 turnState、不挂用户气泡**——这一轮还在流式，插话不是新问题；
+     *    它的内容由 pi 在紧随其后的 `queue_update` 里回显，那时才上徽标（§3.2 的「不做乐观更新」）；
+     * 2. **不占 [switching] 闩、也不受它限制**：插话是「这一轮内部」的动作，会话没滚；
+     * 3. 空文本不吃（与 sendPrompt 同一条 `isBlank` 判据），否则队列里多一条用户看不见的空指令。
+     *
+     * **§2 红线 8**：本函数只做「把用户打好的字发出去」这一件事。全类没有任何
+     * 「看到某事件就自动 steer」的路径——自动插话等于 App 替用户决定说什么。
+     */
+    fun steer(text: String) = enqueue(RpcCommand.Steer(text), text, "插话", "steer")
+
+    /** 追问：把用户原话塞进 followUp 队列（整轮结束之后才消费）。其余语义同 [steer]。 */
+    fun followUp(text: String) = enqueue(RpcCommand.FollowUp(text), text, "追问", "follow_up")
+
+    /**
+     * 清空队列（`clear_queue`）。回执 `{steering:[],followUp:[]}` 是**清空后**的剩余
+     * （protocol.md §3.2：可能已被消费），所以这里不拿回执做任何「撤销/退回」——
+     * 队列的最终面貌只由 [PiEvent.QueueUpdate] 决定，与 [steer] 同一条判据。
+     */
+    fun clearQueue() {
+        val id = sessionId ?: return
+        viewModelScope.launch(Dispatchers.Unconfined) {
+            val requestId = nextCommandId()
+            pendingCommandIds.add(requestId)
+            val sent = runCatching { engine.send(id, RpcCommand.ClearQueue, requestId) }
+            if (sent.isFailure) {
+                pendingCommandIds -= requestId
+                _commandResult.value = failureAsResponse("clear_queue", sent.exceptionOrNull()?.message)
+            }
+        }
+    }
+
+    /**
+     * steering 队列的消费模式（`set_steering_mode`）。取值只露 [MODE_ALL] / [MODE_ONE_AT_A_TIME]
+     * 两个常量给 UI；传别的不在这里拦（pi 会回 success=false，交给 commandResult 显示）。
+     */
+    fun setSteeringMode(mode: String) = sendMode(RpcCommand.SetSteeringMode(mode), "steering 模式", "set_steering_mode")
+
+    /** 见 [setSteeringMode]，作用于 follow-up 队列（`set_follow_up_mode`）。 */
+    fun setFollowUpMode(mode: String) = sendMode(RpcCommand.SetFollowUpMode(mode), "follow-up 模式", "set_follow_up_mode")
+
+    /** steer / follow_up 的共用出站：不碰 turnState、不碰 transcript，只发一条命令。 */
+    private fun enqueue(command: RpcCommand, text: String, label: String, wireName: String) {
+        val id = sessionId
+        if (id == null) {
+            _notice.value = "${label}失败：引擎尚未就绪"
+            return
+        }
+        if (text.isBlank()) return
+        viewModelScope.launch(Dispatchers.Unconfined) {
+            val requestId = nextCommandId()
+            pendingCommandIds.add(requestId)
+            val sent = runCatching { engine.send(id, command, requestId) }
+            if (sent.isFailure) {
+                pendingCommandIds -= requestId
+                _commandResult.value = failureAsResponse(wireName, sent.exceptionOrNull()?.message)
+            }
+        }
+    }
+
+    private fun sendMode(command: RpcCommand, label: String, wireName: String) {
+        val id = sessionId ?: return
+        viewModelScope.launch(Dispatchers.Unconfined) {
+            val requestId = nextCommandId()
+            pendingCommandIds.add(requestId)
+            val sent = runCatching { engine.send(id, command, requestId) }
+            if (sent.isFailure) {
+                pendingCommandIds -= requestId
+                _commandResult.value = failureAsResponse(wireName, sent.exceptionOrNull()?.message)
+            }
+        }
+    }
+
     /** 中止当前轮（Idle 时按钮本就禁用，这里再兜一层）。 */
     fun abort() {
         val id = sessionId ?: return
@@ -453,7 +538,7 @@ class ChatViewModel @Inject constructor(
         cancelPermissionOnce() // 挂着的权限弹框随旧会话一起作废（补 cancelled 恰好一次）
         flushDraft()
         _turnState.value = TurnState.Idle
-        _queueDepth.value = 0
+        _queueState.value = QueueState.EMPTY
         _commandResult.value = null
         _retryNote.value = null
         showLoadingNote()
@@ -729,7 +814,11 @@ class ChatViewModel @Inject constructor(
                 if (_turnState.value != TurnState.PermissionPending) _turnState.value = TurnState.Idle
             }
 
-            is PiEvent.QueueUpdate -> _queueDepth.value = event.steering.size + event.followUp.size
+            is PiEvent.QueueUpdate -> {
+                // §3.2：整表替换，不做增量合并——pi 说「内容=当前队列」，
+                // 本地任何「+1」式的猜测都会在下一条事件上错得更难查。
+                _queueState.value = QueueState.of(event)
+            }
 
             is PiEvent.ExtensionUiRequest -> onPermissionRequest(event)
 
@@ -875,6 +964,14 @@ class ChatViewModel @Inject constructor(
         val id = event.id ?: return
         if (id !in pendingCommandIds) return
         pendingCommandIds -= id
+        // §3.2：steer/follow_up 的回执是 `{disposition:"queued"}`，协议不要求任何 UI 动作
+        // （队列的真相只由 queue_update 说），但必须留一条 logcat——用户按了「插入」而徽标
+        // 半天不动时，这是唯一能分清「pi 没收到」还是「pi 收了没回队列」的地方。
+        if (event.command == "steer" || event.command == "follow_up") {
+            Log.i(QUEUE_LOG_TAG, "${event.command} 已入队：disposition=" +
+                "${(event.data?.get("disposition") as? JsonPrimitive)?.contentOrNull ?: "无"} " +
+                "success=${event.success}")
+        }
         // §3.1：回填那条走专属通道（历史落进 transcript），但它仍然是 VM 自己发的命令，
         // 所以 commandResult 也照记——探针面板看到的形状对所有命令保持一致。
         if (id == backfillRequestId) {
@@ -1028,6 +1125,9 @@ class ChatViewModel @Inject constructor(
 
         /** 回填失败的日志 tag（§3.1：提示上屏之外还要留一条可查的现场）。 */
         const val BACKFILL_LOG_TAG = "PiHost/ChatHistory"
+
+        /** §3.2：steer/follow_up 回执的唯一可见面（无 UI 动作，但必须可查）。 */
+        const val QUEUE_LOG_TAG = "PiHost/Queue"
     }
 }
 

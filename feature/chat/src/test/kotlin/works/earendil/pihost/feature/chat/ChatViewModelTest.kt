@@ -32,6 +32,11 @@ import org.robolectric.annotation.Config
 import works.earendil.pihost.core.engine.InstallProgress
 import works.earendil.pihost.core.engine.PiEngineService
 import works.earendil.pihost.core.engine.SessionState
+import works.earendil.pihost.core.engine.audit.AuditEntry
+import works.earendil.pihost.core.engine.audit.AuditKind
+import works.earendil.pihost.core.engine.audit.AuditSink
+import works.earendil.pihost.core.engine.audit.FileAuditSink
+import works.earendil.pihost.core.engine.audit.NoopAuditSink
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.rpc.AssistantMessageEvent
 import works.earendil.pihost.core.rpc.PiEvent
@@ -69,12 +74,15 @@ class ChatViewModelTest {
         val engine: FakeChatEngine,
         val installer: FakeRuntimeInstall,
         val settings: FakeSettingsRepository,
+        /** P3A §3.2：审计假体（默认 [NoopAuditSink] = 既有用例一字不改）。 */
+        val audit: AuditSink,
     )
 
     private fun TestScope.rig(
         engine: FakeChatEngine = FakeChatEngine(),
         installer: FakeRuntimeInstall = FakeRuntimeInstall(),
         settings: FakeSettingsRepository = FakeSettingsRepository(),
+        audit: AuditSink = NoopAuditSink,
     ): Rig {
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         val app = RuntimeEnvironment.getApplication()
@@ -82,10 +90,11 @@ class ChatViewModelTest {
         // 但构造点必须与 production 一致，否则「渲染层换实现」这类回归在这里测不出来。
         return Rig(
             app,
-            ChatViewModel(app, engine, installer, settings, buildMarkwon(app)),
+            ChatViewModel(app, engine, installer, settings, buildMarkwon(app), audit),
             engine,
             installer,
             settings,
+            audit,
         )
     }
 
@@ -886,6 +895,243 @@ class ChatViewModelTest {
         runCurrent()
         val untouched = second.vm.uiState.value as ChatUiState.Failed
         assertFalse("无 errno 不得追加提示：${untouched.cause}", untouched.cause.contains("errno"))
+    }
+
+    // ── 用例 24–31：P3A §3.2 审计三挂点 ────────────────────────────────────────
+
+    @Test
+    fun `case24 tool start writes one entry with args verbatim and the engine working dir`() = runTest {
+        val audit = FakeAuditSink()
+        val rig = rig(audit = audit)
+        val session = ready(rig)
+
+        rig.engine.emit(
+            PiEvent.ToolExecutionStart(
+                toolCallId = "call-9",
+                toolName = "bash",
+                args = buildJsonObject {
+                    put("command", "git status --porcelain")
+                    put("timeout", 30)
+                },
+            ),
+        )
+        runCurrent()
+
+        val entry = audit.entries.single()
+        assertEquals(AuditKind.TOOL_START, entry.kind)
+        assertEquals("call-9", entry.toolCallId)
+        assertEquals("bash", entry.toolName)
+        // 「原样序列化」= JsonElement.toString()，不解析、不重排、不加空格
+        assertEquals("""{"command":"git status --porcelain","timeout":30}""", entry.argsJson)
+        assertNull("start 阶段没有成败概念，isError 必须是 null 而不是 false", entry.isError)
+        assertNull("start 阶段没有结果", entry.resultPreview)
+        assertEquals(session, entry.sessionId)
+        assertTrue(
+            "cwd 取的是生产装配喂给 SessionSupervisor 的同一条 projectDir：${entry.cwd}",
+            entry.cwd.endsWith("/files/projects/default"),
+        )
+        assertTrue("时间戳得是个当下值", entry.ts > 0)
+    }
+
+    @Test
+    fun `case25 tool end writes isError plus a preview clamped to 4096 characters`() = runTest {
+        val audit = FakeAuditSink()
+        val rig = rig(audit = audit)
+        ready(rig)
+
+        rig.engine.emit(
+            PiEvent.ToolExecutionEnd(
+                toolCallId = "call-9",
+                toolName = "bash",
+                isError = true,
+                result = buildJsonObject { put("content", "E".repeat(FileAuditSink.RESULT_PREVIEW_MAX + 700)) },
+            ),
+        )
+        runCurrent()
+
+        val entry = audit.entries.single()
+        assertEquals(AuditKind.TOOL_END, entry.kind)
+        assertEquals(true, entry.isError)
+        assertEquals(FileAuditSink.RESULT_PREVIEW_MAX, entry.resultPreview?.length)
+        assertEquals("argsJson 在 end 上留空（args 只在 start 出现一次）", "", entry.argsJson)
+
+        // 短结果原样进 preview，不做任何加工
+        val shortAudit = FakeAuditSink()
+        val second = rig(audit = shortAudit)
+        ready(second)
+        shortAudit.entries.clear()
+        second.engine.emit(
+            PiEvent.ToolExecutionEnd(
+                toolCallId = "call-s", toolName = "read", isError = false,
+                result = buildJsonObject { put("content", "一行小结果") },
+            ),
+        )
+        runCurrent()
+        val tail = shortAudit.entries.single()
+        assertEquals("一行小结果", tail.resultPreview)
+        assertEquals(false, tail.isError)
+    }
+
+    @Test
+    fun `case26 allow once and allow session both audit as confirmed exactly once`() = runTest {
+        val audit = FakeAuditSink()
+        val rig = rig(audit = audit)
+        ready(rig)
+
+        rig.engine.emit(uiRequest(id = "p1", method = "confirm", timeout = 5_000L))
+        runCurrent()
+        rig.vm.answerPermission(allowOnce = true)
+        runCurrent()
+
+        val once = audit.all(AuditKind.PERMISSION).single()
+        assertEquals("p1", once.toolCallId)
+        assertEquals("permission", once.toolName)
+        assertEquals("confirmed", once.argsJson)
+
+        // 「本会话」= 线协议同形（§13 偏差 3），审计措辞也同形，不造第四个词
+        rig.engine.emit(uiRequest(id = "p2", method = "exec", timeout = 5_000L))
+        runCurrent()
+        rig.vm.answerPermission(allowSession = true)
+        runCurrent()
+        assertEquals(listOf("p1", "p2"), audit.all(AuditKind.PERMISSION).map { it.toolCallId })
+        assertEquals(listOf("confirmed", "confirmed"), audit.all(AuditKind.PERMISSION).map { it.argsJson })
+
+        // p3：method 已被记住 → 自动放行，也留一条 confirmed
+        rig.engine.emit(uiRequest(id = "p3", method = "exec", timeout = 5_000L))
+        runCurrent()
+        assertEquals(3, audit.all(AuditKind.PERMISSION).size)
+        assertEquals("confirmed", audit.all(AuditKind.PERMISSION).last().argsJson)
+        assertEquals("自动放行不该弹框", null, rig.vm.permissionRequest.value)
+    }
+
+    @Test
+    fun `case27 deny audits as cancelled and a racing TurnEnd backfills cancelled not timeout`() = runTest {
+        val audit = FakeAuditSink()
+        val rig = rig(audit = audit)
+        ready(rig)
+
+        rig.engine.emit(uiRequest(id = "d1", method = "confirm", timeout = 5_000L))
+        runCurrent()
+        rig.vm.answerPermission(deny = true)
+        runCurrent()
+        assertEquals(listOf("cancelled"), audit.all(AuditKind.PERMISSION).map { it.argsJson })
+
+        // TurnEnd 抢跑（§5.2 兜底）：仍是 cancelled——「超时」这个词只属于倒计时到点
+        rig.engine.emit(uiRequest(id = "d2", method = "confirm", timeout = 5_000L))
+        runCurrent()
+        rig.engine.emit(PiEvent.TurnEnd(message = PiMessage(role = "assistant")))
+        runCurrent()
+        assertEquals(
+            listOf("cancelled", "cancelled"),
+            audit.all(AuditKind.PERMISSION).map { it.argsJson },
+        )
+        assertEquals("兜底补发恰好一次", 1, audit.all(AuditKind.PERMISSION).count { it.toolCallId == "d2" })
+    }
+
+    @Test
+    fun `case28 the expiring timer audits cancelled-timeout on the virtual clock`() = runTest {
+        val audit = FakeAuditSink()
+        val rig = rig(audit = audit)
+        ready(rig)
+
+        rig.engine.emit(uiRequest(id = "t1", method = "confirm", timeout = 2_000L))
+        runCurrent()
+        assertTrue(audit.all(AuditKind.PERMISSION).isEmpty())
+
+        advanceTimeBy(2_001)
+        runCurrent()
+
+        val entry = audit.all(AuditKind.PERMISSION).single()
+        assertEquals("t1", entry.toolCallId)
+        assertEquals("cancelled-timeout", entry.argsJson)
+        assertEquals("到点之后不再补第二条", 1, audit.all(AuditKind.PERMISSION).size)
+        advanceTimeBy(10_001)
+        runCurrent()
+        assertEquals(1, audit.all(AuditKind.PERMISSION).size)
+    }
+
+    @Test
+    fun `case29 auditing does not disturb the conversation state machine`() = runTest {
+        val audit = FakeAuditSink()
+        val rig = rig(audit = audit)
+        ready(rig)
+
+        rig.vm.sendPrompt("跑个 git")
+        runCurrent()
+        assertEquals(TurnState.Streaming, rig.vm.turnState.value)
+        rig.engine.emit(PiEvent.ToolExecutionStart(toolCallId = "c1", toolName = "bash", args = buildJsonObject { put("command", "git log") }))
+        rig.engine.emit(
+            PiEvent.ToolExecutionEnd(
+                toolCallId = "c1", toolName = "bash", isError = false,
+                result = buildJsonObject { put("content", "commit abc") },
+            ),
+        )
+        rig.engine.emit(PiEvent.TurnEnd(message = PiMessage(role = "assistant")))
+        runCurrent()
+
+        // 审计条目收了 3 条（start/end + 无权限），状态机与转录该怎样还怎样
+        assertEquals(2, audit.entries.size)
+        assertEquals(TurnState.Idle, rig.vm.turnState.value)
+        assertEquals(ToolStatus.Ok, rig.tool("c1").status)
+        assertEquals("commit abc", rig.tool("c1").output)
+        assertEquals(1, rig.engine.sent.count { it.command is RpcCommand.Prompt })
+        assertNull(rig.vm.permissionRequest.value)
+    }
+
+    @Test
+    fun `case30 a sink that throws RuntimeException does not take the conversation down`() = runTest {
+        // 红线用例：AuditSink 契约是「必须不抛」，这里**故意违约**，验 VM 那道单点闸真的挡住
+        val audit = FakeAuditSink().apply { boom = RuntimeException("假体违约：模拟第三方 sink 抛异常") }
+        val rig = rig(audit = audit)
+        val session = ready(rig)
+
+        rig.engine.emit(
+            PiEvent.ToolExecutionStart(
+                toolCallId = "boom-1", toolName = "bash", args = buildJsonObject { put("command", "ls") },
+            ),
+        )
+        runCurrent()
+
+        // ① 事件收集协程还活着：同一条总线上的后续事件照样进得来
+        rig.engine.emit(
+            PiEvent.ToolExecutionEnd(
+                toolCallId = "boom-1", toolName = "bash", isError = false,
+                result = buildJsonObject { put("content", "ok") },
+            ),
+        )
+        runCurrent()
+        assertEquals("违约之后工具卡仍按序定稿", ToolStatus.Ok, rig.tool("boom-1").status)
+
+        // ② 用户动作路径同样不受牵连：权限应答继续发到线协议
+        rig.engine.emit(uiRequest(id = "boom-2", method = "confirm", timeout = 5_000L))
+        runCurrent()
+        rig.vm.answerPermission(allowOnce = true)
+        runCurrent()
+        assertEquals(1, rig.engine.uiResponses.count { it.id == "boom-2" })
+        assertEquals(true, rig.engine.uiResponses.last().confirmed)
+
+        // ③ VM 本体仍在 Ready，会话 id 没被洗掉
+        assertEquals(ChatUiState.Ready(session), rig.vm.uiState.value)
+        assertEquals(TurnState.Streaming, rig.vm.turnState.value)
+    }
+
+    @Test
+    fun `case31 the default noop sink path stays harmless`() = runTest {
+        // rig 不传 audit ⇒ 构造参数默认值 NoopAuditSink：既有用例的形状（23 条）全走这条路
+        val rig = rig()
+        val session = ready(rig)
+
+        rig.engine.emit(PiEvent.ToolExecutionStart(toolCallId = "n1", toolName = "read", args = buildJsonObject { put("path", "a") }))
+        rig.engine.emit(uiRequest(id = "n2", method = "confirm", timeout = 5_000L))
+        runCurrent()
+        rig.vm.answerPermission(deny = true)
+        rig.engine.emit(PiEvent.TurnEnd(message = PiMessage(role = "assistant")))
+        runCurrent()
+
+        assertEquals(ChatUiState.Ready(session), rig.vm.uiState.value)
+        assertEquals("只发了 start、没发 end，卡片当然停在 Running", ToolStatus.Running, rig.tool("n1").status)
+        assertEquals(TurnState.Idle, rig.vm.turnState.value)
+        assertEquals(1, rig.engine.uiResponses.size)
     }
 
     private companion object {

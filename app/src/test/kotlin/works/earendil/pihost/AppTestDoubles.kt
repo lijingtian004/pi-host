@@ -22,6 +22,8 @@ import works.earendil.pihost.core.engine.ChatEngine
 import works.earendil.pihost.core.engine.InstallProgress
 import works.earendil.pihost.core.engine.RuntimeInstall
 import works.earendil.pihost.core.engine.SessionState
+import works.earendil.pihost.core.engine.audit.AuditEntry
+import works.earendil.pihost.core.engine.audit.AuditSink
 import works.earendil.pihost.core.engine.di.EngineModule
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.ModelCredentialStore
@@ -61,10 +63,22 @@ object AppTestHolder {
     var settings: ScriptedSettingsRepository = ScriptedSettingsRepository()
         private set
 
+    /**
+     * 审计面（P3A §3.2）：`ChatViewModel` 多了第六个注入参数（`auditSink`），
+     * 卸载了 `EngineModule` 的测试图必须补这条绑定，否则 Hilt 建图期就缺 binding
+     * （P2G §8 第 4 条 / P2H §3.3 的同一课，一次不落）。
+     *
+     * 给的是**内存假体**而不是「真类 + 假目录」：审计的写盘面在 `:core:engine` 的
+     * `FileAuditSinkTest`（14 条）里已经测透，`:app` 只需要「图建得起来 + 条目收得到」。
+     */
+    var audit: RecordingAuditSink = RecordingAuditSink()
+        private set
+
     fun reset() {
         engine = RecordingChatEngine()
         installer = ScriptedRuntimeInstall()
         settings = ScriptedSettingsRepository()
+        audit = RecordingAuditSink()
     }
 }
 
@@ -133,6 +147,29 @@ object AppTestEngineModule {
     @Singleton
     fun relayEndpointStore(@ApplicationContext ctx: Context): RelayEndpointStore =
         RelayEndpointStore(PathLayout.homeDir(ctx))
+
+    /**
+     * 审计面（P3A §3.2）：接口 = [AuditSink]，实现 = 本文件的 [RecordingAuditSink]。
+     *
+     * 与 [chatEngine] 一样**不给 scope**：每条用例要一对全新条目表（见 [AppTestHolder] 顶部说明）。
+     */
+    @Provides
+    fun auditSink(): AuditSink = AppTestHolder.audit
+}
+
+/**
+ * [AuditSink] 假体（P3A §3.2）：只把条目收进内存表，不落盘、不抛。
+ *
+ * 「不抛」是接口契约本身要求的（`AuditSink` KDoc：实现必须不抛），
+ * 所以这里连 `runCatching` 都不需要；违约形态的覆盖在 `:feature:chat` 的
+ * `ChatViewModelTest` 用例 30（那条用的 chat 侧 `FakeAuditSink.boom`）。
+ */
+class RecordingAuditSink : AuditSink {
+    val entries = CopyOnWriteArrayList<AuditEntry>()
+
+    override fun record(entry: AuditEntry) {
+        entries.add(entry)
+    }
 }
 
 /**

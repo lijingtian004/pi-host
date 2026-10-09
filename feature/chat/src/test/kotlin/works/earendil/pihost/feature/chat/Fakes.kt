@@ -3,6 +3,9 @@ package works.earendil.pihost.feature.chat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import works.earendil.pihost.core.engine.audit.AuditEntry
+import works.earendil.pihost.core.engine.audit.AuditKind
+import works.earendil.pihost.core.engine.audit.AuditSink
 import works.earendil.pihost.core.engine.settings.AppSettings
 import works.earendil.pihost.core.engine.settings.SettingsRepository
 import works.earendil.pihost.core.environment.MemTier
@@ -45,4 +48,32 @@ class FakeSettingsRepository(initial: AppSettings = AppSettings()) : SettingsRep
         writes.add(Write("default_model", model))
         _settings.value = _settings.value.copy(defaultModel = model)
     }
+}
+
+/**
+ * 审计假体（P3A §3.2）。
+ *
+ * 只做两件事：**收条目**与**按开关抛异常**。后者是给红线用例用的——`ChatViewModel` 承诺
+ * 「sink 抛 RuntimeException 时对话不崩」，而那必须靠一个违约的假体才能测出来
+ * （真实现 `FileAuditSink` 全量吞异常，§3.1 用例 05/06/12 已经把它的「不抛」钉住了）。
+ *
+ * 为什么不复用 `:core:engine` 的 `FileAuditSink` + 临时目录：那会把「写盘面」测第二遍
+ * （归属 `:core:engine`），而 chat 侧要测的是**挂点**——条目形状、时机、以及对状态机零影响。
+ */
+class FakeAuditSink : AuditSink {
+    val entries = CopyOnWriteArrayList<AuditEntry>()
+
+    /** 非空即让 [record] 抛它：模拟「实现违反『必须不抛』契约」。 */
+    var boom: Throwable? = null
+
+    override fun record(entry: AuditEntry) {
+        boom?.let { throw it }
+        entries.add(entry)
+    }
+
+    /** 某一类条目的第一条（没有则 null），断言措辞用。 */
+    fun first(kind: AuditKind): AuditEntry? = entries.firstOrNull { it.kind == kind }
+
+    /** 某一类的全部条目，按写入序。 */
+    fun all(kind: AuditKind): List<AuditEntry> = entries.filter { it.kind == kind }
 }

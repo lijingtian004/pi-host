@@ -1,6 +1,7 @@
 package works.earendil.pihost.feature.chat
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -23,7 +24,14 @@ import works.earendil.pihost.core.engine.InstalledRuntime
 import works.earendil.pihost.core.engine.RuntimeInstall
 import works.earendil.pihost.core.engine.SessionState
 import works.earendil.pihost.core.engine.engineStartIntent
+import works.earendil.pihost.core.engine.audit.AuditEntry
+import works.earendil.pihost.core.engine.audit.AuditKind
+import works.earendil.pihost.core.engine.audit.AuditSink
+import works.earendil.pihost.core.engine.audit.FileAuditSink
+import works.earendil.pihost.core.engine.audit.NoopAuditSink
+import works.earendil.pihost.core.engine.di.EngineModule
 import works.earendil.pihost.core.engine.settings.SettingsRepository
+import works.earendil.pihost.core.environment.PathLayout
 import works.earendil.pihost.core.rpc.AssistantMessageEvent
 import works.earendil.pihost.core.rpc.ExtensionUiResponse
 import works.earendil.pihost.core.rpc.PiEvent
@@ -63,6 +71,16 @@ class ChatViewModel @Inject constructor(
      * 同模块的 UI 与单测都能取到，够用。
      */
     private val markwonInstance: Markwon,
+    /**
+     * 审计出口（P3A §3.2）。**默认值 = [NoopAuditSink]**，且必须放在参数表**末尾**：
+     * `ChatViewModelTest` 与 `:app` 的构造点此前都是五个实参，加默认值的尾位让既有调用一字不改就能编译
+     * （规格书 §3.2 原文「保持既有测试编译兼容」）。
+     *
+     * Hilt 侧仍然要求一条 `AuditSink` binding——**Kotlin 默认值对 Dagger 不可见**，
+     * 它照样按签名要绑定，所以 `EngineModule.auditSink`（生产）与
+     * `AppTestEngineModule`（测试假体）两边都得有（§3.6 收尾）。
+     */
+    private val auditSink: AuditSink = NoopAuditSink,
 ) : AndroidViewModel(app) {
 
     /**
@@ -454,13 +472,34 @@ class ChatViewModel @Inject constructor(
         permissionTicker = null
         _permissionRequest.value = null
         if (allowSession) rememberedMethods.add(pending.method)
-        writePermissionAnswer(pending.id, confirmed = allowOnce || allowSession)
+        // §3.2 挂点三(a)：用户手上一锤子 = confirmed / cancelled
+        writePermissionAnswer(
+            pending.id,
+            confirmed = allowOnce || allowSession,
+            decision = if (allowOnce || allowSession) AUDIT_CONFIRMED else AUDIT_CANCELLED,
+        )
         if (_turnState.value == TurnState.PermissionPending) _turnState.value = TurnState.Streaming
     }
 
-    private fun writePermissionAnswer(requestId: String, confirmed: Boolean) {
+    /**
+     * 权限应答的唯一出口（§5.2 的「恰好一次」闩 + P3A §3.2 的权限审计挂点）。
+     *
+     * [decision] 由调用方给三态原文（`confirmed` / `cancelled` / `cancelled-timeout`），
+     * 而不是在这里从 `confirmed` 反推——「cancelled」有两种来历（用户拒绝、TurnEnd 抢跑兜底），
+     * 只有调用点知道自己属于哪一种；审计要留的正是这个区别。
+     *
+     * 记条目的位置在 `settledPermissions` 闩**之后**：同一条 request 被兜底路径重入时
+     * 既不多发一次线协议应答，也不多写一行审计（否则「拒绝」会被记成两次）。
+     */
+    private fun writePermissionAnswer(requestId: String, confirmed: Boolean, decision: String) {
         val id = sessionId ?: return
         if (!settledPermissions.add(requestId)) return
+        recordAudit(
+            AuditKind.PERMISSION,
+            toolCallId = requestId,
+            toolName = AUDIT_PERMISSION_TOOL,
+            argsJson = decision,
+        )
         val response = if (confirmed) {
             ExtensionUiResponse(requestId, confirmed = true)
         } else {
@@ -469,15 +508,74 @@ class ChatViewModel @Inject constructor(
         engine.sendUiResponse(id, response)
     }
 
-    /** 超时/TurnEnd 抢跑的兜底：补 cancelled 恰好一次，再清空弹框态。 */
-    private fun cancelPermissionOnce() {
+    /**
+     * 超时/TurnEnd 抢跑的兜底：补 cancelled 恰好一次，再清空弹框态。
+     *
+     * [timedOut] 只影响审计措辞（§3.2 原文的 `"cancelled-timeout"`），线协议一字不变：
+     * 倒计时到点 = true，[onSessionRolled]/[endTurn] 的抢跑兜底 = false。
+     */
+    private fun cancelPermissionOnce(timedOut: Boolean = false) {
         val pending = _permissionRequest.value ?: return
         permissionTicker?.cancel()
         permissionTicker = null
         _permissionRequest.value = null
-        writePermissionAnswer(pending.id, confirmed = false)
+        writePermissionAnswer(
+            pending.id,
+            confirmed = false,
+            decision = if (timedOut) AUDIT_CANCELLED_TIMEOUT else AUDIT_CANCELLED,
+        )
         if (_turnState.value == TurnState.PermissionPending) _turnState.value = TurnState.Streaming
     }
+
+    // ── 审计挂点（P3A §3.2）─────────────────────────────────────────────────────
+
+    /**
+     * 审计条目的**唯一**构造口：三个挂点（工具 start / 工具 end / 权限决策）都走这里。
+     *
+     * `runCatching` 只在本函数出现一次，这是 §2 红线与 §3.2 测试第 ⑤ 条唯一能并存的形状：
+     * - 红线说「ChatViewModel 直接调用不额外包 try」，意思是**挂点处**不各写一层防御
+     *   （三个 `recordAudit(...)` 调用行确实一字没有 try）；
+     * - §3.2 又要求「sink 抛 RuntimeException 时 ChatViewModel 不崩」，而 `AuditSink` 是接口——
+     *   违约实现（或未来接进来的第三方 sink）抛出来会落在**事件收集协程**里
+     *   （`viewModelScope` 的 `SupervisorJob` 只挡兄弟，不挡这条主收集协程自己死），
+     *   后果正是红线要禁止的「审计把对话带下水」。
+     * 生产实现 [FileAuditSink] 本来就全量吞异常（§3.1 用例 05/06/12 是它的证明），
+     * 所以这一层在真机上是**永远不该被触发**的第二道闸；触发即说明有实现违约，直接打日志。
+     */
+    private fun recordAudit(
+        kind: AuditKind,
+        toolCallId: String,
+        toolName: String,
+        argsJson: String,
+        isError: Boolean? = null,
+        resultPreview: String? = null,
+    ) {
+        val entry = AuditEntry(
+            ts = System.currentTimeMillis(),
+            kind = kind,
+            toolCallId = toolCallId,
+            toolName = toolName,
+            argsJson = argsJson,
+            isError = isError,
+            resultPreview = resultPreview,
+            cwd = auditCwd(),
+            sessionId = sessionId,
+        )
+        runCatching { auditSink.record(entry) }
+            .onFailure { Log.w(AUDIT_LOG_TAG, "AuditSink 违反『必须不抛』契约：${entry.kind}", it) }
+    }
+
+    /**
+     * 审计面里 `cwd` 的取值来源（§3.2 留给 REPORT §8 的那条）。
+     *
+     * 不是新造的跨模块查询：这两者都是**现成公开 API**，且与生产装配喂给
+     * `SessionSupervisor.workingDir` 的那一条是同一个表达式（`EngineModule:174`），
+     * 所以审计记下的目录 = 子进程真实 chdir 的目录，不存在第二份真相。
+     * `PathLayout.projectDir` 只构造路径不建目录，因此这里既不碰磁盘也不挂起。
+     */
+    private fun auditCwd(): String = runCatching {
+        PathLayout.projectDir(getApplication(), EngineModule.DEFAULT_PROJECT).absolutePath
+    }.getOrDefault("")
 
     // ── 入站装配（§5.1 事件映射）─────────────────────────────────────────────────
 
@@ -496,20 +594,39 @@ class ChatViewModel @Inject constructor(
             is PiEvent.MessageEnd -> onMessageEnd(event.message)
             is PiEvent.MessageUpdate -> event.assistantMessageEvent?.let { onAssistantEvent(it) }
 
-            is PiEvent.ToolExecutionStart -> mutateTranscript { list ->
-                list + TranscriptItem.ToolItem(
-                    id = nextItemId(),
-                    callId = event.toolCallId,
+            is PiEvent.ToolExecutionStart -> {
+                // §3.2 挂点一：args **原样**入审计（不解析、不美化、不截断——§2 红线）
+                recordAudit(
+                    AuditKind.TOOL_START,
+                    toolCallId = event.toolCallId,
                     toolName = event.toolName,
-                    status = ToolStatus.Running,
+                    argsJson = event.args?.toString().orEmpty(),
                 )
+                mutateTranscript { list ->
+                    list + TranscriptItem.ToolItem(
+                        id = nextItemId(),
+                        callId = event.toolCallId,
+                        toolName = event.toolName,
+                        status = ToolStatus.Running,
+                    )
+                }
             }
 
             is PiEvent.ToolExecutionUpdate -> appendToolOutput(event.toolCallId, resultToText(event.partialResult))
 
             is PiEvent.BashExecutionUpdate -> appendBashOutput(event.id, event.delta)
 
-            is PiEvent.ToolExecutionEnd -> mutateTranscript { list ->
+            is PiEvent.ToolExecutionEnd -> {
+                // §3.2 挂点二：结果只进 preview，截 [FileAuditSink.RESULT_PREVIEW_MAX] 字符
+                recordAudit(
+                    AuditKind.TOOL_END,
+                    toolCallId = event.toolCallId,
+                    toolName = event.toolName,
+                    argsJson = "",
+                    isError = event.isError,
+                    resultPreview = resultToText(event.result).toAuditPreview(),
+                )
+                mutateTranscript { list ->
                 list.map { item ->
                     if (item is TranscriptItem.ToolItem && item.callId == event.toolCallId) {
                         item.copy(
@@ -521,6 +638,7 @@ class ChatViewModel @Inject constructor(
                     } else {
                         item
                     }
+                }
                 }
             }
 
@@ -633,7 +751,9 @@ class ChatViewModel @Inject constructor(
     private fun onPermissionRequest(event: PiEvent.ExtensionUiRequest) {
         // 本会话已记下的 method：自动 confirmed，**不弹框**（§5.2）
         if (event.method in rememberedMethods) {
-            writePermissionAnswer(event.id, confirmed = true)
+            // 「本会话记住」的自动放行也是决策：记 confirmed（规格书 §3.2 只列了三态，
+            // 自动放行与用户点「允许一次」在线协议上完全同形，审计面不额外造第四个词）
+            writePermissionAnswer(event.id, confirmed = true, decision = AUDIT_CONFIRMED)
             return
         }
         val total = event.timeout ?: DEFAULT_UI_TIMEOUT_MS
@@ -661,7 +781,7 @@ class ChatViewModel @Inject constructor(
                 val current = _permissionRequest.value ?: return@launch // 已应答 → 停表
                 _permissionRequest.value = current.copy(remainingMs = left)
             }
-            cancelPermissionOnce()
+            cancelPermissionOnce(timedOut = true) // §3.2 挂点三(c)：唯一一条「超时」措辞的来源
         }
     }
 
@@ -805,6 +925,17 @@ class ChatViewModel @Inject constructor(
         PiEvent.Response(id = null, command = command, success = false, error = message)
 
     private companion object {
+        /** 权限决策的三种措辞（§3.2 原文），落 [AuditEntry.argsJson]。 */
+        const val AUDIT_CONFIRMED = "confirmed"
+        const val AUDIT_CANCELLED = "cancelled"
+        const val AUDIT_CANCELLED_TIMEOUT = "cancelled-timeout"
+
+        /** [AuditKind.PERMISSION] 条目的固定 toolName（§3.2 原文）。 */
+        const val AUDIT_PERMISSION_TOOL = "permission"
+
+        /** 审计旁路自己的日志 tag（与 `FileAuditSink.TAG` 同一串，日志侧好聚合）。 */
+        const val AUDIT_LOG_TAG = "PiHost/Audit"
+
         const val ROLE_USER = "user"
         const val ROLE_ASSISTANT = "assistant"
 
@@ -818,6 +949,14 @@ class ChatViewModel @Inject constructor(
         const val CAUSE_MAX_LEN = 240
     }
 }
+
+/**
+ * 审计 preview 的截断（§3.2 挂点二）：**不带省略号**——审计行是 JSON，
+ * 尾部多一个 `…` 就是给下游解析器添一个假字节；上限直接取 [FileAuditSink.RESULT_PREVIEW_MAX]，
+ * 与 `:core:engine` 写侧的那道闸同一个常量，两边永远不会算出两个数。
+ */
+internal fun String.toAuditPreview(): String =
+    if (length <= FileAuditSink.RESULT_PREVIEW_MAX) this else substring(0, FileAuditSink.RESULT_PREVIEW_MAX)
 
 /** 失败文案截断：stderr 尾部可能很长，安装门/顶栏只放前若干字符。 */
 internal fun String.truncate(limit: Int = CAUSE_MAX_LEN): String =

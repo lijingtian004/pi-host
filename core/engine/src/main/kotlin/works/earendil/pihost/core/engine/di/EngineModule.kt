@@ -24,6 +24,7 @@ import works.earendil.pihost.core.engine.audit.AuditPaths
 import works.earendil.pihost.core.engine.audit.AuditScope
 import works.earendil.pihost.core.engine.audit.AuditSink
 import works.earendil.pihost.core.engine.audit.FileAuditSink
+import works.earendil.pihost.core.engine.env.SpawnEnv
 import works.earendil.pihost.core.engine.git.GitInitializer
 import works.earendil.pihost.core.engine.git.GitProbe
 import works.earendil.pihost.core.engine.git.GitSpawn
@@ -35,7 +36,6 @@ import works.earendil.pihost.core.engine.settings.ModelCredentialStore
 import works.earendil.pihost.core.engine.settings.RelayEndpointStore
 import works.earendil.pihost.core.engine.projects.ProjectNames
 import works.earendil.pihost.core.engine.settings.SettingsRepository
-import works.earendil.pihost.core.environment.EnvFactory
 import works.earendil.pihost.core.environment.PathLayout
 import works.earendil.pihost.core.process.JvmProcessFactory
 import works.earendil.pihost.core.process.ProcessStarter
@@ -48,9 +48,16 @@ import javax.inject.Singleton
  *
  * 组装件来自冻结区的公开工厂（P2F 起 starter 外面多一层 core/engine 自己的包装，冻结区未动）：
  * - argv = [PiSpawn]（libDir = `applicationInfo.nativeLibraryDir`、runtimeDir = [PathLayout.runtimeDir]）；
- * - env = `EnvFactory.build(ctx, settings.memTier)`（P2E §3.4 起改动态取；P2C/P2D 写死
+ * - env = `SpawnEnv.build(ctx, settings.memTier)`（P2E §3.4 起改动态取；P2C/P2D 写死
  *   `MemTier.MID`，与 `MemTier.DEFAULT` 同值 192MB，**默认行为一字未变**，
- *   只是磁盘上真写了 LOW/HIGH 时下次 spawn 跟着变，§13 偏差 4）；
+ *   只是磁盘上真写了 LOW/HIGH 时下次 spawn 跟着变，§13 偏差 4）。
+ *   **P3C §3.10**：不再直取 `EnvFactory.build` —— `SpawnEnv` 是那 11 键之上的一层增量，
+ *   补两条被 Termux 编译期前缀坑到的 git 键（`GIT_SSL_CAINFO` / `GIT_SHELL_PATH`）。
+ *   真机上 pi 一发 https 就 `error adding trust anchors from file:
+ *   /data/data/com.termux/files/usr/etc/tls/cert.pem | exit=128`：那份内置 CA 属另一个 app
+ *   （`u0_a404`、0600），宿主 `u0_a401` 连 DAC 都过不去。同一层同时修好 **agent 侧**
+ *   （pi 的 bash 继承这份 env）与**宿主侧**（下面两个 git provider），
+ *   而 `EnvFactory` 本身留在冻结区一字未动（REPORT-P3C §8.11）；
  * - 工作目录 = [PathLayout.projectDir]`(ctx, settings.activeProject)`（P3C §3.3 起可切换；P2F–P3B 期间
  *   恒为 `"default"`）。**P2F 修正**：`PathLayout` 只构造路径不建目录，全仓此前无一处 mkdir `projects/`
  *   （RECON-P2F §2.1）→ 该目录在真机上不存在，
@@ -226,7 +233,7 @@ object EngineModule {
         // 每次 spawn 重新 build env），活动会话不受影响。lambda 同步读 SettingsRepository 的
         // 内存快照 —— 快照由 DataStore 收集器维护，setter 落盘后立刻乐观改写，
         // 所以这里既不挂起也不碰磁盘（RECON-P2E §3 / §7.6：repository 必须在 core 侧）。
-        envFor = { EnvFactory.build(ctx, settings.memTier) },
+        envFor = { SpawnEnv.build(ctx, settings.memTier) },
         // P3C §3.3：项目切换与 memTier 走的是同一条「热更新只影响后续 spawn」语义，但这里
         // 必须比 envFor 更保守 —— Supervisor 只在 start() 里取一次（见 SessionSupervisor 类头），
         // 所以「切活动项目」不会打断在跑的会话，也只可能改变新会话的落点目录。
@@ -269,7 +276,7 @@ object EngineModule {
         spawn: GitSpawn,
         settings: SettingsRepository,
         @ApplicationContext ctx: Context,
-    ): GitInitializer = ProcessGitInitializer(starter, { EnvFactory.build(ctx, settings.memTier) }, spawn)
+    ): GitInitializer = ProcessGitInitializer(starter, { SpawnEnv.build(ctx, settings.memTier) }, spawn)
 
     /** git 读面（红线 12 只许 `status --porcelain=v1 --branch` 一条）。 */
     @Provides
@@ -279,7 +286,7 @@ object EngineModule {
         spawn: GitSpawn,
         settings: SettingsRepository,
         @ApplicationContext ctx: Context,
-    ): ProcessGitProbe = ProcessGitProbe(starter, { EnvFactory.build(ctx, settings.memTier) }, spawn)
+    ): ProcessGitProbe = ProcessGitProbe(starter, { SpawnEnv.build(ctx, settings.memTier) }, spawn)
 
     /** 接口 → 实现转发边：注入点要 [GitProbe]，不是 [ProcessGitProbe]（照 [auditSink] 的先例）。 */
     @Provides
